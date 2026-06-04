@@ -79,7 +79,7 @@ cargo build --release
 | `--address` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | WebSocket port |
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
-| `--markets` | `all` | `perps`, `spot`, `hip3`, `all` |
+| `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -119,12 +119,16 @@ After the initial snapshot, the server stays up to date by watching the node's `
 
 ### Market Types
 
+The `--markets` flag accepts comma-delimited market names. The `all` value remains supported as a compatibility alias for `perps,spot,hip3`.
+
 | Value | Description |
 |-------|-------------|
 | `perps` | Perpetual futures only (BTC, ETH, SOL...) |
 | `spot` | Spot markets (`@*` coins, PURR/USDC) |
 | `hip3` | HIP-3 markets (X:Y format, e.g., xyz:TSLA) |
-| `all` | All markets (default) |
+| `perps,hip3` | Perpetual futures and HIP-3 markets, excluding spot |
+| `perps,spot,hip3` | All markets explicitly |
+| `all` | All markets compatibility alias (default) |
 
 ### Advanced Options
 
@@ -527,7 +531,7 @@ All paths (`abci_state.rmp`, `snapshot.json`, `visor_abci_state.json`) are auto-
 
 ### Market Filtering
 
-The original has a hard-coded `ignore_spot` flag. This fork adds a `--markets` CLI flag supporting `perps`, `spot`, `hip3` (HIP-3 tokens in X:Y format), or `all`.
+The original has a hard-coded `ignore_spot` flag. This fork adds a `--markets` CLI flag supporting comma-delimited `perps`, `spot`, and `hip3` values, plus `all` as a compatibility alias. Use `--markets perps,hip3` to exclude spot while keeping HIP-3 markets.
 
 ### Prometheus Metrics & Health Endpoint
 

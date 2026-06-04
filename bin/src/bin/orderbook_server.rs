@@ -1,21 +1,92 @@
-use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::{fmt, net::Ipv4Addr, path::PathBuf, str::FromStr};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
 
-/// Markets to include in the orderbook
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-pub enum Markets {
-    /// Perpetual futures only
-    Perps,
-    /// Spot markets only (including @ coins)
-    Spot,
-    /// HIP-3 markets only
-    Hip3,
-    /// All markets (perps + spot + hip3)
-    #[default]
-    All,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Markets {
+    include_perps: bool,
+    include_spot: bool,
+    include_hip3: bool,
+}
+
+impl Markets {
+    const fn empty() -> Self {
+        Self { include_perps: false, include_spot: false, include_hip3: false }
+    }
+
+    const fn flags(self) -> (bool, bool, bool) {
+        (self.include_perps, self.include_spot, self.include_hip3)
+    }
+}
+
+impl Default for Markets {
+    fn default() -> Self {
+        Self { include_perps: true, include_spot: true, include_hip3: true }
+    }
+}
+
+impl FromStr for Markets {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("empty market list; expected comma-separated values: perps, spot, hip3, or all".to_string());
+        }
+
+        if value == "all" {
+            return Ok(Self::default());
+        }
+
+        let mut markets = Self::empty();
+        for market in value.split(',') {
+            let market = market.trim();
+            if market.is_empty() {
+                return Err(
+                    "empty market entry; expected comma-separated values: perps, spot, hip3, or all".to_string()
+                );
+            }
+
+            match market {
+                "all" => {
+                    return Err(
+                        "`all` cannot be combined with specific markets; use `all` or `perps,spot,hip3`".to_string()
+                    );
+                }
+                "perps" if !markets.include_perps => markets.include_perps = true,
+                "perps" => return Err("duplicate market `perps`".to_string()),
+                "spot" if !markets.include_spot => markets.include_spot = true,
+                "spot" => return Err("duplicate market `spot`".to_string()),
+                "hip3" if !markets.include_hip3 => markets.include_hip3 = true,
+                "hip3" => return Err("duplicate market `hip3`".to_string()),
+                unknown => {
+                    return Err(format!(
+                        "unknown market `{unknown}`; expected comma-separated values: perps, spot, hip3, or all"
+                    ));
+                }
+            }
+        }
+
+        Ok(markets)
+    }
+}
+
+impl fmt::Display for Markets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (enabled, name) in [(self.include_perps, "perps"), (self.include_spot, "spot"), (self.include_hip3, "hip3")]
+        {
+            if enabled {
+                if !first {
+                    write!(f, ",")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -40,8 +111,8 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Which markets to include: perps, spot, hip3, all
-    #[arg(long, value_enum, default_value = "all")]
+    /// Which markets to include: comma-separated perps, spot, hip3, or all
+    #[arg(long, default_value = "all")]
     markets: Markets,
 
     // ========== Snapshot Configuration ==========
@@ -135,13 +206,7 @@ async fn main() -> Result<()> {
 
     let full_address = format!("{}:{}", args.address, args.port);
 
-    // Determine market flags from Markets enum
-    let (include_perps, include_spot, include_hip3) = match args.markets {
-        Markets::Perps => (true, false, false),
-        Markets::Spot => (false, true, false),
-        Markets::Hip3 => (false, false, true),
-        Markets::All => (true, true, true),
-    };
+    let (include_perps, include_spot, include_hip3) = args.markets.flags();
 
     // Build config
     let config = ServerConfig {
@@ -165,7 +230,7 @@ async fn main() -> Result<()> {
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Address: {}", config.address);
-    println!("  Markets: {:?}", args.markets);
+    println!("  Markets: {}", args.markets);
     if config.bbo_only {
         println!("  Mode: BBO-ONLY (lightweight, ~100MB RAM)");
         println!("  Note: L2/L4/Trades subscriptions disabled");
@@ -223,4 +288,64 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Args, Markets};
+
+    const ALL_MARKETS: Markets = Markets { include_perps: true, include_spot: true, include_hip3: true };
+
+    const PERPS_ONLY: Markets = Markets { include_perps: true, include_spot: false, include_hip3: false };
+
+    const SPOT_ONLY: Markets = Markets { include_perps: false, include_spot: true, include_hip3: false };
+
+    const HIP3_ONLY: Markets = Markets { include_perps: false, include_spot: false, include_hip3: true };
+
+    #[test]
+    fn parses_single_market_values() {
+        assert_eq!("perps".parse::<Markets>(), Ok(PERPS_ONLY));
+        assert_eq!("spot".parse::<Markets>(), Ok(SPOT_ONLY));
+        assert_eq!("hip3".parse::<Markets>(), Ok(HIP3_ONLY));
+    }
+
+    #[test]
+    fn parses_comma_delimited_market_values() {
+        assert_eq!(
+            "perps,hip3".parse::<Markets>(),
+            Ok(Markets { include_perps: true, include_spot: false, include_hip3: true })
+        );
+        assert_eq!("perps,spot,hip3".parse::<Markets>(), Ok(ALL_MARKETS));
+    }
+
+    #[test]
+    fn parses_all_as_compatibility_alias() {
+        assert_eq!("all".parse::<Markets>(), Ok(ALL_MARKETS));
+    }
+
+    #[test]
+    fn trims_whitespace_around_market_values() {
+        assert_eq!(
+            " perps, hip3 ".parse::<Markets>(),
+            Ok(Markets { include_perps: true, include_spot: false, include_hip3: true })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_market_values() {
+        assert!("foo".parse::<Markets>().is_err());
+        assert!("perps,,hip3".parse::<Markets>().is_err());
+        assert!("perps,perps".parse::<Markets>().is_err());
+        assert!("all,hip3".parse::<Markets>().is_err());
+    }
+
+    #[test]
+    fn cli_parses_comma_delimited_markets() {
+        let args = Args::try_parse_from(["orderbook_server", "--markets", "perps,hip3"])
+            .expect("comma-delimited markets should parse");
+
+        assert_eq!(args.markets, Markets { include_perps: true, include_spot: false, include_hip3: true });
+    }
 }
