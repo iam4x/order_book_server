@@ -20,8 +20,8 @@ use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL,
-        ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_FLUSH_PHASE_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT,
+        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
     },
     order_book::{
         Coin, Px, Snapshot, Sz,
@@ -331,8 +331,10 @@ impl OrderBookListener {
         let l2_start = Instant::now();
         let mut changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
         changed_for_l2.retain(|coin| active_coins.contains(coin));
+        let snapshot_start = Instant::now();
         let (time, l2_snapshots) =
             state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
+        L2_FLUSH_PHASE_LATENCY.with_label_values(&["snapshot"]).observe(snapshot_start.elapsed().as_secs_f64());
 
         static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -356,12 +358,14 @@ impl OrderBookListener {
         if prepared.generation != self.l2_generation {
             return;
         }
+        let publish_start = Instant::now();
         self.l2_prepared_hashes = prepared.prepared_hashes;
         self.next_l2_version = prepared.next_version;
         if !prepared.l2_books.is_empty() {
             let msg = Arc::new(InternalMessage::L2Update { l2_books: prepared.l2_books });
             drop(prepared.tx.send(msg));
         }
+        L2_FLUSH_PHASE_LATENCY.with_label_values(&["publish"]).observe(publish_start.elapsed().as_secs_f64());
         L2_BROADCAST_LATENCY.observe(prepared.started_at.elapsed().as_secs_f64());
     }
 }
@@ -656,6 +660,7 @@ struct L2FlushJob {
 
 impl L2FlushJob {
     fn prepare(self) -> PreparedL2Flush {
+        let prepare_start = Instant::now();
         let Self {
             generation,
             time,
@@ -667,6 +672,7 @@ impl L2FlushJob {
             started_at,
         } = self;
         let l2_books = l2_snapshots.into_prepared_books(&active_keys, time, &mut prepared_hashes, &mut next_version);
+        L2_FLUSH_PHASE_LATENCY.with_label_values(&["prepare"]).observe(prepare_start.elapsed().as_secs_f64());
         PreparedL2Flush { generation, tx, l2_books, prepared_hashes, next_version, started_at }
     }
 }

@@ -48,6 +48,13 @@ lazy_static! {
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])
     ).expect("metric can be created");
 
+    /// L2 flush latency by phase
+    pub static ref L2_FLUSH_PHASE_LATENCY: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("l2_flush_phase_latency_seconds", "L2 flush latency by phase")
+            .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+        &["phase"]
+    ).expect("metric can be created");
+
     /// Event processing latency by type
     pub static ref EVENT_PROCESSING_LATENCY: HistogramVec = HistogramVec::new(
         HistogramOpts::new("event_processing_latency_seconds", "Event processing latency")
@@ -193,6 +200,7 @@ pub fn register_metrics() {
     // Latency metrics
     REGISTRY.register(Box::new(BBO_BROADCAST_LATENCY.clone())).ok();
     REGISTRY.register(Box::new(L2_BROADCAST_LATENCY.clone())).ok();
+    REGISTRY.register(Box::new(L2_FLUSH_PHASE_LATENCY.clone())).ok();
     REGISTRY.register(Box::new(EVENT_PROCESSING_LATENCY.clone())).ok();
 
     // Throughput metrics
