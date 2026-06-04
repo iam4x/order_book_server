@@ -79,6 +79,7 @@ cargo build --release
 | `--address` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | WebSocket port |
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
+| `--secret` | unset | Require WebSocket clients to connect with `?token=<secret>` |
 | `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
@@ -196,6 +197,15 @@ Track only the top-of-book bid/ask for all coins. Uses ~100 MB RAM (vs ~1 GB for
 ```
 
 ## WebSocket API
+
+If the server is started with `--secret YOUR_SECRET`, clients must include the
+matching token in the WebSocket URL:
+
+```text
+ws://localhost:8000/ws?token=YOUR_SECRET
+```
+
+Without `--secret`, existing `/ws` connections remain accepted.
 
 ### Subscribe to BBO
 ```json
@@ -400,7 +410,7 @@ Response:
 
 ### Security & exposure model
 
-**This server ships with no TLS, no authentication, no authorization, and no per-IP rate limiting.** Those responsibilities live in your deployment infrastructure. If you bind the server to a public interface without a reverse proxy in front of it, an attacker can DoS it with a handful of TCP sockets. Treat the WebSocket port as you would a Postgres or Redis port: private, fronted, and rate-limited.
+**This server ships with no TLS, no authorization, and no per-IP rate limiting.** The optional `--secret` flag adds simple shared-token authentication for WebSocket handshakes via `?token=<secret>`, but transport security and abuse controls still live in your deployment infrastructure. If you bind the server to a public interface without a reverse proxy in front of it, an attacker can DoS it with a handful of TCP sockets. Treat the WebSocket port as you would a Postgres or Redis port: private, fronted, and rate-limited.
 
 Recommended deployment topology:
 
@@ -413,11 +423,12 @@ Concretely:
 
 1. **Bind the server to `127.0.0.1`** (or a private/VPC interface). The `--address 0.0.0.0` example in *Quick Start* is fine on a private network or behind a firewall but should not be used directly on the public internet.
 2. **Terminate TLS at the reverse proxy.** Let's Encrypt + Caddy/Nginx is the easy default; cloud LBs / Cloudflare also work.
-3. **Set per-IP connection and message limits at the proxy.** A single client subscribing to a few thousand `(coin, n_sig_figs, mantissa)` tuples can already make every other client pay for it; the server applies a hard cap of 256 subscriptions per WS connection, but the proxy is your first line of defense.
-4. **Enforce an `Origin` allowlist** if browser clients will connect, so other websites can't open WS connections from a user's session.
-5. **Lock down the metrics endpoint.** `--metrics-port` binds to `0.0.0.0:9090` by default and exposes internal telemetry that helps an attacker fingerprint your fleet. Run with `--metrics-port 0` to disable it, or proxy/firewall it to your Prometheus scraper only. There is no auth on `/metrics`.
-6. **Run `hl-node` and `orderbook_server` as separate Unix users.** `orderbook_server` only needs read access to the streaming directories (`node_*_streaming/`). It should *not* be able to write into the node's state.
-7. **Use the included systemd unit as a starting point**, but tighten it: set `LimitNOFILE`, `LimitNPROC`, `MemoryHigh` / `MemoryMax`, `Restart=on-failure`, and a short `RestartSec`. A short restart loop is acceptable because the server reloads its snapshot on startup.
+3. **Use `--secret` for shared-token WebSocket access** when clients connect through a private proxy or trusted network. Clients must use `/ws?token=<secret>`. URL-encode the token if it contains reserved URL characters.
+4. **Set per-IP connection and message limits at the proxy.** A single client subscribing to a few thousand `(coin, n_sig_figs, mantissa)` tuples can already make every other client pay for it; the server applies a hard cap of 256 subscriptions per WS connection, but the proxy is your first line of defense.
+5. **Enforce an `Origin` allowlist** if browser clients will connect, so other websites can't open WS connections from a user's session.
+6. **Lock down the metrics endpoint.** `--metrics-port` binds to `0.0.0.0:9090` by default and exposes internal telemetry that helps an attacker fingerprint your fleet. Run with `--metrics-port 0` to disable it, or proxy/firewall it to your Prometheus scraper only. There is no auth on `/metrics`.
+7. **Run `hl-node` and `orderbook_server` as separate Unix users.** `orderbook_server` only needs read access to the streaming directories (`node_*_streaming/`). It should *not* be able to write into the node's state.
+8. **Use the included systemd unit as a starting point**, but tighten it: set `LimitNOFILE`, `LimitNPROC`, `MemoryHigh` / `MemoryMax`, `Restart=on-failure`, and a short `RestartSec`. A short restart loop is acceptable because the server reloads its snapshot on startup.
 
 Minimal Nginx snippet for fronting the server (adjust paths and TLS as needed):
 

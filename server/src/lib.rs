@@ -9,7 +9,6 @@ mod types;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
-
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 
@@ -32,6 +31,8 @@ pub struct ServerConfig {
     pub compression_level: u32,
     /// Optional base directory for hlnode data
     pub data_dir: Option<PathBuf>,
+    /// Optional shared secret required as ?token=... on WebSocket handshakes
+    pub secret: Option<String>,
     /// Include perpetual futures markets
     pub include_perps: bool,
     /// Include spot markets (@ coins, PURR/USDC)

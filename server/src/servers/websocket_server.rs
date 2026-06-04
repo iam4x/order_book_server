@@ -4,9 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{Router, routing::get};
+use axum::{Router, extract::Query, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
+use serde::Deserialize;
 use tokio::{
     net::TcpListener,
     select,
@@ -35,6 +36,11 @@ use crate::{
         subscription::{ClientMessage, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
     },
 };
+
+#[derive(Debug, Deserialize)]
+struct WsAuthQuery {
+    token: Option<String>,
+}
 
 /// Per-subscription cached L2 broadcast. `version` is used for change-based dedup;
 /// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
@@ -109,6 +115,13 @@ async fn heartbeat_tick(ticker: &mut Option<tokio::time::Interval>) {
     }
 }
 
+fn websocket_token_authorized(secret: Option<&str>, token: Option<&str>) -> bool {
+    match secret {
+        Some(secret) => token == Some(secret),
+        None => true,
+    }
+}
+
 pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // Broadcast channel buffer. Each buffered Snapshot now holds Arc'd inner maps
     // shared across receivers, so deep cloning is no longer the cost - but a slow
@@ -145,6 +158,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
 
     let websocket_opts =
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
+    let websocket_secret = config.secret.as_deref().map(Arc::<str>::from);
 
     let start_time = Instant::now();
     let listener_for_health = listener.clone();
@@ -160,18 +174,27 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
                 let listener = listener.clone();
                 let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
-                move |ws_upgrade| async move {
-                    ws_handler(
-                        ws_upgrade,
-                        internal_message_tx.clone(),
-                        listener.clone(),
-                        Arc::clone(&l2_subscription_registry),
-                        market_filter,
-                        bbo_only,
-                        l2book_heartbeat_ms,
-                        bbo_heartbeat_ms,
-                        websocket_opts,
-                    )
+                let websocket_secret = websocket_secret.clone();
+                move |Query(query): Query<WsAuthQuery>, ws_upgrade| {
+                    let websocket_secret = websocket_secret.clone();
+                    async move {
+                        if !websocket_token_authorized(websocket_secret.as_deref(), query.token.as_deref()) {
+                            return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized websocket connection")
+                                .into_response();
+                        }
+
+                        ws_handler(
+                            ws_upgrade,
+                            internal_message_tx.clone(),
+                            listener.clone(),
+                            Arc::clone(&l2_subscription_registry),
+                            market_filter,
+                            bbo_only,
+                            l2book_heartbeat_ms,
+                            bbo_heartbeat_ms,
+                            websocket_opts,
+                        )
+                    }
                 }
             }),
         )
@@ -220,7 +243,6 @@ fn ws_handler(
     bbo_heartbeat_ms: u64,
     websocket_opts: yawc::Options,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     // Reject malformed WS handshakes cleanly. The previous `.unwrap()` would panic
     // inside the axum handler task and dump a backtrace per request.
     let (resp, fut) = match incoming.upgrade(websocket_opts) {
@@ -253,6 +275,36 @@ fn ws_handler(
     });
 
     resp.into_response()
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::websocket_token_authorized;
+
+    #[test]
+    fn no_secret_allows_missing_token() {
+        assert!(websocket_token_authorized(None, None));
+    }
+
+    #[test]
+    fn no_secret_allows_any_token() {
+        assert!(websocket_token_authorized(None, Some("anything")));
+    }
+
+    #[test]
+    fn secret_accepts_exact_token() {
+        assert!(websocket_token_authorized(Some("secret"), Some("secret")));
+    }
+
+    #[test]
+    fn secret_rejects_missing_token() {
+        assert!(!websocket_token_authorized(Some("secret"), None));
+    }
+
+    #[test]
+    fn secret_rejects_mismatched_token() {
+        assert!(!websocket_token_authorized(Some("secret"), Some("wrong")));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

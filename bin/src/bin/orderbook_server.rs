@@ -111,6 +111,10 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
+    /// Optional shared secret required as ?token=... on WebSocket connections
+    #[arg(long)]
+    secret: Option<String>,
+
     /// Which markets to include: comma-separated perps, spot, hip3, or all
     #[arg(long, default_value = "all")]
     markets: Markets,
@@ -213,6 +217,7 @@ async fn main() -> Result<()> {
         address: full_address.clone(),
         compression_level: args.compression_level,
         data_dir: args.data_dir,
+        secret: args.secret,
         include_perps,
         include_spot,
         include_hip3,
@@ -256,6 +261,7 @@ async fn main() -> Result<()> {
     if config.metrics_port > 0 {
         println!("  Metrics: http://0.0.0.0:{}/metrics", config.metrics_port);
     }
+    println!("  WebSocket auth: {}", if config.secret.is_some() { "enabled" } else { "disabled" });
     println!("  Log level: {}", args.log_level);
     println!();
 
@@ -347,5 +353,19 @@ mod tests {
             .expect("comma-delimited markets should parse");
 
         assert_eq!(args.markets, Markets { include_perps: true, include_spot: false, include_hip3: true });
+    }
+
+    #[test]
+    fn cli_secret_is_optional() {
+        let args = Args::try_parse_from(["orderbook_server"]).expect("default args should parse");
+
+        assert_eq!(args.secret, None);
+    }
+
+    #[test]
+    fn cli_parses_secret() {
+        let args = Args::try_parse_from(["orderbook_server", "--secret", "super-secret"]).expect("secret should parse");
+
+        assert_eq!(args.secret.as_deref(), Some("super-secret"));
     }
 }
