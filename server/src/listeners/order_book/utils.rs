@@ -191,15 +191,9 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
     requested_params: &HashSet<L2SnapshotParams>,
 ) -> HashMap<L2SnapshotParams, Snapshot<InnerLevel>> {
     let max_levels = Some(crate::types::subscription::MAX_LEVELS);
-    requested_params
-        .iter()
-        .map(|params| {
-            (
-                *params,
-                order_book.to_l2_snapshot(max_levels, params.n_sig_figs, params.mantissa),
-            )
-        })
-        .collect()
+    let params: Vec<_> = requested_params.iter().copied().collect();
+    let raw_params: Vec<_> = params.iter().map(|params| (params.n_sig_figs, params.mantissa)).collect();
+    params.into_iter().zip(order_book.to_l2_snapshots(max_levels, &raw_params)).collect()
 }
 
 /// Incremental rebuild: recomputes variants only for `changed_coins`, reuses

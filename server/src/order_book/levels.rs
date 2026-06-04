@@ -19,6 +19,7 @@ fn bucket(px: Px, side: Side, n_sig_figs: Option<u32>, mantissa: Option<u64>) ->
 
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn to_l2_snapshot(
         &self,
         n_levels: Option<usize>,
@@ -30,6 +31,17 @@ impl<O: InnerOrder> OrderBook<O> {
         let bids = map_to_l2_levels(bids, Side::Bid, n_levels, n_sig_figs, mantissa);
         let asks = map_to_l2_levels(asks, Side::Ask, n_levels, n_sig_figs, mantissa);
         Snapshot([bids, asks])
+    }
+
+    #[must_use]
+    pub(crate) fn to_l2_snapshots(
+        &self,
+        n_levels: Option<usize>,
+        params: &[(Option<u32>, Option<u64>)],
+    ) -> Vec<Snapshot<InnerLevel>> {
+        let bids = map_to_l2_levels_many(&self.bids, Side::Bid, n_levels, params);
+        let asks = map_to_l2_levels_many(&self.asks, Side::Ask, n_levels, params);
+        bids.into_iter().zip(asks).map(|(bids, asks)| Snapshot([bids, asks])).collect()
     }
 }
 
@@ -77,6 +89,7 @@ fn l2_levels_to_l2_levels(
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn map_to_l2_levels<O: InnerOrder>(
     orders: &BTreeMap<Px, LinkedList<Oid, O>>,
     side: Side,
@@ -111,6 +124,72 @@ fn map_to_l2_levels<O: InnerOrder>(
     }
     levels.extend(cur_level.take());
     levels
+}
+
+struct L2LevelBuildState {
+    n_sig_figs: Option<u32>,
+    mantissa: Option<u64>,
+    levels: Vec<InnerLevel>,
+    cur_level: Option<InnerLevel>,
+    done: bool,
+}
+
+#[must_use]
+fn map_to_l2_levels_many<O: InnerOrder>(
+    orders: &BTreeMap<Px, LinkedList<Oid, O>>,
+    side: Side,
+    n_levels: Option<usize>,
+    params: &[(Option<u32>, Option<u64>)],
+) -> Vec<Vec<InnerLevel>> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+    if n_levels == Some(0) {
+        return vec![Vec::new(); params.len()];
+    }
+
+    let mut states: Vec<_> = params
+        .iter()
+        .map(|&(n_sig_figs, mantissa)| L2LevelBuildState {
+            n_sig_figs,
+            mantissa,
+            levels: Vec::new(),
+            cur_level: None,
+            done: false,
+        })
+        .collect();
+
+    let order_iter: Box<dyn Iterator<Item = (&Px, &LinkedList<Oid, O>)>> = match side {
+        Side::Ask => Box::new(orders.iter()),
+        Side::Bid => Box::new(orders.iter().rev()),
+    };
+    for (px, orders) in order_iter {
+        let sz = orders.fold(Sz::new(0), |sz, order| *sz = *sz + order.sz());
+        let n = orders.fold(0, |n, _| *n += 1);
+        let level = InnerLevel { px: *px, sz, n };
+        for state in states.iter_mut().filter(|state| !state.done) {
+            state.done = build_l2_level(
+                &mut state.cur_level,
+                &mut state.levels,
+                n_levels,
+                state.n_sig_figs,
+                state.mantissa,
+                side,
+                level.clone(),
+            );
+        }
+        if states.iter().all(|state| state.done) {
+            break;
+        }
+    }
+
+    states
+        .into_iter()
+        .map(|mut state| {
+            state.levels.extend(state.cur_level.take());
+            state.levels
+        })
+        .collect()
 }
 
 pub(super) fn build_l2_level(
@@ -214,6 +293,23 @@ mod tests {
         let [bids, asks] = to_levels(snapshot);
         assert_eq!(bids.len(), 2);
         assert_eq!(asks.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_l2_snapshots_match_individual_snapshots() {
+        let book = make_book(
+            &[(3450, 10, 1), (3449, 20, 2), (3410, 30, 1), (3390, 40, 1), (3350, 50, 1)],
+            &[(3451, 15, 1), (3460, 25, 2), (3499, 35, 1), (3510, 45, 1), (3590, 55, 1)],
+        );
+        let params = [(None, None), (Some(2), None), (Some(3), None), (Some(5), Some(2))];
+
+        let snapshots = book.to_l2_snapshots(Some(3), &params);
+
+        assert_eq!(snapshots.len(), params.len());
+        for (index, (n_sig_figs, mantissa)) in params.iter().copied().enumerate() {
+            let expected = book.to_l2_snapshot(Some(3), n_sig_figs, mantissa);
+            assert_eq!(to_levels(snapshots[index].clone()), to_levels(expected));
+        }
     }
 
     #[test]
