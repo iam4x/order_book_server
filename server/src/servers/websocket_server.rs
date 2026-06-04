@@ -324,7 +324,16 @@ async fn handle_socket(
                                     if !alive { break; }
                                     // Skip BBO subs here - they get fast updates via BboUpdate
                                     if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2).await;
+                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2, true).await;
+                                    }
+                                }
+                            },
+                            InternalMessage::L2Update{ l2_snapshots, time } => {
+                                for sub in manager.subscriptions() {
+                                    if !alive { break; }
+                                    // Partial L2 updates intentionally omit unchanged coins.
+                                    if !matches!(sub, Subscription::Bbo { .. }) {
+                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2, false).await;
                                     }
                                 }
                             },
@@ -687,6 +696,7 @@ async fn send_ws_data_from_snapshot(
     time: u64,
     last_bbo: &mut HashMap<String, BboEntry>,
     last_l2: &mut HashMap<String, L2Entry>,
+    missing_is_error: bool,
 ) -> bool {
     match subscription {
         Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
@@ -723,7 +733,9 @@ async fn send_ws_data_from_snapshot(
                 }
                 // else: skip, L2 unchanged
             } else {
-                error!("Coin {coin} not found");
+                if missing_is_error {
+                    error!("Coin {coin} not found");
+                }
             }
         }
         Subscription::Bbo { coin } => {

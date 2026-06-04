@@ -264,8 +264,10 @@ impl OrderBookListener {
                     }
 
                     if let Some(tx) = &self.internal_message_tx {
-                        let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots, time });
-                        drop(tx.send(msg));
+                        if !l2_snapshots.is_empty() {
+                            let msg = Arc::new(InternalMessage::L2Update { l2_snapshots, time });
+                            drop(tx.send(msg));
+                        }
                     }
                     L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
                 }
@@ -505,6 +507,10 @@ impl L2Snapshots {
     pub(crate) const fn as_ref(&self) -> &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>> {
         &self.0
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 pub(crate) struct TimedSnapshots {
@@ -515,7 +521,12 @@ pub(crate) struct TimedSnapshots {
 
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
+    #[allow(dead_code)]
     Snapshot {
+        l2_snapshots: L2Snapshots,
+        time: u64,
+    },
+    L2Update {
         l2_snapshots: L2Snapshots,
         time: u64,
     },
@@ -782,7 +793,7 @@ mod tests {
     fn drain_latest_l2(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
         let mut latest = None;
         while let Ok(msg) = rx.try_recv() {
-            if matches!(msg.as_ref(), InternalMessage::Snapshot { .. }) {
+            if matches!(msg.as_ref(), InternalMessage::Snapshot { .. } | InternalMessage::L2Update { .. }) {
                 latest = Some(msg);
             }
         }
@@ -821,7 +832,7 @@ mod tests {
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
-            InternalMessage::Snapshot { l2_snapshots, .. } => {
+            InternalMessage::Snapshot { l2_snapshots, .. } | InternalMessage::L2Update { l2_snapshots, .. } => {
                 assert_eq!(l2_best_bid_sz(l2_snapshots, "BTC"), "2");
             }
             _ => unreachable!("drain_latest_l2 only returns snapshots"),
@@ -849,7 +860,7 @@ mod tests {
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
-            InternalMessage::Snapshot { l2_snapshots, .. } => {
+            InternalMessage::Snapshot { l2_snapshots, .. } | InternalMessage::L2Update { l2_snapshots, .. } => {
                 assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 0), "1");
                 assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 1), "2");
             }

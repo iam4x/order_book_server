@@ -248,14 +248,14 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
                 .map(|book| (coin, Arc::new(compute_l2_variants_for_coin(book, requested_params))))
         })
         .collect();
+    let mut snapshot = HashMap::with_capacity(updates.len());
     for (coin, arc) in updates {
-        cache.insert(coin, arc);
+        cache.insert(coin.clone(), Arc::clone(&arc));
+        snapshot.insert(coin, arc);
     }
 
-    // Build the outgoing L2Snapshots from the cache. Each entry is an Arc::clone -
-    // O(coins) cheap atomic bumps, no level data is copied.
-    let snapshot: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>> =
-        cache.iter().map(|(c, arc)| (c.clone(), Arc::clone(arc))).collect();
+    // Return only the entries that were recomputed for this update. The listener
+    // cache still holds the full active state for future reuse.
     L2Snapshots(snapshot)
 }
 
@@ -303,12 +303,13 @@ mod tests {
 
         let mut cache = HashMap::new();
         // First call seeds the cache for both coins.
-        drop(compute_l2_snapshots_incremental(
+        let seeded = compute_l2_snapshots_incremental(
             &books,
             &HashSet::new(),
             &all_l2_snapshot_params(),
             &mut cache,
-        ));
+        );
+        assert_eq!(seeded.as_ref().len(), 2);
         assert_eq!(cache.len(), 2);
         let btc_first = Arc::clone(cache.get(&Coin::new("BTC")).unwrap());
         let eth_first = Arc::clone(cache.get(&Coin::new("ETH")).unwrap());
@@ -316,12 +317,14 @@ mod tests {
         // Mark BTC changed; ETH unchanged. ETH's Arc must be the same object.
         let changed: HashSet<Coin> = std::iter::once(Coin::new("BTC")).collect();
         books.add_order(order(3, "BTC", Side::Bid, "2", "50001"));
-        drop(compute_l2_snapshots_incremental(
+        let changed_snapshot = compute_l2_snapshots_incremental(
             &books,
             &changed,
             &all_l2_snapshot_params(),
             &mut cache,
-        ));
+        );
+        assert_eq!(changed_snapshot.as_ref().len(), 1);
+        assert!(changed_snapshot.as_ref().contains_key(&Coin::new("BTC")));
 
         let btc_after = cache.get(&Coin::new("BTC")).unwrap();
         let eth_after = cache.get(&Coin::new("ETH")).unwrap();
