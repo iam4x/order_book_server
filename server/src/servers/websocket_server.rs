@@ -1,6 +1,7 @@
 use crate::{
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen_hft,
+        InternalMessage, L2SnapshotParams, L2Snapshots, L2SubscriptionRegistry, OrderBookListener, TimedSnapshots,
+        hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
@@ -53,6 +54,43 @@ struct BboEntry {
 
 fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>) -> String {
     format!("{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0))
+}
+
+struct ConnectionL2Registrations {
+    registry: Arc<L2SubscriptionRegistry>,
+    subscriptions: HashSet<(String, L2SnapshotParams)>,
+}
+
+impl ConnectionL2Registrations {
+    fn new(registry: Arc<L2SubscriptionRegistry>) -> Self {
+        Self { registry, subscriptions: HashSet::new() }
+    }
+
+    fn register(&mut self, subscription: &Subscription) {
+        if let Subscription::L2Book { coin, n_sig_figs, mantissa, .. } = subscription {
+            let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
+            if self.subscriptions.insert((coin.clone(), params)) {
+                self.registry.register_params(params);
+            }
+        }
+    }
+
+    fn unregister(&mut self, subscription: &Subscription) {
+        if let Subscription::L2Book { coin, n_sig_figs, mantissa, .. } = subscription {
+            let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
+            if self.subscriptions.remove(&(coin.clone(), params)) {
+                self.registry.unregister_params(params);
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionL2Registrations {
+    fn drop(&mut self) {
+        for (_, params) in self.subscriptions.drain() {
+            self.registry.unregister_params(params);
+        }
+    }
 }
 
 /// Build a tokio interval that fires often enough to drive both heartbeats with
@@ -114,6 +152,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
 
     let start_time = Instant::now();
     let listener_for_health = listener.clone();
+    let l2_subscription_registry = listener.lock().await.l2_subscription_registry();
 
     let app: Router = Router::new()
         .route(
@@ -124,11 +163,13 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
                 let listener = listener.clone();
+                let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
                 move |ws_upgrade| async move {
                     ws_handler(
                         ws_upgrade,
                         internal_message_tx.clone(),
                         listener.clone(),
+                        Arc::clone(&l2_subscription_registry),
                         market_filter,
                         bbo_only,
                         l2book_heartbeat_ms,
@@ -176,6 +217,7 @@ fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
@@ -201,8 +243,17 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, market_filter, bbo_only, l2book_heartbeat_ms, bbo_heartbeat_ms)
-            .await
+        handle_socket(
+            ws,
+            internal_message_tx,
+            listener,
+            l2_subscription_registry,
+            market_filter,
+            bbo_only,
+            l2book_heartbeat_ms,
+            bbo_heartbeat_ms,
+        )
+        .await
     });
 
     resp.into_response()
@@ -213,6 +264,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
@@ -241,6 +293,7 @@ async fn handle_socket(
     let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
     let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
+    let mut l2_registrations = ConnectionL2Registrations::new(l2_subscription_registry);
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         let _ = send_socket_message(&mut socket, msg).await;
@@ -399,7 +452,17 @@ async fn handle_socket(
                                         alive &= send_socket_message(&mut socket, ServerResponse::Pong).await;
                                     }
                                     _ => {
-                                        alive &= receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), bbo_only, &mut last_l2, &mut last_bbo).await;
+                                        alive &= receive_client_message(
+                                            &mut socket,
+                                            &mut manager,
+                                            value,
+                                            &universe,
+                                            listener.clone(),
+                                            bbo_only,
+                                            &mut last_l2,
+                                            &mut last_bbo,
+                                            &mut l2_registrations,
+                                        ).await;
                                     }
                                 }
                             }
@@ -434,6 +497,7 @@ async fn receive_client_message(
     bbo_only: bool,
     last_l2: &mut HashMap<String, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
+    l2_registrations: &mut ConnectionL2Registrations,
 ) -> bool {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -469,6 +533,7 @@ async fn receive_client_message(
                 match &subscription {
                     Subscription::L2Book { coin, n_sig_figs, mantissa, .. } => {
                         last_l2.remove(&l2_cache_key(coin, *n_sig_figs, *mantissa));
+                        l2_registrations.unregister(&subscription);
                     }
                     Subscription::Bbo { coin } => {
                         last_bbo.remove(coin);
@@ -494,8 +559,16 @@ async fn receive_client_message(
         } else {
             None
         };
+        let subscribed = if let ClientMessage::Subscribe { subscription } = &client_message {
+            Some(subscription.clone())
+        } else {
+            None
+        };
         if !send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await {
             return false;
+        }
+        if let Some(subscription) = &subscribed {
+            l2_registrations.register(subscription);
         }
         if let Some(snapshot_msg) = snapshot_msg {
             return send_socket_message(socket, snapshot_msg).await;

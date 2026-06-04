@@ -20,7 +20,7 @@ use alloy::primitives::Address;
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::Duration,
 };
 use tokio::{
@@ -39,6 +39,35 @@ mod utils;
 
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 const L2_FLUSH_TICK_MS: u64 = 10;
+
+#[derive(Default)]
+pub(crate) struct L2SubscriptionRegistry {
+    params: StdMutex<HashMap<L2SnapshotParams, usize>>,
+}
+
+impl L2SubscriptionRegistry {
+    fn params(&self) -> StdMutexGuard<'_, HashMap<L2SnapshotParams, usize>> {
+        self.params.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn register_params(&self, params: L2SnapshotParams) {
+        *self.params().entry(params).or_insert(0) += 1;
+    }
+
+    pub(crate) fn unregister_params(&self, params: L2SnapshotParams) {
+        let mut counts = self.params();
+        if let Some(count) = counts.get_mut(&params) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&params);
+            }
+        }
+    }
+
+    pub(crate) fn active_params(&self) -> HashSet<L2SnapshotParams> {
+        self.params().keys().copied().collect()
+    }
+}
 
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
@@ -105,6 +134,7 @@ pub(crate) struct OrderBookListener {
     // the broadcast Arc, so unchanged coins cost an atomic bump rather than a
     // full level-vector clone. Invalidated in `init_from_snapshot`.
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
+    l2_subscription_registry: Arc<L2SubscriptionRegistry>,
 }
 
 impl OrderBookListener {
@@ -117,6 +147,7 @@ impl OrderBookListener {
             last_l2_broadcast: None,
             pending_l2_changed_coins: HashSet::new(),
             l2_snapshot_cache: HashMap::new(),
+            l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
         }
     }
 
@@ -126,6 +157,10 @@ impl OrderBookListener {
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
         self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    }
+
+    pub(crate) fn l2_subscription_registry(&self) -> Arc<L2SubscriptionRegistry> {
+        Arc::clone(&self.l2_subscription_registry)
     }
 
     fn begin_caching(&mut self) {
@@ -170,6 +205,13 @@ impl OrderBookListener {
         // only when receivers existed, so with zero subscribers the throttle reset
         // never fired and the par_iter ran on every event - tens of GB of allocator
         // churn per hour and a pinned listener mutex.
+        let requested_params = self.l2_subscription_registry.active_params();
+        if requested_params.is_empty() {
+            self.pending_l2_changed_coins.clear();
+            self.l2_snapshot_cache.clear();
+            return;
+        }
+
         let should_broadcast_l2 = !self.pending_l2_changed_coins.is_empty()
             && self
                 .last_l2_broadcast
@@ -186,7 +228,7 @@ impl OrderBookListener {
                     let l2_start = Instant::now();
                     let changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
                     let (time, l2_snapshots) =
-                        state.l2_snapshots_incremental(&changed_for_l2, &mut self.l2_snapshot_cache);
+                        state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
 
                     static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -468,7 +510,7 @@ pub(crate) enum InternalMessage {
     },
 }
 
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
@@ -666,12 +708,14 @@ mod tests {
         let snapshots = Snapshots::new(HashMap::from([(Coin::new("BTC"), book.to_snapshot())]));
         let mut listener = OrderBookListener::new(Some(tx), false);
         listener.init_from_snapshot(snapshots, 0);
+        listener.l2_subscription_registry.register_params(L2SnapshotParams::new(None, None));
 
         // Seed the L2 cache with the original BTC size. The regression below verifies
         // that a throttled BTC change invalidates this cached entry before the next L2 send.
         let state = listener.order_book_state.as_ref().expect("state initialized");
         let empty = HashSet::new();
-        let (_time, seeded) = state.l2_snapshots_incremental(&empty, &mut listener.l2_snapshot_cache);
+        let requested_params = listener.l2_subscription_registry.active_params();
+        let (_time, seeded) = state.l2_snapshots_incremental(&empty, &requested_params, &mut listener.l2_snapshot_cache);
         assert_eq!(l2_best_bid_sz(&seeded, "BTC"), "1");
         listener
     }
@@ -774,5 +818,21 @@ mod tests {
             _ => unreachable!("drain_latest_l2 only returns snapshots"),
         }
         assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn l2_flush_without_active_l2_subscribers_skips_snapshot_work() {
+        let (tx, mut rx) = channel(8);
+        let mut listener = listener_with_btc_bid(tx);
+        listener.l2_subscription_registry.unregister_params(L2SnapshotParams::new(None, None));
+        listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
+        assert!(!listener.l2_snapshot_cache.is_empty(), "test setup should seed cache");
+
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+
+        assert!(listener.pending_l2_changed_coins.is_empty());
+        assert!(listener.l2_snapshot_cache.is_empty());
+        assert!(drain_latest_l2(&mut rx).is_none());
     }
 }

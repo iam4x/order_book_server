@@ -66,11 +66,13 @@ impl OrderBookState {
     pub(super) fn l2_snapshots_incremental(
         &self,
         changed_coins: &HashSet<Coin>,
+        requested_params: &HashSet<crate::listeners::order_book::L2SnapshotParams>,
         cache: &mut HashMap<Coin, std::sync::Arc<HashMap<crate::listeners::order_book::L2SnapshotParams, crate::order_book::Snapshot<crate::types::inner::InnerLevel>>>>,
     ) -> (u64, L2Snapshots) {
         let snapshots = crate::listeners::order_book::utils::compute_l2_snapshots_incremental(
             &self.order_book,
             changed_coins,
+            requested_params,
             cache,
         );
         (self.time, snapshots)

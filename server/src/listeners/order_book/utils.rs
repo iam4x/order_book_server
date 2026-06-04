@@ -167,34 +167,39 @@ impl L2SnapshotParams {
     }
 }
 
+#[cfg(test)]
+pub(super) fn all_l2_snapshot_params() -> HashSet<L2SnapshotParams> {
+    let mut params = HashSet::with_capacity(7);
+    params.insert(L2SnapshotParams::new(None, None));
+    for n_sig_figs in (2..=5).rev() {
+        if n_sig_figs == 5 {
+            for mantissa in [None, Some(2), Some(5)] {
+                params.insert(L2SnapshotParams::new(Some(n_sig_figs), mantissa));
+            }
+        } else {
+            params.insert(L2SnapshotParams::new(Some(n_sig_figs), None));
+        }
+    }
+    params
+}
+
 /// Build the seven L2 aggregation variants for a single coin's order book.
 /// Pulled out of `compute_l2_snapshots` so incremental updates can call it
 /// per coin without rerunning the full universe scan.
 fn compute_l2_variants_for_coin<O: InnerOrder>(
     order_book: &crate::order_book::OrderBook<O>,
+    requested_params: &HashSet<L2SnapshotParams>,
 ) -> HashMap<L2SnapshotParams, Snapshot<InnerLevel>> {
     let max_levels = Some(crate::types::subscription::MAX_LEVELS);
-    let mut entries = Vec::with_capacity(7);
-    entries.push((
-        L2SnapshotParams { n_sig_figs: None, mantissa: None },
-        order_book.to_l2_snapshot(max_levels, None, None),
-    ));
-    for n_sig_figs in (2..=5).rev() {
-        if n_sig_figs == 5 {
-            for mantissa in [None, Some(2), Some(5)] {
-                entries.push((
-                    L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa },
-                    order_book.to_l2_snapshot(max_levels, Some(n_sig_figs), mantissa),
-                ));
-            }
-        } else {
-            entries.push((
-                L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa: None },
-                order_book.to_l2_snapshot(max_levels, Some(n_sig_figs), None),
-            ));
-        }
-    }
-    entries.into_iter().collect()
+    requested_params
+        .iter()
+        .map(|params| {
+            (
+                *params,
+                order_book.to_l2_snapshot(max_levels, params.n_sig_figs, params.mantissa),
+            )
+        })
+        .collect()
 }
 
 /// Incremental rebuild: recomputes variants only for `changed_coins`, reuses
@@ -209,18 +214,27 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
 pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     order_books: &OrderBooks<O>,
     changed_coins: &HashSet<Coin>,
+    requested_params: &HashSet<L2SnapshotParams>,
     cache: &mut HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
 ) -> L2Snapshots {
+    if requested_params.is_empty() {
+        cache.clear();
+        return L2Snapshots(HashMap::new());
+    }
+
     // Evict stale entries.
     cache.retain(|coin, _| order_books.as_ref().contains_key(coin));
 
     // Determine which coins we actually need to (re)compute: anything in
     // `changed_coins` that the book still contains, plus any present-but-uncached
     // coins (first-time broadcast after a snapshot reset).
-    let mut to_compute: Vec<Coin> = changed_coins.iter().filter(|c| order_books.as_ref().contains_key(c)).cloned().collect();
+    let mut to_compute: HashSet<Coin> = changed_coins.iter().filter(|c| order_books.as_ref().contains_key(c)).cloned().collect();
     for coin in order_books.as_ref().keys() {
-        if !cache.contains_key(coin) && !changed_coins.contains(coin) {
-            to_compute.push(coin.clone());
+        let has_all_requested_params = cache.get(coin).is_some_and(|variants| {
+            variants.len() == requested_params.len() && requested_params.iter().all(|params| variants.contains_key(params))
+        });
+        if !has_all_requested_params {
+            to_compute.insert(coin.clone());
         }
     }
 
@@ -228,7 +242,10 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     let updates: Vec<(Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>)> = to_compute
         .into_par_iter()
         .filter_map(|coin| {
-            order_books.as_ref().get(&coin).map(|book| (coin, Arc::new(compute_l2_variants_for_coin(book))))
+            order_books
+                .as_ref()
+                .get(&coin)
+                .map(|book| (coin, Arc::new(compute_l2_variants_for_coin(book, requested_params))))
         })
         .collect();
     for (coin, arc) in updates {
@@ -286,7 +303,12 @@ mod tests {
 
         let mut cache = HashMap::new();
         // First call seeds the cache for both coins.
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache);
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &all_l2_snapshot_params(),
+            &mut cache,
+        ));
         assert_eq!(cache.len(), 2);
         let btc_first = Arc::clone(cache.get(&Coin::new("BTC")).unwrap());
         let eth_first = Arc::clone(cache.get(&Coin::new("ETH")).unwrap());
@@ -294,7 +316,12 @@ mod tests {
         // Mark BTC changed; ETH unchanged. ETH's Arc must be the same object.
         let changed: HashSet<Coin> = std::iter::once(Coin::new("BTC")).collect();
         books.add_order(order(3, "BTC", Side::Bid, "2", "50001"));
-        let _ = compute_l2_snapshots_incremental(&books, &changed, &mut cache);
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &changed,
+            &all_l2_snapshot_params(),
+            &mut cache,
+        ));
 
         let btc_after = cache.get(&Coin::new("BTC")).unwrap();
         let eth_after = cache.get(&Coin::new("ETH")).unwrap();
@@ -309,13 +336,23 @@ mod tests {
         books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
 
         let mut cache = HashMap::new();
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache);
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &all_l2_snapshot_params(),
+            &mut cache,
+        ));
         assert!(cache.contains_key(&Coin::new("BTC")));
 
         // Cancel BTC's only order — the multi-book evicts the empty book, which
         // means our cache must also drop the entry on the next incremental call.
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC"));
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache);
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &all_l2_snapshot_params(),
+            &mut cache,
+        ));
         assert!(!cache.contains_key(&Coin::new("BTC")), "BTC entry should have been evicted from the cache");
         assert!(cache.contains_key(&Coin::new("ETH")));
     }
@@ -328,7 +365,12 @@ mod tests {
         }
 
         let mut cache = HashMap::new();
-        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache));
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &all_l2_snapshot_params(),
+            &mut cache,
+        ));
         let btc = cache.get(&Coin::new("BTC")).expect("BTC cache");
 
         for snapshot in btc.values() {
@@ -339,5 +381,19 @@ mod tests {
             btc.get(&L2SnapshotParams::new(None, None)).expect("default l2").as_ref()[0].len(),
             crate::types::subscription::MAX_LEVELS
         );
+    }
+
+    #[test]
+    fn test_l2_variants_only_include_requested_params() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        books.add_order(order(1, "BTC", Side::Bid, "1", "50000"));
+
+        let requested_params = HashSet::from([L2SnapshotParams::new(None, None)]);
+        let mut cache = HashMap::new();
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &requested_params, &mut cache));
+
+        let btc = cache.get(&Coin::new("BTC")).expect("BTC cache");
+        assert_eq!(btc.len(), 1);
+        assert!(btc.contains_key(&L2SnapshotParams::new(None, None)));
     }
 }
