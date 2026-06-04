@@ -30,9 +30,10 @@ The server runs co-located with a Hyperliquid node and is memory-light relative 
 
 | Profile | CPU | RAM (steady-state) | Notes |
 |---------|-----|---------------------|-------|
-| **Full (`--markets all`)** | 2 cores minimum, 4+ recommended | ~750 MB – 2 GB | Rises with connected clients and L2 subscription fanout. Reserve **4 GB** for headroom in production. |
-| **Perps only (`--markets perps`)** | 2 cores | ~400 MB – 1 GB | Smaller universe ≈ smaller book and fewer L2 variants to compute. |
-| **BBO-only (`--bbo-only`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
+| **Full (`--features all --markets all`)** | 2 cores minimum, 4+ recommended | ~750 MB – 2 GB | Rises with connected clients and L2 subscription fanout. Reserve **4 GB** for headroom in production. |
+| **Perps only (`--markets perps`)** | 2 cores | ~400 MB – 1 GB | Smaller public universe and fewer L2 variants to compute. |
+| **BBO only (`--features bbo`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
+| **Raw streams only (`--features trades,bookdiffs,orderupdates`)** | 1 core | lowest | Skips startup snapshot and in-memory orderbook state. |
 
 Other requirements:
 
@@ -81,6 +82,7 @@ cargo build --release
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
 | `--secret` | unset | Require WebSocket clients to connect with `?token=<secret>` |
 | `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
+| `--features` | `all` | Comma-delimited `bbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -98,7 +100,7 @@ Your WebSocket client must support `permessage-deflate` for levels 1-9 to have a
 
 ### Snapshot Mode
 
-On startup, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book.
+When `bbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` skip this snapshot and start serving as soon as their file watchers are running.
 
 The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
@@ -107,6 +109,30 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 **`direct`** - Use when your node runs directly on the host via systemctl or bare metal. The server calls the `hl-node` binary directly on the host to generate the snapshot.
 
 After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify. No further snapshots are needed unless the server restarts.
+
+### Feature Selection
+
+The `--features` flag controls both the WebSocket channels the server accepts and the upstream work it performs.
+
+| Feature | WebSocket type | Requires snapshot/orderbook state | Watched node stream |
+|---------|----------------|------------------------------------|---------------------|
+| `bbo` | `bbo` | Yes | order diffs + order statuses |
+| `l2book` | `l2Book` | Yes | order diffs + order statuses |
+| `l4book` | `l4Book` | Yes | order diffs + order statuses |
+| `trades` | `trades` | No | fills |
+| `bookdiffs` | `bookDiffs` | No | order diffs |
+| `orderupdates` | `orderUpdates` | No | order statuses |
+
+Examples:
+
+```bash
+--features bbo
+--features l2book
+--features bbo,l2book,trades
+--features trades,orderupdates
+```
+
+If a client subscribes to a disabled channel, the server returns an error and does not register that subscription. Raw-only modes skip snapshot-derived coin validation; a syntactically valid coin in the selected `--markets` category is accepted and receives data only if the node emits it.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -136,7 +162,6 @@ The `--markets` flag accepts comma-delimited market names. The `all` value remai
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
-| `--bbo-only` | `false` | Lightweight BBO-only mode (~100 MB RAM, vs ~1 GB for full markets). Disables L2/L4/Trades subscriptions |
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 
@@ -169,6 +194,7 @@ Optimized for sub-millisecond BBO updates. Compression is disabled to eliminate 
 
 ```bash
 ./target/release/orderbook_server \
+    --features bbo \
     --compression-level 0 \
     --markets perps \
     --data-dir /path/to/data
@@ -191,7 +217,7 @@ Track only the top-of-book bid/ask for all coins. Uses ~100 MB RAM (vs ~1 GB for
 
 ```bash
 ./target/release/orderbook_server \
-    --bbo-only \
+    --features bbo \
     --compression-level 0 \
     --data-dir /path/to/data
 ```
@@ -505,7 +531,7 @@ This fork processes every order diff, status, and fill **the instant it arrives*
 
 The original uses a single file watcher thread that handles all three event sources (order statuses, book diffs, fills) sequentially.
 
-This fork spawns **3 dedicated inotify threads** (one per event source) with independent crossbeam channels bridged to the tokio async runtime. Order diffs (the BBO-critical path) are never blocked by slow fill or status parsing.
+This fork spawns dedicated inotify threads for the event sources required by `--features`, with independent crossbeam channels bridged to the tokio async runtime. Order diffs (the BBO-critical path) are never blocked by slow fill or status parsing.
 
 ### New Subscription Types
 
@@ -526,9 +552,9 @@ This fork deduplicates at the WebSocket level:
 - **L2Book**: only sends when the snapshot hash changes (~10us overhead)
 - Saves ~500us per unchanged update and significantly reduces client-side bandwidth
 
-### BBO-Only Lightweight Mode
+### Granular Feature Selection
 
-New `--bbo-only` flag reduces memory from ~1 GB to ~100 MB by only tracking the top-of-book bid/ask per coin. L2/L4/Trades subscriptions are disabled. Useful for price feeds, alerting, or memory-constrained environments.
+The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, and raw-only configurations such as `--features trades,orderupdates` skip the startup snapshot and in-memory orderbook maintenance entirely.
 
 ### Snapshot Modes: Docker & Direct
 
@@ -571,7 +597,7 @@ Both use `yawc` with `permessage-deflate`. This fork increases the broadcast cha
 | File watchers | 1 thread | 3 parallel threads |
 | BBO subscription | No | Yes + dedup |
 | Order updates | No | Yes (per-user) |
-| BBO-only mode | No | Yes (~100MB) |
+| Granular feature flag | No | Yes (`--features ...`) |
 | Metrics | None | 25+ Prometheus metrics |
 | Health endpoint | No | Yes |
 | Snapshot modes | HTTP RPC | Docker + Direct CLI |

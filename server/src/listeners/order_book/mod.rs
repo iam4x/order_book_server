@@ -17,6 +17,7 @@ use tokio::{
 use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file};
 
 use crate::{
+    FeatureSet,
     listeners::order_book::state::OrderBookState,
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
@@ -162,6 +163,7 @@ fn fetch_snapshot(
 
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
+    features: FeatureSet,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     // Only Some when we want it to collect updates
@@ -185,9 +187,14 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        features: FeatureSet,
+    ) -> Self {
         Self {
             ignore_spot,
+            features,
             order_book_state: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
@@ -202,8 +209,8 @@ impl OrderBookListener {
         }
     }
 
-    pub(crate) const fn is_ready(&self) -> bool {
-        self.order_book_state.is_some()
+    pub(crate) fn is_ready(&self) -> bool {
+        !self.features.requires_book_state() || self.order_book_state.is_some()
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -277,6 +284,10 @@ impl OrderBookListener {
     }
 
     fn take_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
+        if !self.features.l2book() {
+            return None;
+        }
+
         // Throttled L2 snapshot broadcast for L2Book subscribers.
         // l2_snapshots_uncached() walks every coin x every aggregation variant, so
         // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
@@ -388,6 +399,15 @@ impl OrderBookListener {
             return Ok(());
         }
 
+        let source_enabled = match event_source {
+            EventSource::Fills => self.features.trades(),
+            EventSource::OrderStatuses => self.features.watch_order_statuses(),
+            EventSource::OrderDiffs => self.features.watch_order_diffs(),
+        };
+        if !source_enabled {
+            return Ok(());
+        }
+
         // Parse the batch
         let res = match event_source {
             EventSource::Fills => sonic_rs::from_str::<Batch<NodeDataFill>>(&line).map(|batch| {
@@ -463,30 +483,32 @@ impl OrderBookListener {
 
         // HFT mode: Process events DIRECTLY without block-level synchronization
         // This is arbor's key insight - process independently with order-level caching
-        let changed_coins: HashSet<Coin> = if let Some(state) = self.order_book_state.as_mut() {
-            let result = match event_batch {
-                EventBatch::Orders(batch) => {
-                    // Broadcast L4 order statuses for L4Book subscribers - skip the
-                    // batch clone entirely when nothing is subscribed (the per-conn
-                    // filter inside handle_socket already short-circuits, but the
-                    // clone is what costs us in OOM scenarios).
+        let result = match event_batch {
+            EventBatch::Orders(batch) => {
+                let should_broadcast = self.features.l4book() || self.features.orderupdates();
+                if should_broadcast {
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
                             let msg = Arc::new(InternalMessage::L4OrderStatuses { batch: batch.clone() });
                             drop(tx.send(msg));
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
-                    state.apply_order_statuses_hft(batch)
                 }
-                EventBatch::BookDiffs(batch) => {
-                    // Broadcast L4 order diffs for L4Book / BookDiffs subscribers.
-                    // Defense-in-depth: when running with `ignore_spot=true`, strip
-                    // spot diffs from the broadcast too. Otherwise `bookDiffs` clients
-                    // would see events for coins whose state we never applied locally.
+                EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
+                if self.features.requires_book_state() {
+                    self.order_book_state
+                        .as_mut()
+                        .map_or_else(|| Ok(HashSet::new()), |state| state.apply_order_statuses_hft(batch))
+                } else {
+                    Ok(HashSet::new())
+                }
+            }
+            EventBatch::BookDiffs(batch) => {
+                let should_broadcast = self.features.l4book() || self.features.bookdiffs();
+                if should_broadcast {
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
-                            let to_broadcast = if state.ignore_spot() {
+                            let to_broadcast = if self.ignore_spot {
                                 batch.filter_events(|d| !d.coin().is_spot())
                             } else {
                                 batch.clone()
@@ -497,40 +519,45 @@ impl OrderBookListener {
                             }
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
-                    state.apply_order_diffs_hft(batch)
                 }
-                EventBatch::Fills(batch) => {
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
-                    // Broadcast fills (no clone needed - we own the batch and don't apply it locally)
+                EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
+                if self.features.requires_book_state() {
+                    self.order_book_state
+                        .as_mut()
+                        .map_or_else(|| Ok(HashSet::new()), |state| state.apply_order_diffs_hft(batch))
+                } else {
+                    Ok(HashSet::new())
+                }
+            }
+            EventBatch::Fills(batch) => {
+                EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
+                if self.features.trades() {
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
                             let snapshot = Arc::new(InternalMessage::Fills { batch });
                             drop(tx.send(snapshot));
                         }
                     }
-                    Ok(HashSet::new())
                 }
-            };
-
-            match result {
-                Ok(coins) => coins,
-                Err(err) => {
-                    // Per-event errors (malformed Px/Sz, unrecognized diff variant) are
-                    // recoverable: skip the offending batch and keep serving every other
-                    // coin's state. Discarding `order_book_state` here used to take down
-                    // the entire feed for ~10s on a single malformed line.
-                    PARSE_ERRORS_TOTAL.with_label_values(&[source_label]).inc();
-                    log::warn!(
-                        "Skipping event batch at height={} source={} due to apply error: {err}",
-                        height,
-                        source_label
-                    );
-                    HashSet::new()
-                }
+                Ok(HashSet::new())
             }
-        } else {
-            HashSet::new()
+        };
+
+        let changed_coins = match result {
+            Ok(coins) => coins,
+            Err(err) => {
+                // Per-event errors (malformed Px/Sz, unrecognized diff variant) are
+                // recoverable: skip the offending batch and keep serving every other
+                // coin's state. Discarding `order_book_state` here used to take down
+                // the entire feed for ~10s on a single malformed line.
+                PARSE_ERRORS_TOTAL.with_label_values(&[source_label]).inc();
+                log::warn!(
+                    "Skipping event batch at height={} source={} due to apply error: {err}",
+                    height,
+                    source_label
+                );
+                HashSet::new()
+            }
         };
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
 
@@ -566,24 +593,29 @@ impl OrderBookListener {
         // listening. Without the receiver-count gate we'd `get_bbos_for_coins` and
         // spawn a tokio task per change even with zero subscribers, wasting CPU.
         if !changed_coins.is_empty() {
-            self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
+            if self.features.l2book() {
+                self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
+            }
             self.broadcast_universe_if_changed(&changed_coins);
 
-            if let Some(state) = &self.order_book_state {
-                if let Some(tx) = &self.internal_message_tx {
-                    if tx.receiver_count() > 0 {
-                        let bbo_start = Instant::now();
-                        let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                        static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if bc % 1000 == 0 {
-                            info!("Fast BBO broadcast #{} at time {} for {} coins", bc, time, changed_coins.len());
+            if self.features.bbo() {
+                if let Some(state) = &self.order_book_state {
+                    if let Some(tx) = &self.internal_message_tx {
+                        if tx.receiver_count() > 0 {
+                            let bbo_start = Instant::now();
+                            let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
+                            static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if bc % 1000 == 0 {
+                                info!("Fast BBO broadcast #{} at time {} for {} coins", bc, time, changed_coins.len());
+                            }
+                            // broadcast::Sender::send is non-blocking; the previous
+                            // tokio::spawn wrapper added task overhead with no benefit.
+                            let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
+                            drop(tx.send(msg));
+                            BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
                         }
-                        // broadcast::Sender::send is non-blocking; the previous
-                        // tokio::spawn wrapper added task overhead with no benefit.
-                        let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
-                        drop(tx.send(msg));
-                        BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
                     }
                 }
             }
@@ -661,16 +693,8 @@ struct L2FlushJob {
 impl L2FlushJob {
     fn prepare(self) -> PreparedL2Flush {
         let prepare_start = Instant::now();
-        let Self {
-            generation,
-            time,
-            l2_snapshots,
-            active_keys,
-            tx,
-            mut prepared_hashes,
-            mut next_version,
-            started_at,
-        } = self;
+        let Self { generation, time, l2_snapshots, active_keys, tx, mut prepared_hashes, mut next_version, started_at } =
+            self;
         let l2_books = l2_snapshots.into_prepared_books(&active_keys, time, &mut prepared_hashes, &mut next_version);
         L2_FLUSH_PHASE_LATENCY.with_label_values(&["prepare"]).observe(prepare_start.elapsed().as_secs_f64());
         PreparedL2Flush { generation, tx, l2_books, prepared_hashes, next_version, started_at }
@@ -703,7 +727,7 @@ pub(crate) enum InternalMessage {
     Fills {
         batch: Batch<NodeDataFill>,
     },
-    /// Fast BBO-only broadcast path - bypasses expensive L2 snapshot computation
+    /// Fast BBO broadcast path - bypasses expensive L2 snapshot computation
     BboUpdate {
         bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
         time: u64,
@@ -773,6 +797,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
     info!("Starting HFT-optimized listener");
     info!("Data directory: {:?}", dir);
+    info!("Enabled features: {}", config.features);
 
     // Create SnapshotConfig from ServerConfig
     let snapshot_config = SnapshotConfig {
@@ -790,8 +815,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         listener.ignore_spot
     };
 
-    // Start parallel file watchers (crossbeam channel)
-    let (crossbeam_rx, _handles, _last_os, _last_fills, _last_diffs) = parallel::start_parallel_file_watchers(dir);
+    // Start only the file watchers needed by the enabled features.
+    let (crossbeam_rx, _handles, _last_os, _last_fills, _last_diffs) =
+        parallel::start_parallel_file_watchers(dir, config.features);
 
     // Bridge crossbeam to tokio mpsc.
     // BOUNDED channel: under processing stalls (mutex contention, slow L2 compute),
@@ -845,10 +871,12 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // Flush throttled L2 changes on the scheduler, ahead of file events in
             // this biased select, so a full file-event queue cannot starve L2.
             _ = l2_flush_ticker.tick() => {
-                let job = listener.lock().await.take_l2_flush_job_if_due();
-                if let Some(job) = job {
-                    let prepared = job.prepare();
-                    listener.lock().await.finish_l2_flush(prepared);
+                if config.features.l2book() {
+                    let job = listener.lock().await.take_l2_flush_job_if_due();
+                    if let Some(job) = job {
+                        let prepared = job.prepare();
+                        listener.lock().await.finish_l2_flush(prepared);
+                    }
                 }
             }
 
@@ -894,7 +922,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             _ = ticker.tick() => {
                 let is_ready = listener.lock().await.is_ready();
                 info!("Ticker: is_ready={}, snapshot_fetch_pending={}", is_ready, snapshot_fetch_pending);
-                if !is_ready && !snapshot_fetch_pending {
+                if config.features.requires_book_state() && !is_ready && !snapshot_fetch_pending {
                     snapshot_fetch_pending = true;
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
@@ -940,13 +968,33 @@ mod tests {
         listener_with_btc_bids(tx, &[(1, "100", "1")])
     }
 
+    fn listener_with_btc_bid_for_features(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
+        listener_with_btc_bids_for_features(tx, &[(1, "100", "1")], features)
+    }
+
     fn listener_with_btc_bids(tx: Sender<Arc<InternalMessage>>, bids: &[(u64, &str, &str)]) -> OrderBookListener {
         listener_with_coin_bids(tx, &[("BTC", bids)])
+    }
+
+    fn listener_with_btc_bids_for_features(
+        tx: Sender<Arc<InternalMessage>>,
+        bids: &[(u64, &str, &str)],
+        features: FeatureSet,
+    ) -> OrderBookListener {
+        listener_with_coin_bids_for_features(tx, &[("BTC", bids)], features)
     }
 
     fn listener_with_coin_bids(
         tx: Sender<Arc<InternalMessage>>,
         books: &[(&str, &[(u64, &str, &str)])],
+    ) -> OrderBookListener {
+        listener_with_coin_bids_for_features(tx, books, FeatureSet::all())
+    }
+
+    fn listener_with_coin_bids_for_features(
+        tx: Sender<Arc<InternalMessage>>,
+        books: &[(&str, &[(u64, &str, &str)])],
+        features: FeatureSet,
     ) -> OrderBookListener {
         let mut snapshot_map = HashMap::new();
         for (coin, bids) in books {
@@ -958,10 +1006,13 @@ mod tests {
         }
 
         let snapshots = Snapshots::new(snapshot_map);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, features);
         listener.init_from_snapshot(snapshots, 0);
-        listener.l2_subscription_registry.register_l2(default_l2_key("BTC"));
+        if !features.l2book() {
+            return listener;
+        }
 
+        listener.l2_subscription_registry.register_l2(default_l2_key("BTC"));
         // Seed the L2 cache with the original sizes. The regression below verifies
         // that a throttled change invalidates this cached entry before the next L2 send.
         let state = listener.order_book_state.as_ref().expect("state initialized");
@@ -971,6 +1022,14 @@ mod tests {
             state.l2_snapshots_incremental(&empty, &requested_params, &mut listener.l2_snapshot_cache);
         assert_eq!(l2_best_bid_sz(&seeded, "BTC"), "1");
         listener
+    }
+
+    fn listener_without_snapshot(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
+        OrderBookListener::new(Some(tx), false, features)
+    }
+
+    fn features(value: &str) -> FeatureSet {
+        value.parse().expect("valid features")
     }
 
     fn update_diff_line(coin: &str, oid: u64, orig_sz: &str, new_sz: &str) -> String {
@@ -992,6 +1051,78 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    fn order_status_line(coin: &str, oid: u64, user: &str) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 1,
+            "events": [{
+                "time": "2024-01-15T10:30:00",
+                "user": user,
+                "hash": "0xabc",
+                "builder": null,
+                "status": "open",
+                "order": {
+                    "user": user,
+                    "coin": coin,
+                    "side": "B",
+                    "limitPx": "100.0",
+                    "sz": "1.0",
+                    "oid": oid,
+                    "timestamp": 1000,
+                    "triggerCondition": "N/A",
+                    "isTrigger": false,
+                    "triggerPx": "0.0",
+                    "children": [],
+                    "isPositionTpsl": false,
+                    "reduceOnly": false,
+                    "orderType": "Limit",
+                    "origSz": "1.0",
+                    "tif": "Gtc",
+                    "cloid": null
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn fill_line(coin: &str) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 1,
+            "events": [[
+                "0x0000000000000000000000000000000000000001",
+                {
+                    "coin": coin,
+                    "px": "50000.0",
+                    "sz": "0.1",
+                    "side": "A",
+                    "time": 1700000000000u64,
+                    "startPosition": "0",
+                    "dir": "Open Long",
+                    "closedPnl": "0",
+                    "hash": "0xabc",
+                    "oid": 123u64,
+                    "crossed": true,
+                    "fee": "0.5",
+                    "tid": 999u64,
+                    "feeToken": "USDC",
+                    "liquidation": null
+                }
+            ]]
+        })
+        .to_string()
+    }
+
+    fn drain_all(rx: &mut Receiver<Arc<InternalMessage>>) -> Vec<Arc<InternalMessage>> {
+        let mut messages = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        messages
     }
 
     fn drain_latest_l2(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
@@ -1026,6 +1157,108 @@ mod tests {
     ) -> String {
         let prepared = l2_books.get(&default_l2_key(coin)).expect("prepared l2 book");
         prepared.payload().levels()[0].get(level_index).expect("bid level").sz().to_string()
+    }
+
+    #[test]
+    fn bbo_feature_only_skips_l2_and_raw_broadcast_work() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::Fills { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })));
+        assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn l2book_feature_only_emits_l2_without_bbo_or_raw_streams() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("l2book"));
+
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+
+        listener.flush_l2_if_due();
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })));
+    }
+
+    #[test]
+    fn trades_only_is_ready_without_snapshot_and_only_broadcasts_fills() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("trades"));
+
+        assert!(listener.is_ready());
+        assert!(listener.order_book_state.is_none());
+
+        listener.process_data_hft(fill_line("BTC"), EventSource::Fills).expect("fill parses");
+        listener
+            .process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs)
+            .expect("disabled diff source is ignored");
+
+        let messages = drain_all(&mut rx);
+        assert_eq!(messages.iter().filter(|msg| matches!(msg.as_ref(), InternalMessage::Fills { .. })).count(), 1);
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+    }
+
+    #[test]
+    fn bookdiffs_only_is_ready_without_snapshot_and_only_broadcasts_raw_diffs() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bookdiffs"));
+
+        assert!(listener.is_ready());
+        assert!(listener.order_book_state.is_none());
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff parses");
+        listener.process_data_hft(fill_line("BTC"), EventSource::Fills).expect("disabled fill source is ignored");
+
+        let messages = drain_all(&mut rx);
+        assert_eq!(
+            messages.iter().filter(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })).count(),
+            1
+        );
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::Fills { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn orderupdates_only_is_ready_without_snapshot_and_only_broadcasts_statuses() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("orderupdates"));
+        let user = "0x0000000000000000000000000000000000000001";
+
+        assert!(listener.is_ready());
+        assert!(listener.order_book_state.is_none());
+
+        listener
+            .process_data_hft(order_status_line("BTC", 1, user), EventSource::OrderStatuses)
+            .expect("status parses");
+        listener
+            .process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs)
+            .expect("disabled diff source is ignored");
+
+        let messages = drain_all(&mut rx);
+        assert_eq!(
+            messages.iter().filter(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })).count(),
+            1
+        );
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(listener.pending_l2_changed_coins.is_empty());
     }
 
     #[test]

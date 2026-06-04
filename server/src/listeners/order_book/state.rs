@@ -47,10 +47,6 @@ impl OrderBookState {
         self.height
     }
 
-    pub(super) const fn ignore_spot(&self) -> bool {
-        self.ignore_spot
-    }
-
     pub(super) const fn time(&self) -> u64 {
         self.time
     }

@@ -1,7 +1,7 @@
 use std::{fmt, net::Ipv4Addr, path::PathBuf, str::FromStr};
 
 use clap::Parser;
-use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
+use server::{FeatureSet, Result, ServerConfig, SnapshotMode, run_websocket_server};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Markets {
@@ -119,6 +119,10 @@ struct Args {
     #[arg(long, default_value = "all")]
     markets: Markets,
 
+    /// Which WebSocket features to serve: comma-separated bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all
+    #[arg(long, default_value = "all")]
+    features: FeatureSet,
+
     // ========== Snapshot Configuration ==========
     /// Snapshot fetching mode: docker or direct
     /// - docker: Use 'docker exec <container> hl-node ...' (for Docker users)
@@ -153,11 +157,6 @@ struct Args {
     /// Port for Prometheus metrics endpoint (0 to disable)
     #[arg(long, default_value = "9090")]
     metrics_port: u16,
-
-    /// BBO-only mode: lightweight mode that only tracks best bid/ask per coin.
-    /// Reduces RAM from 2-3GB to ~100MB. Disables L2/L4/Trades subscriptions.
-    #[arg(long, default_value = "false")]
-    bbo_only: bool,
 
     /// Resend the last l2Book snapshot for each active subscription every N ms
     /// when nothing has changed. Off by default (0 = disabled). Matches the
@@ -228,7 +227,7 @@ async fn main() -> Result<()> {
         snapshot_output_path: args.snapshot_output_path,
         visor_state_path: args.visor_state_path,
         metrics_port: args.metrics_port,
-        bbo_only: args.bbo_only,
+        features: args.features,
         l2book_heartbeat_ms: args.l2book_heartbeat_ms,
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
     };
@@ -236,10 +235,7 @@ async fn main() -> Result<()> {
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Address: {}", config.address);
     println!("  Markets: {}", args.markets);
-    if config.bbo_only {
-        println!("  Mode: BBO-ONLY (lightweight, ~100MB RAM)");
-        println!("  Note: L2/L4/Trades subscriptions disabled");
-    }
+    println!("  Features: {}", config.features);
     println!("  Snapshot mode: {:?}", config.snapshot_mode);
     match config.snapshot_mode {
         SnapshotMode::Docker => {
@@ -300,7 +296,7 @@ async fn main() -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{Args, Markets};
+    use super::{Args, FeatureSet, Markets};
 
     const ALL_MARKETS: Markets = Markets { include_perps: true, include_spot: true, include_hip3: true };
 
@@ -367,5 +363,48 @@ mod tests {
         let args = Args::try_parse_from(["orderbook_server", "--secret", "super-secret"]).expect("secret should parse");
 
         assert_eq!(args.secret.as_deref(), Some("super-secret"));
+    }
+
+    #[test]
+    fn cli_features_default_to_all() {
+        let args = Args::try_parse_from(["orderbook_server"]).expect("default args should parse");
+
+        assert_eq!(args.features, FeatureSet::all());
+    }
+
+    #[test]
+    fn cli_parses_comma_delimited_features() {
+        let args = Args::try_parse_from(["orderbook_server", "--features", "bbo,l2book,trades"])
+            .expect("comma-delimited features should parse");
+
+        assert!(args.features.bbo());
+        assert!(args.features.l2book());
+        assert!(args.features.trades());
+        assert!(!args.features.l4book());
+        assert!(!args.features.bookdiffs());
+        assert!(!args.features.orderupdates());
+    }
+
+    #[test]
+    fn cli_parses_each_single_feature() {
+        for feature in ["bbo", "l2book", "l4book", "trades", "bookdiffs", "orderupdates"] {
+            let args =
+                Args::try_parse_from(["orderbook_server", "--features", feature]).expect("single feature should parse");
+
+            assert_eq!(args.features.to_string(), feature);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_invalid_features() {
+        assert!(Args::try_parse_from(["orderbook_server", "--features", "foo"]).is_err());
+        assert!(Args::try_parse_from(["orderbook_server", "--features", "bbo,,trades"]).is_err());
+        assert!(Args::try_parse_from(["orderbook_server", "--features", "bbo,bbo"]).is_err());
+        assert!(Args::try_parse_from(["orderbook_server", "--features", "all,bbo"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_removed_bbo_only_flag() {
+        assert!(Args::try_parse_from(["orderbook_server", "--bbo-only"]).is_err());
     }
 }

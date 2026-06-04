@@ -1,10 +1,6 @@
 // HFT-optimized parallel file watcher
 // Each event source runs on its own thread for maximum throughput
 
-use crate::types::node_data::EventSource;
-use crossbeam_channel::{Sender, bounded};
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -17,12 +13,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crossbeam_channel::{Sender, bounded};
+use log::{error, info};
+use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+
+use crate::{FeatureSet, types::node_data::EventSource};
+
 /// Message sent from file watcher threads to the main processor
 #[derive(Debug)]
 pub(crate) enum FileEvent {
     OrderStatus(String),
     OrderDiff(String),
     Fill(String),
+}
+
+pub(super) fn enabled_event_sources(features: FeatureSet) -> Vec<EventSource> {
+    let mut sources = Vec::new();
+    if features.watch_order_statuses() {
+        sources.push(EventSource::OrderStatuses);
+    }
+    if features.watch_fills() {
+        sources.push(EventSource::Fills);
+    }
+    if features.watch_order_diffs() {
+        sources.push(EventSource::OrderDiffs);
+    }
+    sources
 }
 
 /// Hard cap on a single un-terminated JSON line. The streaming files write
@@ -413,6 +429,7 @@ pub(super) fn spawn_file_watcher(
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
+    features: FeatureSet,
 ) -> (crossbeam_channel::Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)
 {
     // Bounded so a slow downstream actually back-pressures the file readers
@@ -428,25 +445,41 @@ pub(crate) fn start_parallel_file_watchers(
     let last_order_diffs = Arc::new(AtomicU64::new(0));
 
     // HFT mode uses streaming directories (for --stream-with-block-info)
-    // Spawn watcher for OrderStatuses
-    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir_streaming(&data_dir);
-    info!("OrderStatuses dir: {:?}", order_statuses_dir);
-    handles.push(spawn_file_watcher(
-        EventSource::OrderStatuses,
-        order_statuses_dir,
-        tx.clone(),
-        last_order_status.clone(),
-    ));
-
-    // Spawn watcher for Fills
-    let fills_dir = EventSource::Fills.event_source_dir_streaming(&data_dir);
-    info!("Fills dir: {:?}", fills_dir);
-    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone()));
-
-    // Spawn watcher for OrderDiffs
-    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir);
-    info!("OrderDiffs dir: {:?}", order_diffs_dir);
-    handles.push(spawn_file_watcher(EventSource::OrderDiffs, order_diffs_dir, tx, last_order_diffs.clone()));
+    for source in enabled_event_sources(features) {
+        let dir = source.event_source_dir_streaming(&data_dir);
+        info!("{} dir: {:?}", source, dir);
+        let last_event = match source {
+            EventSource::OrderStatuses => last_order_status.clone(),
+            EventSource::Fills => last_fills.clone(),
+            EventSource::OrderDiffs => last_order_diffs.clone(),
+        };
+        handles.push(spawn_file_watcher(source, dir, tx.clone(), last_event));
+    }
 
     (rx, handles, last_order_status, last_fills, last_order_diffs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn features(value: &str) -> FeatureSet {
+        value.parse().expect("valid features")
+    }
+
+    #[test]
+    fn enabled_sources_for_bbo_need_book_state_inputs() {
+        assert_eq!(enabled_event_sources(features("bbo")), vec![EventSource::OrderStatuses, EventSource::OrderDiffs]);
+    }
+
+    #[test]
+    fn enabled_sources_for_trades_only_watch_fills() {
+        assert_eq!(enabled_event_sources(features("trades")), vec![EventSource::Fills]);
+    }
+
+    #[test]
+    fn enabled_sources_for_raw_order_streams_are_granular() {
+        assert_eq!(enabled_event_sources(features("bookdiffs")), vec![EventSource::OrderDiffs]);
+        assert_eq!(enabled_event_sources(features("orderupdates")), vec![EventSource::OrderStatuses]);
+    }
 }

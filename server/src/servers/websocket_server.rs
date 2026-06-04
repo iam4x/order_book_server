@@ -19,7 +19,7 @@ use tokio::{
 use yawc::{FrameView, OpCode, WebSocket};
 
 use crate::{
-    ServerConfig,
+    FeatureSet, ServerConfig,
     listeners::order_book::{
         InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, OrderBookListener, PreparedL2Book, TimedSnapshots,
         hl_listen_hft,
@@ -140,7 +140,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // Central task: listen to messages and forward them for distribution
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        OrderBookListener::new(Some(internal_message_tx), ignore_spot, config.features)
     };
     let listener = Arc::new(Mutex::new(listener));
     {
@@ -169,9 +169,9 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             "/ws",
             get({
                 let internal_message_tx = internal_message_tx.clone();
-                let bbo_only = config.bbo_only;
                 let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
+                let features = config.features;
                 let listener = listener.clone();
                 let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
                 let websocket_secret = websocket_secret.clone();
@@ -189,7 +189,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                             listener.clone(),
                             Arc::clone(&l2_subscription_registry),
                             market_filter,
-                            bbo_only,
+                            features,
                             l2book_heartbeat_ms,
                             bbo_heartbeat_ms,
                             websocket_opts,
@@ -238,7 +238,7 @@ fn ws_handler(
     listener: Arc<Mutex<OrderBookListener>>,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
-    bbo_only: bool,
+    features: FeatureSet,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
     websocket_opts: yawc::Options,
@@ -267,7 +267,7 @@ fn ws_handler(
             listener,
             l2_subscription_registry,
             market_filter,
-            bbo_only,
+            features,
             l2book_heartbeat_ms,
             bbo_heartbeat_ms,
         )
@@ -314,7 +314,7 @@ async fn handle_socket(
     listener: Arc<Mutex<OrderBookListener>>,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
-    bbo_only: bool,
+    features: FeatureSet,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
 ) {
@@ -351,9 +351,16 @@ async fn handle_socket(
 
     // Optional heartbeat ticker. We tick at min(enabled_heartbeats)/2 (clamped to [50, 500] ms)
     // so each subscription's last-sent timestamp can drift at most half a heartbeat from the configured value.
-    let mut heartbeat_ticker = build_heartbeat_ticker(l2book_heartbeat_ms, bbo_heartbeat_ms);
-    let l2_hb = if l2book_heartbeat_ms > 0 { Some(Duration::from_millis(l2book_heartbeat_ms)) } else { None };
-    let bbo_hb = if bbo_heartbeat_ms > 0 { Some(Duration::from_millis(bbo_heartbeat_ms)) } else { None };
+    let effective_l2book_heartbeat_ms = if features.l2book() { l2book_heartbeat_ms } else { 0 };
+    let effective_bbo_heartbeat_ms = if features.bbo() { bbo_heartbeat_ms } else { 0 };
+    let mut heartbeat_ticker = build_heartbeat_ticker(effective_l2book_heartbeat_ms, effective_bbo_heartbeat_ms);
+    let l2_hb = if effective_l2book_heartbeat_ms > 0 {
+        Some(Duration::from_millis(effective_l2book_heartbeat_ms))
+    } else {
+        None
+    };
+    let bbo_hb =
+        if effective_bbo_heartbeat_ms > 0 { Some(Duration::from_millis(effective_bbo_heartbeat_ms)) } else { None };
 
     // `alive` flips to false the moment any `send_socket_message` returns false
     // (network error or send timeout). The outer loop checks it at every iteration
@@ -366,6 +373,9 @@ async fn handle_socket(
                     Ok(msg) => {
                         match msg.as_ref() {
                             InternalMessage::L2Update{ l2_books } => {
+                                if !features.l2book() {
+                                    continue;
+                                }
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     // Partial L2 updates intentionally omit unchanged coins.
@@ -378,6 +388,9 @@ async fn handle_socket(
                                 universe = filter_universe(next_universe, market_filter.0, market_filter.1, market_filter.2);
                             },
                             InternalMessage::BboUpdate{ bbos, time } => {
+                                if !features.bbo() {
+                                    continue;
+                                }
                                 // Fast path for BBO subscribers only
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
@@ -387,6 +400,9 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
+                                if !features.trades() {
+                                    continue;
+                                }
                                 let has_trades = manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. }));
                                 if has_trades {
                                     let mut trades = coin_to_trades(batch);
@@ -397,6 +413,9 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderDiffs{ batch } => {
+                                if !features.l4book() && !features.bookdiffs() {
+                                    continue;
+                                }
                                 let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
                                 let has_book_diffs = manager.subscriptions().iter().any(|s| matches!(s, Subscription::BookDiffs { .. }));
                                 if has_l4 || has_book_diffs {
@@ -415,6 +434,9 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::L4OrderStatuses{ batch } => {
+                                if !features.l4book() && !features.orderupdates() {
+                                    continue;
+                                }
                                 let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
                                 let has_order_updates = manager.subscriptions().iter().any(|s| matches!(s, Subscription::OrderUpdates { .. }));
                                 if has_l4 {
@@ -509,7 +531,8 @@ async fn handle_socket(
                                             value,
                                             &universe,
                                             listener.clone(),
-                                            bbo_only,
+                                            features,
+                                            market_filter,
                                             &mut last_l2,
                                             &mut last_bbo,
                                             &mut l2_registrations,
@@ -545,7 +568,8 @@ async fn receive_client_message(
     client_message: ClientMessage,
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
-    bbo_only: bool,
+    features: FeatureSet,
+    market_filter: (bool, bool, bool),
     last_l2: &mut HashMap<L2SubscriptionKey, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
     l2_registrations: &mut ConnectionL2Registrations,
@@ -554,21 +578,16 @@ async fn receive_client_message(
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
         ClientMessage::Ping => unreachable!("Ping is handled before receive_client_message"),
     };
-    // BBO-only mode rejects non-BBO subs up-front, before validation, so the
-    // operator sees a single clear "denied" message in the log instead of "valid
-    // subscription" then a rejection.
-    if bbo_only && !matches!(&subscription, Subscription::Bbo { .. }) {
+    if !subscription_feature_enabled(&subscription, features) {
         return send_socket_message(
             socket,
-            ServerResponse::Error(
-                "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
-            ),
+            ServerResponse::Error(format!("Feature disabled for subscription type: {}", subscription.type_label())),
         )
         .await;
     }
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
-    if !subscription.validate(universe) {
+    if !validate_subscription_for_features(&subscription, universe, features, market_filter) {
         return send_socket_message(socket, ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
     }
 
@@ -730,6 +749,44 @@ fn filter_universe(
         .collect()
 }
 
+fn subscription_feature_enabled(subscription: &Subscription, features: FeatureSet) -> bool {
+    match subscription {
+        Subscription::Bbo { .. } => features.bbo(),
+        Subscription::L2Book { .. } => features.l2book(),
+        Subscription::L4Book { .. } => features.l4book(),
+        Subscription::Trades { .. } => features.trades(),
+        Subscription::OrderUpdates { .. } => features.orderupdates(),
+        Subscription::BookDiffs { .. } => features.bookdiffs(),
+    }
+}
+
+fn market_filter_allows_coin(coin: &str, market_filter: (bool, bool, bool)) -> bool {
+    if coin.is_empty() {
+        return false;
+    }
+    let coin = Coin::new(coin);
+    (coin.is_perp() && market_filter.0) || (coin.is_spot() && market_filter.1) || (coin.is_hip3() && market_filter.2)
+}
+
+fn validate_subscription_for_features(
+    subscription: &Subscription,
+    universe: &HashSet<String>,
+    features: FeatureSet,
+    market_filter: (bool, bool, bool),
+) -> bool {
+    if features.requires_book_state() || !universe.is_empty() {
+        return subscription.validate(universe);
+    }
+
+    match subscription {
+        Subscription::Trades { coin } | Subscription::BookDiffs { coin } => {
+            market_filter_allows_coin(coin, market_filter)
+        }
+        Subscription::OrderUpdates { .. } => subscription.validate(universe),
+        Subscription::Bbo { .. } | Subscription::L2Book { .. } | Subscription::L4Book { .. } => false,
+    }
+}
+
 async fn send_ws_data_from_l2_update(
     socket: &mut WebSocket,
     subscription: &Subscription,
@@ -794,6 +851,63 @@ mod tests {
         assert!(perps_hip3.contains("BTC"));
         assert!(perps_hip3.contains("xyz:TSLA"));
         assert!(!perps_hip3.contains("@1"));
+    }
+
+    #[test]
+    fn subscription_feature_enabled_matches_feature_set() {
+        let features: FeatureSet = "bbo,trades".parse().expect("valid features");
+
+        assert!(subscription_feature_enabled(&Subscription::Bbo { coin: "BTC".to_string() }, features));
+        assert!(subscription_feature_enabled(&Subscription::Trades { coin: "BTC".to_string() }, features));
+        assert!(!subscription_feature_enabled(
+            &Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: None, mantissa: None },
+            features
+        ));
+        assert!(!subscription_feature_enabled(&Subscription::L4Book { coin: "BTC".to_string() }, features));
+        assert!(!subscription_feature_enabled(&Subscription::BookDiffs { coin: "BTC".to_string() }, features));
+        assert!(!subscription_feature_enabled(
+            &Subscription::OrderUpdates { user: "0x0000000000000000000000000000000000000000".to_string() },
+            features
+        ));
+    }
+
+    #[test]
+    fn raw_only_validation_does_not_require_universe() {
+        let trades: FeatureSet = "trades".parse().expect("valid features");
+        let bookdiffs: FeatureSet = "bookdiffs".parse().expect("valid features");
+        let universe = HashSet::new();
+
+        assert!(validate_subscription_for_features(
+            &Subscription::Trades { coin: "BTC".to_string() },
+            &universe,
+            trades,
+            (true, false, false),
+        ));
+        assert!(validate_subscription_for_features(
+            &Subscription::BookDiffs { coin: "xyz:TSLA".to_string() },
+            &universe,
+            bookdiffs,
+            (false, false, true),
+        ));
+        assert!(!validate_subscription_for_features(
+            &Subscription::Trades { coin: "@1".to_string() },
+            &universe,
+            trades,
+            (true, false, false),
+        ));
+    }
+
+    #[test]
+    fn book_backed_validation_still_requires_universe() {
+        let features: FeatureSet = "bbo,l2book".parse().expect("valid features");
+        let universe = HashSet::new();
+
+        assert!(!validate_subscription_for_features(
+            &Subscription::Bbo { coin: "BTC".to_string() },
+            &universe,
+            features,
+            (true, true, true),
+        ));
     }
 }
 

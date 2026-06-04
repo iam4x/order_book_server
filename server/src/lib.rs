@@ -6,7 +6,7 @@ mod prelude;
 mod servers;
 mod types;
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use clap::ValueEnum;
 pub use prelude::Result;
@@ -20,6 +20,153 @@ pub enum SnapshotMode {
     Docker,
     /// Call hl-node directly (for systemctl/bare metal setups)
     Direct,
+}
+
+/// Optional WebSocket channels and the upstream work needed to serve them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureSet {
+    bbo: bool,
+    l2book: bool,
+    l4book: bool,
+    trades: bool,
+    bookdiffs: bool,
+    orderupdates: bool,
+}
+
+impl FeatureSet {
+    pub const fn all() -> Self {
+        Self { bbo: true, l2book: true, l4book: true, trades: true, bookdiffs: true, orderupdates: true }
+    }
+
+    const fn empty() -> Self {
+        Self { bbo: false, l2book: false, l4book: false, trades: false, bookdiffs: false, orderupdates: false }
+    }
+
+    pub const fn bbo(self) -> bool {
+        self.bbo
+    }
+
+    pub const fn l2book(self) -> bool {
+        self.l2book
+    }
+
+    pub const fn l4book(self) -> bool {
+        self.l4book
+    }
+
+    pub const fn trades(self) -> bool {
+        self.trades
+    }
+
+    pub const fn bookdiffs(self) -> bool {
+        self.bookdiffs
+    }
+
+    pub const fn orderupdates(self) -> bool {
+        self.orderupdates
+    }
+
+    pub const fn requires_book_state(self) -> bool {
+        self.bbo || self.l2book || self.l4book
+    }
+
+    pub const fn watch_order_statuses(self) -> bool {
+        self.requires_book_state() || self.orderupdates
+    }
+
+    pub const fn watch_order_diffs(self) -> bool {
+        self.requires_book_state() || self.bookdiffs
+    }
+
+    pub const fn watch_fills(self) -> bool {
+        self.trades
+    }
+}
+
+impl Default for FeatureSet {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl FromStr for FeatureSet {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(
+                "empty feature list; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                    .to_string(),
+            );
+        }
+
+        if value == "all" {
+            return Ok(Self::all());
+        }
+
+        let mut features = Self::empty();
+        for feature in value.split(',') {
+            let feature = feature.trim();
+            if feature.is_empty() {
+                return Err(
+                    "empty feature entry; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                        .to_string(),
+                );
+            }
+
+            match feature {
+                "all" => {
+                    return Err(
+                        "`all` cannot be combined with specific features; use `all` or an explicit comma-separated feature list"
+                            .to_string(),
+                    );
+                }
+                "bbo" if !features.bbo => features.bbo = true,
+                "bbo" => return Err("duplicate feature `bbo`".to_string()),
+                "l2book" if !features.l2book => features.l2book = true,
+                "l2book" => return Err("duplicate feature `l2book`".to_string()),
+                "l4book" if !features.l4book => features.l4book = true,
+                "l4book" => return Err("duplicate feature `l4book`".to_string()),
+                "trades" if !features.trades => features.trades = true,
+                "trades" => return Err("duplicate feature `trades`".to_string()),
+                "bookdiffs" if !features.bookdiffs => features.bookdiffs = true,
+                "bookdiffs" => return Err("duplicate feature `bookdiffs`".to_string()),
+                "orderupdates" if !features.orderupdates => features.orderupdates = true,
+                "orderupdates" => return Err("duplicate feature `orderupdates`".to_string()),
+                unknown => {
+                    return Err(format!(
+                        "unknown feature `{unknown}`; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                    ));
+                }
+            }
+        }
+
+        Ok(features)
+    }
+}
+
+impl fmt::Display for FeatureSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (enabled, name) in [
+            (self.bbo, "bbo"),
+            (self.l2book, "l2book"),
+            (self.l4book, "l4book"),
+            (self.trades, "trades"),
+            (self.bookdiffs, "bookdiffs"),
+            (self.orderupdates, "orderupdates"),
+        ] {
+            if enabled {
+                if !first {
+                    write!(f, ",")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Server configuration passed from CLI arguments
@@ -53,9 +200,8 @@ pub struct ServerConfig {
     pub visor_state_path: Option<PathBuf>,
     /// Port for Prometheus metrics endpoint (0 to disable)
     pub metrics_port: u16,
-    /// BBO-only mode: lightweight mode that only tracks best bid/ask per coin
-    /// Disables L2/L4/Trades subscriptions but uses ~100MB RAM instead of 2-3GB
-    pub bbo_only: bool,
+    /// Enabled WebSocket features and the upstream processing required by them
+    pub features: FeatureSet,
     /// Resend the last l2Book payload every N ms when nothing has changed.
     /// 0 = disabled (default). Provides a heartbeat for low-liquidity coins
     /// whose snapshot hash rarely changes, matching the official HL API behavior.

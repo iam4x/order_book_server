@@ -53,7 +53,7 @@ impl NodeDataOrderStatus {
     }
 }
 
-#[derive(Clone, Copy, strum_macros::Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,
     OrderStatuses,
