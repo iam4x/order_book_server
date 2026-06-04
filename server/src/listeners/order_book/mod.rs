@@ -177,6 +177,7 @@ pub(crate) struct OrderBookListener {
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
     l2_prepared_hashes: HashMap<L2SubscriptionKey, u64>,
     next_l2_version: u64,
+    l2_generation: u64,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     last_universe: HashSet<Coin>,
 }
@@ -193,6 +194,7 @@ impl OrderBookListener {
             l2_snapshot_cache: HashMap::new(),
             l2_prepared_hashes: HashMap::new(),
             next_l2_version: 1,
+            l2_generation: 0,
             l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
             last_universe: HashSet::new(),
         }
@@ -231,6 +233,7 @@ impl OrderBookListener {
         self.l2_snapshot_cache = HashMap::new();
         self.l2_prepared_hashes.clear();
         self.next_l2_version = 1;
+        self.l2_generation = self.l2_generation.wrapping_add(1);
         self.pending_l2_changed_coins.clear();
         // Clear any stale cache
         self.fetched_snapshot_cache = None;
@@ -263,7 +266,15 @@ impl OrderBookListener {
         }
     }
 
+    #[cfg(test)]
     fn flush_l2_if_due(&mut self) {
+        if let Some(job) = self.take_l2_flush_job_if_due() {
+            let prepared = job.prepare();
+            self.finish_l2_flush(prepared);
+        }
+    }
+
+    fn take_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
         // Throttled L2 snapshot broadcast for L2Book subscribers.
         // l2_snapshots_uncached() walks every coin x every aggregation variant, so
         // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
@@ -283,11 +294,12 @@ impl OrderBookListener {
             self.pending_l2_changed_coins.clear();
             self.l2_snapshot_cache.clear();
             self.l2_prepared_hashes.clear();
-            return;
+            self.next_l2_version = 1;
+            return None;
         }
         if !self.pending_l2_changed_coins.iter().any(|coin| active_coins.contains(coin)) {
             self.pending_l2_changed_coins.clear();
-            return;
+            return None;
         }
 
         let should_broadcast_l2 = !self.pending_l2_changed_coins.is_empty()
@@ -296,43 +308,57 @@ impl OrderBookListener {
                 .map(|t| t.elapsed() >= Duration::from_millis(L2_BROADCAST_THROTTLE_MS))
                 .unwrap_or(true);
 
-        if should_broadcast_l2 {
-            let has_receivers = self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0);
-            // Mark the throttle as fired regardless of receivers so we don't
-            // re-check on every subsequent event when nobody is listening.
-            self.last_l2_broadcast = Some(Instant::now());
-            if has_receivers {
-                if let Some(state) = &self.order_book_state {
-                    let l2_start = Instant::now();
-                    let changed_for_l2: HashSet<Coin> = std::mem::take(&mut self.pending_l2_changed_coins)
-                        .into_iter()
-                        .filter(|coin| active_coins.contains(coin))
-                        .collect();
-                    let (time, l2_snapshots) =
-                        state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
-
-                    static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if bc % 100 == 0 {
-                        info!("L2 broadcast #{} at time {}", bc, time);
-                    }
-
-                    if let Some(tx) = &self.internal_message_tx {
-                        let l2_books = l2_snapshots.into_prepared_books(
-                            &active_keys,
-                            time,
-                            &mut self.l2_prepared_hashes,
-                            &mut self.next_l2_version,
-                        );
-                        if !l2_books.is_empty() {
-                            let msg = Arc::new(InternalMessage::L2Update { l2_books });
-                            drop(tx.send(msg));
-                        }
-                    }
-                    L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
-                }
-            }
+        if !should_broadcast_l2 {
+            return None;
         }
+
+        let tx = self.internal_message_tx.as_ref()?;
+        let has_receivers = tx.receiver_count() > 0;
+        // Mark the throttle as fired regardless of receivers so we don't
+        // re-check on every subsequent event when nobody is listening.
+        self.last_l2_broadcast = Some(Instant::now());
+        if !has_receivers {
+            return None;
+        }
+
+        let state = self.order_book_state.as_ref()?;
+        let l2_start = Instant::now();
+        let changed_for_l2: HashSet<Coin> = std::mem::take(&mut self.pending_l2_changed_coins)
+            .into_iter()
+            .filter(|coin| active_coins.contains(coin))
+            .collect();
+        let (time, l2_snapshots) =
+            state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
+
+        static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if bc % 100 == 0 {
+            info!("L2 broadcast #{} at time {}", bc, time);
+        }
+
+        Some(L2FlushJob {
+            generation: self.l2_generation,
+            time,
+            l2_snapshots,
+            active_keys,
+            tx: tx.clone(),
+            prepared_hashes: std::mem::take(&mut self.l2_prepared_hashes),
+            next_version: self.next_l2_version,
+            started_at: l2_start,
+        })
+    }
+
+    fn finish_l2_flush(&mut self, prepared: PreparedL2Flush) {
+        if prepared.generation != self.l2_generation {
+            return;
+        }
+        self.l2_prepared_hashes = prepared.prepared_hashes;
+        self.next_l2_version = prepared.next_version;
+        if !prepared.l2_books.is_empty() {
+            let msg = Arc::new(InternalMessage::L2Update { l2_books: prepared.l2_books });
+            drop(prepared.tx.send(msg));
+        }
+        L2_BROADCAST_LATENCY.observe(prepared.started_at.elapsed().as_secs_f64());
     }
 }
 
@@ -613,6 +639,43 @@ impl L2Snapshots {
     }
 }
 
+struct L2FlushJob {
+    generation: u64,
+    time: u64,
+    l2_snapshots: L2Snapshots,
+    active_keys: HashSet<L2SubscriptionKey>,
+    tx: Sender<Arc<InternalMessage>>,
+    prepared_hashes: HashMap<L2SubscriptionKey, u64>,
+    next_version: u64,
+    started_at: Instant,
+}
+
+impl L2FlushJob {
+    fn prepare(self) -> PreparedL2Flush {
+        let Self {
+            generation,
+            time,
+            l2_snapshots,
+            active_keys,
+            tx,
+            mut prepared_hashes,
+            mut next_version,
+            started_at,
+        } = self;
+        let l2_books = l2_snapshots.into_prepared_books(&active_keys, time, &mut prepared_hashes, &mut next_version);
+        PreparedL2Flush { generation, tx, l2_books, prepared_hashes, next_version, started_at }
+    }
+}
+
+struct PreparedL2Flush {
+    generation: u64,
+    tx: Sender<Arc<InternalMessage>>,
+    l2_books: HashMap<L2SubscriptionKey, Arc<PreparedL2Book>>,
+    prepared_hashes: HashMap<L2SubscriptionKey, u64>,
+    next_version: u64,
+    started_at: Instant,
+}
+
 pub(crate) struct TimedSnapshots {
     pub(crate) time: u64,
     pub(crate) height: u64,
@@ -772,7 +835,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // Flush throttled L2 changes on the scheduler, ahead of file events in
             // this biased select, so a full file-event queue cannot starve L2.
             _ = l2_flush_ticker.tick() => {
-                listener.lock().await.flush_l2_if_due();
+                let job = listener.lock().await.take_l2_flush_job_if_due();
+                if let Some(job) = job {
+                    let prepared = job.prepare();
+                    listener.lock().await.finish_l2_flush(prepared);
+                }
             }
 
             // Process events from file watchers (via bridge)
@@ -1077,6 +1144,22 @@ mod tests {
         listener.flush_l2_if_due();
 
         assert!(drain_latest_l2(&mut rx).is_none(), "unchanged prepared book should be filtered before broadcast");
+    }
+
+    #[test]
+    fn stale_l2_flush_job_after_snapshot_reset_is_dropped() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+
+        listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        let job = listener.take_l2_flush_job_if_due().expect("flush job");
+        let prepared = job.prepare();
+
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 1);
+        listener.finish_l2_flush(prepared);
+
+        assert!(drain_latest_l2(&mut rx).is_none(), "stale prepared L2 should not publish after a snapshot reset");
     }
 
     #[test]
