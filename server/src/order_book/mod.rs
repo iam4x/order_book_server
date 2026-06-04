@@ -15,10 +15,63 @@ pub(crate) struct OrderBook<O> {
     oid_to_side_px: HashMap<Oid, (Side, Px)>,
     bids: BTreeMap<Px, LinkedList<Oid, O>>,
     asks: BTreeMap<Px, LinkedList<Oid, O>>,
+    bid_totals: BTreeMap<Px, LevelTotal>,
+    ask_totals: BTreeMap<Px, LevelTotal>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot<O>([Vec<O>; 2]);
+
+#[derive(Clone, Copy, Debug)]
+struct LevelTotal {
+    sz: Sz,
+    n: usize,
+}
+
+impl Default for LevelTotal {
+    fn default() -> Self {
+        Self { sz: Sz::new(0), n: 0 }
+    }
+}
+
+impl LevelTotal {
+    const fn new(sz: Sz) -> Self {
+        Self { sz, n: 1 }
+    }
+
+    fn add_order(&mut self, sz: Sz) {
+        self.sz = self.sz + sz;
+        self.n += 1;
+    }
+
+    fn remove_order(&mut self, sz: Sz) {
+        self.sz = Sz::new(self.sz.value().saturating_sub(sz.value()));
+        self.n = self.n.saturating_sub(1);
+    }
+
+    fn apply_match(&mut self, matched_sz: Sz, order_removed: bool) {
+        self.sz = Sz::new(self.sz.value().saturating_sub(matched_sz.value()));
+        if order_removed {
+            self.n = self.n.saturating_sub(1);
+        }
+    }
+
+    fn update_order_sz(&mut self, old_sz: Sz, new_sz: Sz) {
+        self.sz = if new_sz >= old_sz {
+            self.sz + Sz::new(new_sz.value() - old_sz.value())
+        } else {
+            Sz::new(self.sz.value().saturating_sub(old_sz.value() - new_sz.value()))
+        };
+    }
+
+    const fn as_bbo(self, px: Px) -> (Px, Sz, u32) {
+        (px, self.sz, self.n as u32)
+    }
+
+    const fn is_empty(self) -> bool {
+        self.n == 0
+    }
+}
 
 impl<O: Clone> Snapshot<O> {
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
@@ -56,7 +109,13 @@ impl<O: InnerOrder> Snapshot<O> {
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
+        Self {
+            oid_to_side_px: HashMap::new(),
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            bid_totals: BTreeMap::new(),
+            ask_totals: BTreeMap::new(),
+        }
     }
 
     /// Number of orders in this orderbook
@@ -75,29 +134,33 @@ impl<O: InnerOrder> OrderBook<O> {
             log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
             return;
         }
-        let (maker_orders, resting_book) = match order.side() {
-            Side::Ask => (&mut self.bids, &mut self.asks),
-            Side::Bid => (&mut self.asks, &mut self.bids),
+        let (maker_orders, maker_totals, resting_book, resting_totals) = match order.side() {
+            Side::Ask => (&mut self.bids, &mut self.bid_totals, &mut self.asks, &mut self.ask_totals),
+            Side::Bid => (&mut self.asks, &mut self.ask_totals, &mut self.bids, &mut self.bid_totals),
         };
-        let oids = match_order(maker_orders, &mut order);
+        let oids = match_order(maker_orders, maker_totals, &mut order);
         for oid in oids {
             self.oid_to_side_px.remove(&oid);
         }
         if order.sz().is_positive() {
             self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            add_order_to_book(resting_book, order);
+            add_order_to_book(resting_book, resting_totals, order);
         }
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
         if let Some((side, px)) = self.oid_to_side_px.remove(&oid) {
-            let map = match side {
-                Side::Ask => &mut self.asks,
-                Side::Bid => &mut self.bids,
+            let (map, totals) = match side {
+                Side::Ask => (&mut self.asks, &mut self.ask_totals),
+                Side::Bid => (&mut self.bids, &mut self.bid_totals),
             };
             let list = map.get_mut(&px);
             if let Some(list) = list {
+                let removed_sz = list.node_value_mut(&oid).map(|order| order.sz());
                 let success = list.remove_node(oid.clone());
+                if let (true, Some(removed_sz)) = (success, removed_sz) {
+                    remove_order_from_totals(totals, px, removed_sz);
+                }
                 if list.is_empty() {
                     map.remove(&px);
                 }
@@ -112,16 +175,20 @@ impl<O: InnerOrder> OrderBook<O> {
         if sz.is_zero() {
             return self.cancel_order(oid);
         }
-        if let Some((side, px)) = self.oid_to_side_px.get(&oid) {
-            let map = match side {
-                Side::Ask => &mut self.asks,
-                Side::Bid => &mut self.bids,
+        if let Some((side, px)) = self.oid_to_side_px.get(&oid).copied() {
+            let (map, totals) = match side {
+                Side::Ask => (&mut self.asks, &mut self.ask_totals),
+                Side::Bid => (&mut self.bids, &mut self.bid_totals),
             };
-            let list = map.get_mut(px);
+            let list = map.get_mut(&px);
             if let Some(list) = list {
                 let old_order = list.node_value_mut(&oid);
                 if let Some(old_order) = old_order {
+                    let old_sz = old_order.sz();
                     old_order.modify_sz(sz);
+                    if let Some(total) = totals.get_mut(&px) {
+                        total.update_order_sz(old_sz, sz);
+                    }
                     return true;
                 }
                 return false;
@@ -135,20 +202,10 @@ impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn get_bbo(&self) -> (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>) {
         // Best bid = highest price in bids (last key in BTreeMap)
-        let best_bid = self.bids.last_key_value().map(|(px, list)| {
-            let orders = list.to_vec();
-            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
-            let count = orders.len() as u32;
-            (*px, Sz::new(total_sz), count)
-        });
+        let best_bid = self.bid_totals.last_key_value().map(|(px, total)| total.as_bbo(*px));
 
         // Best ask = lowest price in asks (first key in BTreeMap)
-        let best_ask = self.asks.first_key_value().map(|(px, list)| {
-            let orders = list.to_vec();
-            let total_sz = orders.iter().map(|o| o.sz().value()).sum::<u64>();
-            let count = orders.len() as u32;
-            (*px, Sz::new(total_sz), count)
-        });
+        let best_ask = self.ask_totals.first_key_value().map(|(px, total)| total.as_bbo(*px));
 
         (best_bid, best_ask)
     }
@@ -200,13 +257,36 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 }
 
-fn add_order_to_book<O: InnerOrder>(map: &mut BTreeMap<Px, LinkedList<Oid, O>>, order: O) {
+fn add_order_to_book<O: InnerOrder>(
+    map: &mut BTreeMap<Px, LinkedList<Oid, O>>,
+    totals: &mut BTreeMap<Px, LevelTotal>,
+    order: O,
+) {
     let oid = order.oid();
     let limit_px = order.limit_px();
-    map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order);
+    let sz = order.sz();
+    if map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order) {
+        totals.entry(limit_px).and_modify(|total| total.add_order(sz)).or_insert_with(|| LevelTotal::new(sz));
+    }
 }
 
-fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>>, taker_order: &mut O) -> Vec<Oid> {
+fn remove_order_from_totals(totals: &mut BTreeMap<Px, LevelTotal>, px: Px, sz: Sz) {
+    let remove_level = if let Some(total) = totals.get_mut(&px) {
+        total.remove_order(sz);
+        total.is_empty()
+    } else {
+        false
+    };
+    if remove_level {
+        totals.remove(&px);
+    }
+}
+
+fn match_order<O: InnerOrder>(
+    maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>>,
+    maker_totals: &mut BTreeMap<Px, LevelTotal>,
+    taker_order: &mut O,
+) -> Vec<Oid> {
     let mut filled_oids = Vec::new();
     let mut keys_to_remove = Vec::new();
     let taker_side = taker_order.side();
@@ -224,8 +304,12 @@ fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>
             break;
         }
         while let Some(match_order) = list.head_value_ref_mut_unsafe() {
-            taker_order.fill(match_order);
-            if match_order.sz().is_zero() {
+            let matched_sz = taker_order.fill(match_order);
+            let maker_filled = match_order.sz().is_zero();
+            if let Some(total) = maker_totals.get_mut(&px) {
+                total.apply_match(matched_sz, maker_filled);
+            }
+            if maker_filled {
                 filled_oids.push(match_order.oid());
                 let _unused = list.remove_front();
             }
@@ -242,6 +326,7 @@ fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>
     }
     for key in keys_to_remove {
         maker_orders.remove(&key);
+        maker_totals.remove(&key);
     }
     filled_oids
 }
@@ -437,6 +522,37 @@ mod tests {
         assert_eq!(px, Px::new(50));
         assert_eq!(sz, Sz::new(300)); // aggregated
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_level_totals_track_mutations_and_matching() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+        book.add_order(MinimalOrder::new(2, 15, 100, Side::Bid));
+
+        let (bid, ask) = book.get_bbo();
+        assert_eq!(bid.unwrap(), (Px::new(100), Sz::new(25), 2));
+        assert!(ask.is_none());
+
+        assert!(book.modify_sz(Oid::new(1), Sz::new(20)));
+        let (bid, ask) = book.get_bbo();
+        assert_eq!(bid.unwrap(), (Px::new(100), Sz::new(35), 2));
+        assert!(ask.is_none());
+
+        assert!(book.cancel_order(Oid::new(2)));
+        let (bid, ask) = book.get_bbo();
+        assert_eq!(bid.unwrap(), (Px::new(100), Sz::new(20), 1));
+        assert!(ask.is_none());
+
+        book.add_order(MinimalOrder::new(3, 5, 100, Side::Ask));
+        let (bid, ask) = book.get_bbo();
+        assert_eq!(bid.unwrap(), (Px::new(100), Sz::new(15), 1));
+        assert!(ask.is_none());
+
+        book.add_order(MinimalOrder::new(4, 20, 100, Side::Ask));
+        let (bid, ask) = book.get_bbo();
+        assert!(bid.is_none());
+        assert_eq!(ask.unwrap(), (Px::new(100), Sz::new(5), 1));
     }
 
     // ==================== Order Matching Tests ====================

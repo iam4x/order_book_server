@@ -129,6 +129,7 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         res
     }
 
+    #[allow(dead_code)]
     pub(crate) fn fold<F, Acc>(&self, mut init: Acc, f: F) -> Acc
     where
         F: Fn(&mut Acc, &T),

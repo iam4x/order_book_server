@@ -1,4 +1,4 @@
-use crate::order_book::{InnerOrder, Oid, OrderBook, Px, Side, Snapshot, Sz, linked_list::LinkedList};
+use crate::order_book::{InnerOrder, LevelTotal, OrderBook, Px, Side, Snapshot};
 use crate::types::Level;
 use crate::types::inner::InnerLevel;
 use std::collections::BTreeMap;
@@ -26,10 +26,8 @@ impl<O: InnerOrder> OrderBook<O> {
         n_sig_figs: Option<u32>,
         mantissa: Option<u64>,
     ) -> Snapshot<InnerLevel> {
-        let bids = &self.bids;
-        let asks = &self.asks;
-        let bids = map_to_l2_levels(bids, Side::Bid, n_levels, n_sig_figs, mantissa);
-        let asks = map_to_l2_levels(asks, Side::Ask, n_levels, n_sig_figs, mantissa);
+        let bids = map_to_l2_levels(&self.bid_totals, Side::Bid, n_levels, n_sig_figs, mantissa);
+        let asks = map_to_l2_levels(&self.ask_totals, Side::Ask, n_levels, n_sig_figs, mantissa);
         Snapshot([bids, asks])
     }
 
@@ -39,8 +37,8 @@ impl<O: InnerOrder> OrderBook<O> {
         n_levels: Option<usize>,
         params: &[(Option<u32>, Option<u64>)],
     ) -> Vec<Snapshot<InnerLevel>> {
-        let bids = map_to_l2_levels_many(&self.bids, Side::Bid, n_levels, params);
-        let asks = map_to_l2_levels_many(&self.asks, Side::Ask, n_levels, params);
+        let bids = map_to_l2_levels_many(&self.bid_totals, Side::Bid, n_levels, params);
+        let asks = map_to_l2_levels_many(&self.ask_totals, Side::Ask, n_levels, params);
         bids.into_iter().zip(asks).map(|(bids, asks)| Snapshot([bids, asks])).collect()
     }
 }
@@ -90,8 +88,8 @@ fn l2_levels_to_l2_levels(
 
 #[must_use]
 #[allow(dead_code)]
-fn map_to_l2_levels<O: InnerOrder>(
-    orders: &BTreeMap<Px, LinkedList<Oid, O>>,
+fn map_to_l2_levels(
+    totals: &BTreeMap<Px, LevelTotal>,
     side: Side,
     n_levels: Option<usize>,
     n_sig_figs: Option<u32>,
@@ -102,14 +100,11 @@ fn map_to_l2_levels<O: InnerOrder>(
         return levels;
     }
     let mut cur_level: Option<InnerLevel> = None;
-    let order_iter: Box<dyn Iterator<Item = (&Px, &LinkedList<Oid, O>)>> = match side {
-        Side::Ask => Box::new(orders.iter()),
-        Side::Bid => Box::new(orders.iter().rev()),
+    let level_iter: Box<dyn Iterator<Item = (&Px, &LevelTotal)>> = match side {
+        Side::Ask => Box::new(totals.iter()),
+        Side::Bid => Box::new(totals.iter().rev()),
     };
-    for (px, orders) in order_iter {
-        // could be done a bit more efficiently using caching
-        let sz = orders.fold(Sz::new(0), |sz, order| *sz = *sz + order.sz());
-        let n = orders.fold(0, |n, _| *n += 1);
+    for (px, total) in level_iter {
         if build_l2_level(
             &mut cur_level,
             &mut levels,
@@ -117,7 +112,7 @@ fn map_to_l2_levels<O: InnerOrder>(
             n_sig_figs,
             mantissa,
             side,
-            InnerLevel { px: *px, sz, n },
+            InnerLevel { px: *px, sz: total.sz, n: total.n },
         ) {
             break;
         }
@@ -135,8 +130,8 @@ struct L2LevelBuildState {
 }
 
 #[must_use]
-fn map_to_l2_levels_many<O: InnerOrder>(
-    orders: &BTreeMap<Px, LinkedList<Oid, O>>,
+fn map_to_l2_levels_many(
+    totals: &BTreeMap<Px, LevelTotal>,
     side: Side,
     n_levels: Option<usize>,
     params: &[(Option<u32>, Option<u64>)],
@@ -159,14 +154,12 @@ fn map_to_l2_levels_many<O: InnerOrder>(
         })
         .collect();
 
-    let order_iter: Box<dyn Iterator<Item = (&Px, &LinkedList<Oid, O>)>> = match side {
-        Side::Ask => Box::new(orders.iter()),
-        Side::Bid => Box::new(orders.iter().rev()),
+    let level_iter: Box<dyn Iterator<Item = (&Px, &LevelTotal)>> = match side {
+        Side::Ask => Box::new(totals.iter()),
+        Side::Bid => Box::new(totals.iter().rev()),
     };
-    for (px, orders) in order_iter {
-        let sz = orders.fold(Sz::new(0), |sz, order| *sz = *sz + order.sz());
-        let n = orders.fold(0, |n, _| *n += 1);
-        let level = InnerLevel { px: *px, sz, n };
+    for (px, total) in level_iter {
+        let level = InnerLevel { px: *px, sz: total.sz, n: total.n };
         for state in states.iter_mut().filter(|state| !state.done) {
             state.done = build_l2_level(
                 &mut state.cur_level,
@@ -222,7 +215,7 @@ pub(super) fn build_l2_level(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order_book::{OrderBook, types::InnerOrder};
+    use crate::order_book::{OrderBook, Sz, types::InnerOrder};
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct TestOrder {
