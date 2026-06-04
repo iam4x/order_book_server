@@ -37,6 +37,9 @@ mod parallel;
 mod state;
 mod utils;
 
+const L2_BROADCAST_THROTTLE_MS: u64 = 50;
+const L2_FLUSH_TICK_MS: u64 = 10;
+
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
     listener: Arc<Mutex<OrderBookListener>>,
@@ -152,6 +155,53 @@ impl OrderBookListener {
     // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+    }
+
+    fn flush_l2_if_due(&mut self) {
+        // Throttled L2 snapshot broadcast for L2Book subscribers.
+        // l2_snapshots_uncached() walks every coin x every aggregation variant, so
+        // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
+        // since the previous L2 compute - there's nothing new to send and the
+        // per-client dedup would drop it anyway.
+        // (Heartbeat resend for quiet coins is handled per-connection in handle_socket.)
+        //
+        // CRITICAL: the receiver_count gate must wrap l2_snapshots_uncached(), not
+        // sit between compute and send. A prior version updated last_l2_broadcast
+        // only when receivers existed, so with zero subscribers the throttle reset
+        // never fired and the par_iter ran on every event - tens of GB of allocator
+        // churn per hour and a pinned listener mutex.
+        let should_broadcast_l2 = !self.pending_l2_changed_coins.is_empty()
+            && self
+                .last_l2_broadcast
+                .map(|t| t.elapsed() >= Duration::from_millis(L2_BROADCAST_THROTTLE_MS))
+                .unwrap_or(true);
+
+        if should_broadcast_l2 {
+            let has_receivers = self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0);
+            // Mark the throttle as fired regardless of receivers so we don't
+            // re-check on every subsequent event when nobody is listening.
+            self.last_l2_broadcast = Some(Instant::now());
+            if has_receivers {
+                if let Some(state) = &self.order_book_state {
+                    let l2_start = Instant::now();
+                    let changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
+                    let (time, l2_snapshots) =
+                        state.l2_snapshots_incremental(&changed_for_l2, &mut self.l2_snapshot_cache);
+
+                    static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if bc % 100 == 0 {
+                        info!("L2 broadcast #{} at time {}", bc, time);
+                    }
+
+                    if let Some(tx) = &self.internal_message_tx {
+                        let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots, time });
+                        drop(tx.send(msg));
+                    }
+                    L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
+                }
+            }
+        }
     }
 }
 
@@ -372,47 +422,7 @@ impl OrderBookListener {
             }
         }
 
-        // Throttled L2 snapshot broadcast for L2Book subscribers.
-        // l2_snapshots_uncached() walks every coin x every aggregation variant, so
-        // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
-        // since the previous L2 compute - there's nothing new to send and the
-        // per-client dedup would drop it anyway.
-        // (Heartbeat resend for quiet coins is handled per-connection in handle_socket.)
-        //
-        // CRITICAL: the receiver_count gate must wrap l2_snapshots_uncached(), not
-        // sit between compute and send. A prior version updated last_l2_broadcast
-        // only when receivers existed, so with zero subscribers the throttle reset
-        // never fired and the par_iter ran on every event - tens of GB of allocator
-        // churn per hour and a pinned listener mutex.
-        let should_broadcast_l2 = !self.pending_l2_changed_coins.is_empty()
-            && self.last_l2_broadcast.map(|t| t.elapsed() >= Duration::from_millis(50)).unwrap_or(true);
-
-        if should_broadcast_l2 {
-            let has_receivers = self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0);
-            // Mark the throttle as fired regardless of receivers so we don't
-            // re-check on every subsequent event when nobody is listening.
-            self.last_l2_broadcast = Some(Instant::now());
-            if has_receivers {
-                if let Some(state) = &self.order_book_state {
-                    let l2_start = Instant::now();
-                    let changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
-                    let (time, l2_snapshots) =
-                        state.l2_snapshots_incremental(&changed_for_l2, &mut self.l2_snapshot_cache);
-
-                    static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if bc % 100 == 0 {
-                        info!("L2 broadcast #{} at time {}", bc, time);
-                    }
-
-                    if let Some(tx) = &self.internal_message_tx {
-                        let msg = Arc::new(InternalMessage::Snapshot { l2_snapshots, time });
-                        drop(tx.send(msg));
-                    }
-                    L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
-                }
-            }
-        }
+        self.flush_l2_if_due();
         Ok(())
     }
 }
@@ -541,6 +551,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(10));
+    let mut l2_flush_ticker = tokio::time::interval_at(
+        Instant::now() + Duration::from_millis(L2_FLUSH_TICK_MS),
+        Duration::from_millis(L2_FLUSH_TICK_MS),
+    );
+    l2_flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_fetch_pending = false;
 
     info!("Main event loop starting");
@@ -571,6 +586,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                     }
                 }
+            }
+
+            // Flush throttled L2 changes even if no further file event arrives.
+            _ = l2_flush_ticker.tick() => {
+                listener.lock().await.flush_l2_if_due();
             }
 
             // Snapshot fetch result
@@ -677,16 +697,6 @@ mod tests {
         .to_string()
     }
 
-    fn empty_status_line() -> String {
-        serde_json::json!({
-            "local_time": "2024-01-15T10:30:00.000000000",
-            "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 2,
-            "events": []
-        })
-        .to_string()
-    }
-
     fn drain_latest_l2(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
         let mut latest = None;
         while let Ok(msg) = rx.try_recv() {
@@ -721,11 +731,11 @@ mod tests {
         assert!(drain_latest_l2(&mut rx).is_none(), "the BTC update should be inside the L2 throttle window");
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
 
-        // The next event after the throttle window has no changed coins of its own.
-        // Before the fix, this did not recompute BTC, leaving L2 stale until a later
-        // BTC event happened to land outside the global throttle window.
-        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(51));
-        listener.process_data_hft(empty_status_line(), EventSource::OrderStatuses).expect("empty status batch parses");
+        // The periodic L2 flush after the throttle window must recompute BTC even
+        // if no additional file event arrives.
+        listener.last_l2_broadcast =
+            Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
@@ -751,8 +761,9 @@ mod tests {
         assert!(drain_latest_l2(&mut rx).is_none(), "the second-level change should be inside the L2 throttle window");
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
 
-        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(51));
-        listener.process_data_hft(empty_status_line(), EventSource::OrderStatuses).expect("empty status batch parses");
+        listener.last_l2_broadcast =
+            Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
