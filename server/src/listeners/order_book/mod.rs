@@ -154,6 +154,7 @@ pub(crate) struct OrderBookListener {
     // full level-vector clone. Invalidated in `init_from_snapshot`.
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
+    last_universe: HashSet<Coin>,
 }
 
 impl OrderBookListener {
@@ -167,6 +168,7 @@ impl OrderBookListener {
             pending_l2_changed_coins: HashSet::new(),
             l2_snapshot_cache: HashMap::new(),
             l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
+            last_universe: HashSet::new(),
         }
     }
 
@@ -197,6 +199,7 @@ impl OrderBookListener {
         // Don't try to apply cached updates - they may have gaps
         let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
         self.order_book_state = Some(new_order_book);
+        self.last_universe = self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe);
         // The incremental L2 cache references the previous book's coins/levels;
         // drop it so the next broadcast does a full rebuild against the new state.
         self.l2_snapshot_cache = HashMap::new();
@@ -209,6 +212,27 @@ impl OrderBookListener {
     // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+    }
+
+    fn broadcast_universe_if_changed(&mut self, changed_coins: &HashSet<Coin>) {
+        let Some(state) = &self.order_book_state else { return };
+        let might_have_changed =
+            state.coin_count() != self.last_universe.len() || changed_coins.iter().any(|coin| !self.last_universe.contains(coin));
+        if !might_have_changed {
+            return;
+        }
+
+        let universe = state.compute_universe();
+        if universe == self.last_universe {
+            return;
+        }
+
+        self.last_universe = universe.clone();
+        if let Some(tx) = &self.internal_message_tx {
+            if tx.receiver_count() > 0 {
+                drop(tx.send(Arc::new(InternalMessage::Universe { universe })));
+            }
+        }
     }
 
     fn flush_l2_if_due(&mut self) {
@@ -472,6 +496,7 @@ impl OrderBookListener {
         // spawn a tokio task per change even with zero subscribers, wasting CPU.
         if !changed_coins.is_empty() {
             self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
+            self.broadcast_universe_if_changed(&changed_coins);
 
             if let Some(state) = &self.order_book_state {
                 if let Some(tx) = &self.internal_message_tx {
@@ -521,14 +546,12 @@ pub(crate) struct TimedSnapshots {
 
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    #[allow(dead_code)]
-    Snapshot {
-        l2_snapshots: L2Snapshots,
-        time: u64,
-    },
     L2Update {
         l2_snapshots: L2Snapshots,
         time: u64,
+    },
+    Universe {
+        universe: HashSet<Coin>,
     },
     Fills {
         batch: Batch<NodeDataFill>,
@@ -793,7 +816,7 @@ mod tests {
     fn drain_latest_l2(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
         let mut latest = None;
         while let Ok(msg) = rx.try_recv() {
-            if matches!(msg.as_ref(), InternalMessage::Snapshot { .. } | InternalMessage::L2Update { .. }) {
+            if matches!(msg.as_ref(), InternalMessage::L2Update { .. }) {
                 latest = Some(msg);
             }
         }
@@ -832,7 +855,7 @@ mod tests {
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
-            InternalMessage::Snapshot { l2_snapshots, .. } | InternalMessage::L2Update { l2_snapshots, .. } => {
+            InternalMessage::L2Update { l2_snapshots, .. } => {
                 assert_eq!(l2_best_bid_sz(l2_snapshots, "BTC"), "2");
             }
             _ => unreachable!("drain_latest_l2 only returns snapshots"),
@@ -860,7 +883,7 @@ mod tests {
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
-            InternalMessage::Snapshot { l2_snapshots, .. } | InternalMessage::L2Update { l2_snapshots, .. } => {
+            InternalMessage::L2Update { l2_snapshots, .. } => {
                 assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 0), "1");
                 assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 1), "2");
             }

@@ -1,7 +1,6 @@
 use crate::{
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, L2SubscriptionRegistry, OrderBookListener, TimedSnapshots,
-        hl_listen_hft,
+        InternalMessage, L2SnapshotParams, L2SubscriptionRegistry, OrderBookListener, TimedSnapshots, hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
@@ -290,7 +289,7 @@ async fn handle_socket(
     BROADCAST_RECEIVERS.set(internal_message_tx.receiver_count() as i64);
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
-    let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
+    let mut universe = filter_universe(&listener.lock().await.universe(), market_filter.0, market_filter.1, market_filter.2);
     // Per-(coin,params) cache for L2 dedup + heartbeat resend (key = "<coin>:<n_sig_figs>:<mantissa>")
     let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
@@ -318,16 +317,6 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
-                                universe = new_universe(l2_snapshots, market_filter.0, market_filter.1, market_filter.2);
-                                for sub in manager.subscriptions() {
-                                    if !alive { break; }
-                                    // Skip BBO subs here - they get fast updates via BboUpdate
-                                    if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2, true).await;
-                                    }
-                                }
-                            },
                             InternalMessage::L2Update{ l2_snapshots, time } => {
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
@@ -336,6 +325,9 @@ async fn handle_socket(
                                         alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2, false).await;
                                     }
                                 }
+                            },
+                            InternalMessage::Universe{ universe: next_universe } => {
+                                universe = filter_universe(next_universe, market_filter.0, market_filter.1, market_filter.2);
                             },
                             InternalMessage::BboUpdate{ bbos, time } => {
                                 // Fast path for BBO subscribers only
@@ -670,18 +662,16 @@ async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) -> boo
     }
 }
 
-// derive it from l2_snapshots because thats convenient
 // Filters coins based on market type flags
-fn new_universe(
-    l2_snapshots: &L2Snapshots,
+fn filter_universe(
+    universe: &HashSet<Coin>,
     include_perps: bool,
     include_spot: bool,
     include_hip3: bool,
 ) -> HashSet<String> {
-    l2_snapshots
-        .as_ref()
+    universe
         .iter()
-        .filter_map(|(c, _)| {
+        .filter_map(|c| {
             let include =
                 (c.is_perp() && include_perps) || (c.is_spot() && include_spot) || (c.is_hip3() && include_hip3);
             if include { Some(c.clone().value()) } else { None }
@@ -795,6 +785,17 @@ mod tests {
 
         assert!(registry.active_params().is_empty());
         assert!(registry.active_coins().is_empty());
+    }
+
+    #[test]
+    fn filter_universe_applies_market_flags() {
+        let universe = HashSet::from([Coin::new("BTC"), Coin::new("@1"), Coin::new("xyz:TSLA")]);
+
+        let perps_hip3 = filter_universe(&universe, true, false, true);
+
+        assert!(perps_hip3.contains("BTC"));
+        assert!(perps_hip3.contains("xyz:TSLA"));
+        assert!(!perps_hip3.contains("@1"));
     }
 }
 
