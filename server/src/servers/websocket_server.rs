@@ -1,31 +1,15 @@
-use crate::{
-    listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2SubscriptionRegistry, OrderBookListener, TimedSnapshots, hl_listen_hft,
-    },
-    metrics::{
-        BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
-        MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
-    },
-    order_book::{Coin, Px, Snapshot, Sz},
-    prelude::*,
-    types::{
-        Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Trade,
-        inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-        subscription::{ClientMessage, DEFAULT_LEVELS, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
-    },
-};
-use axum::{Router, routing::get};
-use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::select;
+
+use axum::{Router, routing::get};
+use futures_util::{SinkExt, StreamExt};
+use log::{error, info};
 use tokio::{
     net::TcpListener,
+    select,
     sync::{
         Mutex,
         broadcast::{Sender, channel},
@@ -33,7 +17,24 @@ use tokio::{
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-use crate::ServerConfig;
+use crate::{
+    ServerConfig,
+    listeners::order_book::{
+        InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, OrderBookListener, PreparedL2Book, TimedSnapshots,
+        hl_listen_hft,
+    },
+    metrics::{
+        BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
+        MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
+    },
+    order_book::{Coin, Px, Sz},
+    prelude::*,
+    types::{
+        Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Trade,
+        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::{ClientMessage, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
+    },
+};
 
 /// Per-(coin, params) cached L2 broadcast. `hash` is used for change-based dedup;
 /// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
@@ -51,13 +52,9 @@ struct BboEntry {
     payload: Bbo,
 }
 
-fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>) -> String {
-    format!("{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0))
-}
-
 struct ConnectionL2Registrations {
     registry: Arc<L2SubscriptionRegistry>,
-    subscriptions: HashSet<(Coin, L2SnapshotParams, Option<usize>)>,
+    subscriptions: HashSet<L2SubscriptionKey>,
 }
 
 impl ConnectionL2Registrations {
@@ -67,20 +64,18 @@ impl ConnectionL2Registrations {
 
     fn register(&mut self, subscription: &Subscription) {
         if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-            let coin = Coin::new(coin);
-            let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
-            if self.subscriptions.insert((coin.clone(), params, *n_levels)) {
-                self.registry.register_l2(coin, params);
+            let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
+            if self.subscriptions.insert(key.clone()) {
+                self.registry.register_l2(key);
             }
         }
     }
 
     fn unregister(&mut self, subscription: &Subscription) {
         if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-            let coin = Coin::new(coin);
-            let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
-            if self.subscriptions.remove(&(coin.clone(), params, *n_levels)) {
-                self.registry.unregister_l2(&coin, params);
+            let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
+            if self.subscriptions.remove(&key) {
+                self.registry.unregister_l2(&key);
             }
         }
     }
@@ -88,8 +83,8 @@ impl ConnectionL2Registrations {
 
 impl Drop for ConnectionL2Registrations {
     fn drop(&mut self) {
-        for (coin, params, _) in self.subscriptions.drain() {
-            self.registry.unregister_l2(&coin, params);
+        for key in self.subscriptions.drain() {
+            self.registry.unregister_l2(&key);
         }
     }
 }
@@ -289,9 +284,10 @@ async fn handle_socket(
     BROADCAST_RECEIVERS.set(internal_message_tx.receiver_count() as i64);
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
-    let mut universe = filter_universe(&listener.lock().await.universe(), market_filter.0, market_filter.1, market_filter.2);
-    // Per-(coin,params) cache for L2 dedup + heartbeat resend (key = "<coin>:<n_sig_figs>:<mantissa>")
-    let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
+    let mut universe =
+        filter_universe(&listener.lock().await.universe(), market_filter.0, market_filter.1, market_filter.2);
+    // Per-subscription cache for L2 dedup + heartbeat resend.
+    let mut last_l2: HashMap<L2SubscriptionKey, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
     let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
     let mut l2_registrations = ConnectionL2Registrations::new(l2_subscription_registry);
@@ -317,12 +313,12 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::L2Update{ l2_snapshots, time } => {
+                            InternalMessage::L2Update{ l2_books } => {
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     // Partial L2 updates intentionally omit unchanged coins.
-                                    if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, &mut last_bbo, &mut last_l2, false).await;
+                                    if matches!(sub, Subscription::L2Book { .. }) {
+                                        alive &= send_ws_data_from_l2_update(&mut socket, sub, l2_books, &mut last_l2).await;
                                     }
                                 }
                             },
@@ -404,9 +400,9 @@ async fn handle_socket(
                 for sub in manager.subscriptions() {
                     if !alive { break; }
                     match sub {
-                        Subscription::L2Book { coin, n_sig_figs, mantissa, .. } => {
+                        Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
                             let Some(hb) = l2_hb else { continue };
-                            let key = l2_cache_key(coin, *n_sig_figs, *mantissa);
+                            let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
                             if let Some(entry) = last_l2.get_mut(&key) {
                                 if now.duration_since(entry.last_sent) >= hb {
                                     entry.payload.set_time(now_ms);
@@ -498,7 +494,7 @@ async fn receive_client_message(
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
     bbo_only: bool,
-    last_l2: &mut HashMap<String, L2Entry>,
+    last_l2: &mut HashMap<L2SubscriptionKey, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
     l2_registrations: &mut ConnectionL2Registrations,
 ) -> bool {
@@ -510,9 +506,13 @@ async fn receive_client_message(
     // operator sees a single clear "denied" message in the log instead of "valid
     // subscription" then a rejection.
     if bbo_only && !matches!(&subscription, Subscription::Bbo { .. }) {
-        return send_socket_message(socket, ServerResponse::Error(
-            "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
-        )).await;
+        return send_socket_message(
+            socket,
+            ServerResponse::Error(
+                "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
+            ),
+        )
+        .await;
     }
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
@@ -524,7 +524,8 @@ async fn receive_client_message(
         ClientMessage::Subscribe { .. } => match manager.subscribe(subscription.clone()) {
             Ok(inserted) => ("", inserted),
             Err(err) => {
-                return send_socket_message(socket, ServerResponse::Error(format!("Rejected subscription: {err}"))).await;
+                return send_socket_message(socket, ServerResponse::Error(format!("Rejected subscription: {err}")))
+                    .await;
             }
         },
         ClientMessage::Unsubscribe { .. } => {
@@ -534,8 +535,9 @@ async fn receive_client_message(
             // the same coin (or BBO across coins) leaks one entry per cycle until disconnect.
             if removed {
                 match &subscription {
-                    Subscription::L2Book { coin, n_sig_figs, mantissa, .. } => {
-                        last_l2.remove(&l2_cache_key(coin, *n_sig_figs, *mantissa));
+                    Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
+                        let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
+                        last_l2.remove(&key);
                         l2_registrations.unregister(&subscription);
                     }
                     Subscription::Bbo { coin } => {
@@ -555,8 +557,11 @@ async fn receive_client_message(
                 Ok(msg) => msg,
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
-                    return send_socket_message(socket,
-                        ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"))).await;
+                    return send_socket_message(
+                        socket,
+                        ServerResponse::Error(format!("Unable to grab order book snapshot: {err}")),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -596,12 +601,8 @@ async fn send_ws_data_from_bbo(
         // Use the canonical wire format (Px/Sz::to_str) instead of `format!("{:?}", ...)`.
         // Debug for Px/Sz happens to produce the same output today, but going through
         // to_str matches what the L2 path already emits and skips the Formatter machinery.
-        let bid = best_bid
-            .as_ref()
-            .map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
-        let ask = best_ask
-            .as_ref()
-            .map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
+        let bid = best_bid.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
+        let ask = best_ask.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
 
         // Deduplication check
         let bid_px = bid.as_ref().map(|b| b.px().to_string()).unwrap_or_default();
@@ -614,10 +615,8 @@ async fn send_ws_data_from_bbo(
             BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
             BROADCASTS_TOTAL.with_label_values(&["bbo"]).inc();
             let bbo = Bbo { coin: coin.to_string(), time, bid, ask };
-            last_bbo.insert(
-                coin.to_string(),
-                BboEntry { tuple: current, last_sent: Instant::now(), payload: bbo.clone() },
-            );
+            last_bbo
+                .insert(coin.to_string(), BboEntry { tuple: current, last_sent: Instant::now(), payload: bbo.clone() });
             return send_socket_message(socket, ServerResponse::Bbo(bbo)).await;
         }
     }
@@ -679,84 +678,29 @@ fn filter_universe(
         .collect()
 }
 
-async fn send_ws_data_from_snapshot(
+async fn send_ws_data_from_l2_update(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    snapshot: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
-    time: u64,
-    last_bbo: &mut HashMap<String, BboEntry>,
-    last_l2: &mut HashMap<String, L2Entry>,
-    missing_is_error: bool,
+    l2_books: &HashMap<L2SubscriptionKey, Arc<PreparedL2Book>>,
+    last_l2: &mut HashMap<L2SubscriptionKey, L2Entry>,
 ) -> bool {
-    match subscription {
-        Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
-            let snapshot = snapshot.get(&Coin::new(coin));
-            if let Some(snapshot) =
-                snapshot.and_then(|snapshot| snapshot.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
-            {
-                let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-                let snapshot = snapshot.truncate(n_levels);
-                let snapshot = snapshot.export_inner_snapshot();
+    let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription else {
+        return true;
+    };
 
-                // Hash the snapshot for dedup comparison. Level derives Hash, so we
-                // walk the [Vec<Level>; 2] directly - the prior `format!("{:?}", snapshot)`
-                // path allocated a Debug-format string per L2 subscription per broadcast,
-                // saturating glibc/jemalloc under load and dominating allocator pressure.
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                snapshot.hash(&mut hasher);
-                let current_hash = hasher.finish();
+    let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
+    let Some(prepared) = l2_books.get(&key) else {
+        return true;
+    };
 
-                // Create unique key for this subscription (coin + params)
-                let key = l2_cache_key(coin, *n_sig_figs, *mantissa);
-
-                if last_l2.get(&key).map(|e| e.hash) != Some(current_hash) {
-                    BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
-                    let l2_book =
-                        L2Book::from_l2_snapshot(coin.clone(), snapshot, time, *n_sig_figs, *mantissa, Some(n_levels));
-                    last_l2.insert(
-                        key,
-                        L2Entry { hash: current_hash, last_sent: Instant::now(), payload: l2_book.clone() },
-                    );
-                    return send_socket_message(socket, ServerResponse::L2Book(l2_book)).await;
-                }
-                // else: skip, L2 unchanged
-            } else {
-                if missing_is_error {
-                    error!("Coin {coin} not found");
-                }
-            }
-        }
-        Subscription::Bbo { coin } => {
-            // Get default snapshot (no aggregation)
-            let snapshot = snapshot.get(&Coin::new(coin));
-            if let Some(snapshot) = snapshot.and_then(|s| s.get(&L2SnapshotParams::new(None, None))) {
-                let levels = snapshot.truncate(1).export_inner_snapshot();
-                let bid = levels[0].first().cloned();
-                let ask = levels[1].first().cloned();
-
-                // Only send if BBO changed (dedupe identical messages)
-                let bid_px = bid.as_ref().map(|b| b.px().to_string()).unwrap_or_default();
-                let bid_sz = bid.as_ref().map(|b| b.sz().to_string()).unwrap_or_default();
-                let ask_px = ask.as_ref().map(|a| a.px().to_string()).unwrap_or_default();
-                let ask_sz = ask.as_ref().map(|a| a.sz().to_string()).unwrap_or_default();
-                let current = (bid_px, bid_sz, ask_px, ask_sz);
-
-                if last_bbo.get(coin).map(|e| &e.tuple) != Some(&current) {
-                    let bbo = Bbo { coin: coin.clone(), time, bid, ask };
-                    last_bbo.insert(
-                        coin.clone(),
-                        BboEntry { tuple: current, last_sent: Instant::now(), payload: bbo.clone() },
-                    );
-                    return send_socket_message(socket, ServerResponse::Bbo(bbo)).await;
-                }
-                // else: skip, BBO unchanged
-            }
-        }
-        _ => {}
+    if last_l2.get(&key).map(|entry| entry.hash) == Some(prepared.hash()) {
+        return true;
     }
-    true
+
+    BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
+    let payload = prepared.payload().clone();
+    last_l2.insert(key, L2Entry { hash: prepared.hash(), last_sent: Instant::now(), payload: payload.clone() });
+    send_socket_message(socket, ServerResponse::L2Book(payload)).await
 }
 
 #[cfg(test)]
@@ -767,7 +711,8 @@ mod tests {
     fn l2_registration_counts_distinct_levels_independently() {
         let registry = Arc::new(L2SubscriptionRegistry::default());
         let mut registrations = ConnectionL2Registrations::new(Arc::clone(&registry));
-        let default_params = L2SnapshotParams::new(None, None);
+        let default_key = L2SubscriptionKey::new(Coin::new("BTC"), None, None, None);
+        let ten_levels_key = L2SubscriptionKey::new(Coin::new("BTC"), None, None, Some(10));
 
         let default_levels =
             Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: None, mantissa: None };
@@ -778,12 +723,13 @@ mod tests {
         registrations.register(&ten_levels);
         registrations.unregister(&default_levels);
 
-        assert!(registry.active_params().contains(&default_params));
+        assert!(!registry.active_keys().contains(&default_key));
+        assert!(registry.active_keys().contains(&ten_levels_key));
         assert!(registry.active_coins().contains(&Coin::new("BTC")));
 
         registrations.unregister(&ten_levels);
 
-        assert!(registry.active_params().is_empty());
+        assert!(registry.active_keys().is_empty());
         assert!(registry.active_coins().is_empty());
     }
 

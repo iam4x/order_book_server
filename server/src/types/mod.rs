@@ -87,6 +87,11 @@ impl L2Book {
     pub(crate) const fn set_time(&mut self, time: u64) {
         self.time = time;
     }
+
+    #[cfg(test)]
+    pub(crate) const fn levels(&self) -> &[Vec<Level>; 2] {
+        &self.levels
+    }
 }
 
 impl Trade {
