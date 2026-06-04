@@ -555,7 +555,6 @@ impl OrderBookListener {
             }
         }
 
-        self.flush_l2_if_due();
         Ok(())
     }
 }
@@ -770,6 +769,12 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         tokio::select! {
             biased;
 
+            // Flush throttled L2 changes on the scheduler, ahead of file events in
+            // this biased select, so a full file-event queue cannot starve L2.
+            _ = l2_flush_ticker.tick() => {
+                listener.lock().await.flush_l2_if_due();
+            }
+
             // Process events from file watchers (via bridge)
             Some(event) = tokio_rx.recv() => {
                 match event {
@@ -792,11 +797,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                     }
                 }
-            }
-
-            // Flush throttled L2 changes even if no further file event arrives.
-            _ = l2_flush_ticker.tick() => {
-                listener.lock().await.flush_l2_if_due();
             }
 
             // Snapshot fetch result
@@ -1005,6 +1005,28 @@ mod tests {
             _ => unreachable!("drain_latest_l2 only returns snapshots"),
         }
         assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn process_data_hft_defers_l2_flush_to_scheduler() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+        assert!(drain_latest_l2(&mut rx).is_none(), "event processing should not synchronously flush L2");
+
+        listener.flush_l2_if_due();
+
+        let msg = drain_latest_l2(&mut rx).expect("scheduler flush should publish pending L2");
+        match msg.as_ref() {
+            InternalMessage::L2Update { l2_books, .. } => {
+                assert_eq!(prepared_l2_bid_sz_at_level(l2_books, "BTC", 0), "2");
+            }
+            _ => unreachable!("drain_latest_l2 only returns L2 updates"),
+        }
     }
 
     #[test]
