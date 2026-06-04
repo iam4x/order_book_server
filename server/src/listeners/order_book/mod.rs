@@ -97,10 +97,12 @@ impl L2SubscriptionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn active_params(&self) -> HashSet<L2SnapshotParams> {
         self.params().keys().copied().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn active_coins(&self) -> HashSet<Coin> {
         self.coins().keys().cloned().collect()
     }
@@ -287,16 +289,20 @@ impl OrderBookListener {
         // only when receivers existed, so with zero subscribers the throttle reset
         // never fired and the par_iter ran on every event - tens of GB of allocator
         // churn per hour and a pinned listener mutex.
-        let requested_params = self.l2_subscription_registry.active_params();
-        let active_coins = self.l2_subscription_registry.active_coins();
+        if self.pending_l2_changed_coins.is_empty() {
+            return None;
+        }
+
         let active_keys = self.l2_subscription_registry.active_keys();
-        if requested_params.is_empty() || active_coins.is_empty() || active_keys.is_empty() {
+        if active_keys.is_empty() {
             self.pending_l2_changed_coins.clear();
             self.l2_snapshot_cache.clear();
             self.l2_prepared_hashes.clear();
             self.next_l2_version = 1;
             return None;
         }
+        let requested_params: HashSet<L2SnapshotParams> = active_keys.iter().map(|key| key.params).collect();
+        let active_coins: HashSet<Coin> = active_keys.iter().map(|key| key.coin.clone()).collect();
         if !self.pending_l2_changed_coins.iter().any(|coin| active_coins.contains(coin)) {
             self.pending_l2_changed_coins.clear();
             return None;
@@ -323,10 +329,8 @@ impl OrderBookListener {
 
         let state = self.order_book_state.as_ref()?;
         let l2_start = Instant::now();
-        let changed_for_l2: HashSet<Coin> = std::mem::take(&mut self.pending_l2_changed_coins)
-            .into_iter()
-            .filter(|coin| active_coins.contains(coin))
-            .collect();
+        let mut changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
+        changed_for_l2.retain(|coin| active_coins.contains(coin));
         let (time, l2_snapshots) =
             state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
 
