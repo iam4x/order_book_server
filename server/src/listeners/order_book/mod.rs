@@ -43,6 +43,7 @@ const L2_FLUSH_TICK_MS: u64 = 10;
 #[derive(Default)]
 pub(crate) struct L2SubscriptionRegistry {
     params: StdMutex<HashMap<L2SnapshotParams, usize>>,
+    coins: StdMutex<HashMap<Coin, usize>>,
 }
 
 impl L2SubscriptionRegistry {
@@ -50,11 +51,16 @@ impl L2SubscriptionRegistry {
         self.params.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(crate) fn register_params(&self, params: L2SnapshotParams) {
-        *self.params().entry(params).or_insert(0) += 1;
+    fn coins(&self) -> StdMutexGuard<'_, HashMap<Coin, usize>> {
+        self.coins.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(crate) fn unregister_params(&self, params: L2SnapshotParams) {
+    pub(crate) fn register_l2(&self, coin: Coin, params: L2SnapshotParams) {
+        *self.params().entry(params).or_insert(0) += 1;
+        *self.coins().entry(coin).or_insert(0) += 1;
+    }
+
+    pub(crate) fn unregister_l2(&self, coin: &Coin, params: L2SnapshotParams) {
         let mut counts = self.params();
         if let Some(count) = counts.get_mut(&params) {
             *count -= 1;
@@ -62,10 +68,23 @@ impl L2SubscriptionRegistry {
                 counts.remove(&params);
             }
         }
+        drop(counts);
+
+        let mut counts = self.coins();
+        if let Some(count) = counts.get_mut(coin) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(coin);
+            }
+        }
     }
 
     pub(crate) fn active_params(&self) -> HashSet<L2SnapshotParams> {
         self.params().keys().copied().collect()
+    }
+
+    pub(crate) fn active_coins(&self) -> HashSet<Coin> {
+        self.coins().keys().cloned().collect()
     }
 }
 
@@ -206,9 +225,14 @@ impl OrderBookListener {
         // never fired and the par_iter ran on every event - tens of GB of allocator
         // churn per hour and a pinned listener mutex.
         let requested_params = self.l2_subscription_registry.active_params();
-        if requested_params.is_empty() {
+        let active_coins = self.l2_subscription_registry.active_coins();
+        if requested_params.is_empty() || active_coins.is_empty() {
             self.pending_l2_changed_coins.clear();
             self.l2_snapshot_cache.clear();
+            return;
+        }
+        if !self.pending_l2_changed_coins.iter().any(|coin| active_coins.contains(coin)) {
+            self.pending_l2_changed_coins.clear();
             return;
         }
 
@@ -226,7 +250,10 @@ impl OrderBookListener {
             if has_receivers {
                 if let Some(state) = &self.order_book_state {
                     let l2_start = Instant::now();
-                    let changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
+                    let changed_for_l2: HashSet<Coin> = std::mem::take(&mut self.pending_l2_changed_coins)
+                        .into_iter()
+                        .filter(|coin| active_coins.contains(coin))
+                        .collect();
                     let (time, l2_snapshots) =
                         state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
 
@@ -700,18 +727,29 @@ mod tests {
     }
 
     fn listener_with_btc_bids(tx: Sender<Arc<InternalMessage>>, bids: &[(u64, &str, &str)]) -> OrderBookListener {
-        let mut book = OrderBook::new();
-        for (oid, px, sz) in bids {
-            book.add_order(inner_order(*oid, "BTC", Side::Bid, px, sz));
+        listener_with_coin_bids(tx, &[("BTC", bids)])
+    }
+
+    fn listener_with_coin_bids(
+        tx: Sender<Arc<InternalMessage>>,
+        books: &[(&str, &[(u64, &str, &str)])],
+    ) -> OrderBookListener {
+        let mut snapshot_map = HashMap::new();
+        for (coin, bids) in books {
+            let mut book = OrderBook::new();
+            for (oid, px, sz) in *bids {
+                book.add_order(inner_order(*oid, coin, Side::Bid, px, sz));
+            }
+            snapshot_map.insert(Coin::new(coin), book.to_snapshot());
         }
 
-        let snapshots = Snapshots::new(HashMap::from([(Coin::new("BTC"), book.to_snapshot())]));
+        let snapshots = Snapshots::new(snapshot_map);
         let mut listener = OrderBookListener::new(Some(tx), false);
         listener.init_from_snapshot(snapshots, 0);
-        listener.l2_subscription_registry.register_params(L2SnapshotParams::new(None, None));
+        listener.l2_subscription_registry.register_l2(Coin::new("BTC"), L2SnapshotParams::new(None, None));
 
-        // Seed the L2 cache with the original BTC size. The regression below verifies
-        // that a throttled BTC change invalidates this cached entry before the next L2 send.
+        // Seed the L2 cache with the original sizes. The regression below verifies
+        // that a throttled change invalidates this cached entry before the next L2 send.
         let state = listener.order_book_state.as_ref().expect("state initialized");
         let empty = HashSet::new();
         let requested_params = listener.l2_subscription_registry.active_params();
@@ -821,10 +859,28 @@ mod tests {
     }
 
     #[test]
+    fn l2_flush_skips_dirty_coins_without_active_l2_subscriptions() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_coin_bids(tx, &[("BTC", &[(1, "100", "1")]), ("ETH", &[(2, "100", "1")])]);
+        let eth_before = Arc::clone(listener.l2_snapshot_cache.get(&Coin::new("ETH")).expect("ETH cache"));
+
+        listener.pending_l2_changed_coins.insert(Coin::new("ETH"));
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+
+        assert!(listener.pending_l2_changed_coins.is_empty());
+        assert!(Arc::ptr_eq(
+            &eth_before,
+            listener.l2_snapshot_cache.get(&Coin::new("ETH")).expect("ETH cache")
+        ));
+        assert!(drain_latest_l2(&mut rx).is_none());
+    }
+
+    #[test]
     fn l2_flush_without_active_l2_subscribers_skips_snapshot_work() {
         let (tx, mut rx) = channel(8);
         let mut listener = listener_with_btc_bid(tx);
-        listener.l2_subscription_registry.unregister_params(L2SnapshotParams::new(None, None));
+        listener.l2_subscription_registry.unregister_l2(&Coin::new("BTC"), L2SnapshotParams::new(None, None));
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         assert!(!listener.l2_snapshot_cache.is_empty(), "test setup should seed cache");
 

@@ -58,7 +58,7 @@ fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>) -> S
 
 struct ConnectionL2Registrations {
     registry: Arc<L2SubscriptionRegistry>,
-    subscriptions: HashSet<(String, L2SnapshotParams)>,
+    subscriptions: HashSet<(Coin, L2SnapshotParams, Option<usize>)>,
 }
 
 impl ConnectionL2Registrations {
@@ -67,19 +67,21 @@ impl ConnectionL2Registrations {
     }
 
     fn register(&mut self, subscription: &Subscription) {
-        if let Subscription::L2Book { coin, n_sig_figs, mantissa, .. } = subscription {
+        if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
+            let coin = Coin::new(coin);
             let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
-            if self.subscriptions.insert((coin.clone(), params)) {
-                self.registry.register_params(params);
+            if self.subscriptions.insert((coin.clone(), params, *n_levels)) {
+                self.registry.register_l2(coin, params);
             }
         }
     }
 
     fn unregister(&mut self, subscription: &Subscription) {
-        if let Subscription::L2Book { coin, n_sig_figs, mantissa, .. } = subscription {
+        if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
+            let coin = Coin::new(coin);
             let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
-            if self.subscriptions.remove(&(coin.clone(), params)) {
-                self.registry.unregister_params(params);
+            if self.subscriptions.remove(&(coin.clone(), params, *n_levels)) {
+                self.registry.unregister_l2(&coin, params);
             }
         }
     }
@@ -87,8 +89,8 @@ impl ConnectionL2Registrations {
 
 impl Drop for ConnectionL2Registrations {
     fn drop(&mut self) {
-        for (_, params) in self.subscriptions.drain() {
-            self.registry.unregister_params(params);
+        for (coin, params, _) in self.subscriptions.drain() {
+            self.registry.unregister_l2(&coin, params);
         }
     }
 }
@@ -753,6 +755,35 @@ async fn send_ws_data_from_snapshot(
         _ => {}
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l2_registration_counts_distinct_levels_independently() {
+        let registry = Arc::new(L2SubscriptionRegistry::default());
+        let mut registrations = ConnectionL2Registrations::new(Arc::clone(&registry));
+        let default_params = L2SnapshotParams::new(None, None);
+
+        let default_levels =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let ten_levels =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(10), mantissa: None };
+
+        registrations.register(&default_levels);
+        registrations.register(&ten_levels);
+        registrations.unregister(&default_levels);
+
+        assert!(registry.active_params().contains(&default_params));
+        assert!(registry.active_coins().contains(&Coin::new("BTC")));
+
+        registrations.unregister(&ten_levels);
+
+        assert!(registry.active_params().is_empty());
+        assert!(registry.active_coins().is_empty());
+    }
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
