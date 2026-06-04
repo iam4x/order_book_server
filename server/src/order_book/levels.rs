@@ -35,6 +35,7 @@ impl<O: InnerOrder> OrderBook<O> {
 
 impl Snapshot<InnerLevel> {
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn to_l2_snapshot(
         &self,
         n_levels: Option<usize>,
@@ -53,6 +54,7 @@ impl Snapshot<InnerLevel> {
 }
 
 #[must_use]
+#[allow(dead_code)]
 fn l2_levels_to_l2_levels(
     levels: &[InnerLevel],
     side: Side,

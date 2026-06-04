@@ -6,7 +6,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-const MAX_LEVELS: usize = 100;
+pub(crate) const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 /// Hard cap on subscriptions per WS connection. The broadcast hot paths iterate
 /// every subscription on every event, and L4Book subscribes also trigger a

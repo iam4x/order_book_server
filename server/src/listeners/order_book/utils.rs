@@ -173,27 +173,25 @@ impl L2SnapshotParams {
 fn compute_l2_variants_for_coin<O: InnerOrder>(
     order_book: &crate::order_book::OrderBook<O>,
 ) -> HashMap<L2SnapshotParams, Snapshot<InnerLevel>> {
-    let mut entries = Vec::new();
-    let snapshot = order_book.to_l2_snapshot(None, None, None);
-    entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
-    let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
-        if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
-            let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
-            entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
-        }
-    };
+    let max_levels = Some(crate::types::subscription::MAX_LEVELS);
+    let mut entries = Vec::with_capacity(7);
+    entries.push((
+        L2SnapshotParams { n_sig_figs: None, mantissa: None },
+        order_book.to_l2_snapshot(max_levels, None, None),
+    ));
     for n_sig_figs in (2..=5).rev() {
         if n_sig_figs == 5 {
             for mantissa in [None, Some(2), Some(5)] {
-                if mantissa == Some(5) {
-                    // Some(2) is NOT a superset of this info!
-                    add_new_snapshot(Some(n_sig_figs), mantissa, 2);
-                } else {
-                    add_new_snapshot(Some(n_sig_figs), mantissa, 1);
-                }
+                entries.push((
+                    L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa },
+                    order_book.to_l2_snapshot(max_levels, Some(n_sig_figs), mantissa),
+                ));
             }
         } else {
-            add_new_snapshot(Some(n_sig_figs), None, 1);
+            entries.push((
+                L2SnapshotParams { n_sig_figs: Some(n_sig_figs), mantissa: None },
+                order_book.to_l2_snapshot(max_levels, Some(n_sig_figs), None),
+            ));
         }
     }
     entries.into_iter().collect()
@@ -320,5 +318,26 @@ mod tests {
         let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache);
         assert!(!cache.contains_key(&Coin::new("BTC")), "BTC entry should have been evicted from the cache");
         assert!(cache.contains_key(&Coin::new("ETH")));
+    }
+
+    #[test]
+    fn test_l2_variants_are_capped_to_subscription_max_levels() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        for i in 0..150u64 {
+            books.add_order(order(i, "BTC", Side::Bid, "1", &(50_000 - i).to_string()));
+        }
+
+        let mut cache = HashMap::new();
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &mut cache));
+        let btc = cache.get(&Coin::new("BTC")).expect("BTC cache");
+
+        for snapshot in btc.values() {
+            assert!(snapshot.as_ref()[0].len() <= crate::types::subscription::MAX_LEVELS);
+            assert!(snapshot.as_ref()[1].len() <= crate::types::subscription::MAX_LEVELS);
+        }
+        assert_eq!(
+            btc.get(&L2SnapshotParams::new(None, None)).expect("default l2").as_ref()[0].len(),
+            crate::types::subscription::MAX_LEVELS
+        );
     }
 }
