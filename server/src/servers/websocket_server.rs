@@ -36,10 +36,10 @@ use crate::{
     },
 };
 
-/// Per-(coin, params) cached L2 broadcast. `hash` is used for change-based dedup;
+/// Per-subscription cached L2 broadcast. `version` is used for change-based dedup;
 /// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
 struct L2Entry {
-    hash: u64,
+    version: u64,
     last_sent: Instant,
     payload: L2Book,
 }
@@ -693,13 +693,13 @@ async fn send_ws_data_from_l2_update(
         return true;
     };
 
-    if last_l2.get(&key).map(|entry| entry.hash) == Some(prepared.hash()) {
+    if last_l2.get(&key).map(|entry| entry.version) == Some(prepared.version()) {
         return true;
     }
 
     BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
     let payload = prepared.payload().clone();
-    last_l2.insert(key, L2Entry { hash: prepared.hash(), last_sent: Instant::now(), payload: payload.clone() });
+    last_l2.insert(key, L2Entry { version: prepared.version(), last_sent: Instant::now(), payload: payload.clone() });
     send_socket_message(socket, ServerResponse::L2Book(payload)).await
 }
 

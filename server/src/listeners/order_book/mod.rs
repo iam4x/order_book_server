@@ -175,6 +175,8 @@ pub(crate) struct OrderBookListener {
     // the broadcast Arc, so unchanged coins cost an atomic bump rather than a
     // full level-vector clone. Invalidated in `init_from_snapshot`.
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
+    l2_prepared_hashes: HashMap<L2SubscriptionKey, u64>,
+    next_l2_version: u64,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     last_universe: HashSet<Coin>,
 }
@@ -189,6 +191,8 @@ impl OrderBookListener {
             last_l2_broadcast: None,
             pending_l2_changed_coins: HashSet::new(),
             l2_snapshot_cache: HashMap::new(),
+            l2_prepared_hashes: HashMap::new(),
+            next_l2_version: 1,
             l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
             last_universe: HashSet::new(),
         }
@@ -225,6 +229,8 @@ impl OrderBookListener {
         // The incremental L2 cache references the previous book's coins/levels;
         // drop it so the next broadcast does a full rebuild against the new state.
         self.l2_snapshot_cache = HashMap::new();
+        self.l2_prepared_hashes.clear();
+        self.next_l2_version = 1;
         self.pending_l2_changed_coins.clear();
         // Clear any stale cache
         self.fetched_snapshot_cache = None;
@@ -273,9 +279,10 @@ impl OrderBookListener {
         let requested_params = self.l2_subscription_registry.active_params();
         let active_coins = self.l2_subscription_registry.active_coins();
         let active_keys = self.l2_subscription_registry.active_keys();
-        if requested_params.is_empty() || active_coins.is_empty() {
+        if requested_params.is_empty() || active_coins.is_empty() || active_keys.is_empty() {
             self.pending_l2_changed_coins.clear();
             self.l2_snapshot_cache.clear();
+            self.l2_prepared_hashes.clear();
             return;
         }
         if !self.pending_l2_changed_coins.iter().any(|coin| active_coins.contains(coin)) {
@@ -311,7 +318,12 @@ impl OrderBookListener {
                     }
 
                     if let Some(tx) = &self.internal_message_tx {
-                        let l2_books = l2_snapshots.into_prepared_books(&active_keys, time);
+                        let l2_books = l2_snapshots.into_prepared_books(
+                            &active_keys,
+                            time,
+                            &mut self.l2_prepared_hashes,
+                            &mut self.next_l2_version,
+                        );
                         if !l2_books.is_empty() {
                             let msg = Arc::new(InternalMessage::L2Update { l2_books });
                             drop(tx.send(msg));
@@ -563,12 +575,15 @@ impl L2Snapshots {
         self,
         active_keys: &HashSet<L2SubscriptionKey>,
         time: u64,
+        prepared_hashes: &mut HashMap<L2SubscriptionKey, u64>,
+        next_version: &mut u64,
     ) -> HashMap<L2SubscriptionKey, Arc<PreparedL2Book>> {
         use std::{
             collections::hash_map::DefaultHasher,
             hash::{Hash, Hasher},
         };
 
+        prepared_hashes.retain(|key, _| active_keys.contains(key));
         let mut prepared = HashMap::new();
         for key in active_keys {
             let Some(variants) = self.0.get(&key.coin) else { continue };
@@ -578,6 +593,13 @@ impl L2Snapshots {
             let mut hasher = DefaultHasher::new();
             levels.hash(&mut hasher);
             let hash = hasher.finish();
+            if prepared_hashes.get(key).copied() == Some(hash) {
+                continue;
+            }
+
+            let version = *next_version;
+            *next_version = (*next_version).wrapping_add(1).max(1);
+            prepared_hashes.insert(key.clone(), hash);
             let payload = L2Book::from_l2_snapshot(
                 key.coin.value(),
                 levels,
@@ -586,7 +608,7 @@ impl L2Snapshots {
                 key.params.mantissa,
                 Some(key.n_levels),
             );
-            prepared.insert(key.clone(), Arc::new(PreparedL2Book { hash, payload }));
+            prepared.insert(key.clone(), Arc::new(PreparedL2Book { version, payload }));
         }
         prepared
     }
@@ -644,13 +666,13 @@ impl L2SubscriptionKey {
 }
 
 pub(crate) struct PreparedL2Book {
-    hash: u64,
+    version: u64,
     payload: L2Book,
 }
 
 impl PreparedL2Book {
-    pub(crate) const fn hash(&self) -> u64 {
-        self.hash
+    pub(crate) const fn version(&self) -> u64 {
+        self.version
     }
 
     pub(crate) fn payload(&self) -> &L2Book {
@@ -1002,11 +1024,37 @@ mod tests {
                 assert_eq!(l2_books.len(), 2);
                 assert!(l2_books.contains_key(&default_l2_key("BTC")));
                 assert!(l2_books.contains_key(&one_level_key));
+                assert!(l2_books.get(&default_l2_key("BTC")).expect("default book").version() > 0);
                 assert_eq!(prepared_l2_bid_sz_at_level(l2_books, "BTC", 1), "2");
                 assert_eq!(l2_books.get(&one_level_key).expect("one-level book").payload().levels()[0].len(), 1);
             }
             _ => unreachable!("drain_latest_l2 only returns L2 updates"),
         }
+    }
+
+    #[test]
+    fn l2_update_skips_unchanged_prepared_subscription_shapes() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+
+        listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+
+        let msg = drain_latest_l2(&mut rx).expect("first dirty flush should publish the prepared book");
+        let first_version = match msg.as_ref() {
+            InternalMessage::L2Update { l2_books, .. } => {
+                l2_books.get(&default_l2_key("BTC")).expect("prepared l2 book").version()
+            }
+            _ => unreachable!("drain_latest_l2 only returns L2 updates"),
+        };
+        assert!(first_version > 0);
+
+        listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+
+        assert!(drain_latest_l2(&mut rx).is_none(), "unchanged prepared book should be filtered before broadcast");
     }
 
     #[test]
