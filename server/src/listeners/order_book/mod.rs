@@ -94,6 +94,10 @@ pub(crate) struct OrderBookListener {
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
+    // Coins whose L2 snapshot cache is stale. This intentionally survives the
+    // 50ms L2 throttle window; otherwise changes suppressed by the throttle are
+    // never recomputed and subscribers can see stale L2 while BBO is current.
+    pending_l2_changed_coins: HashSet<Coin>,
     // Incremental L2 snapshot cache. Each per-coin entry is Arc'd and shared with
     // the broadcast Arc, so unchanged coins cost an atomic bump rather than a
     // full level-vector clone. Invalidated in `init_from_snapshot`.
@@ -108,6 +112,7 @@ impl OrderBookListener {
             fetched_snapshot_cache: None,
             internal_message_tx,
             last_l2_broadcast: None,
+            pending_l2_changed_coins: HashSet::new(),
             l2_snapshot_cache: HashMap::new(),
         }
     }
@@ -138,6 +143,7 @@ impl OrderBookListener {
         // The incremental L2 cache references the previous book's coins/levels;
         // drop it so the next broadcast does a full rebuild against the new state.
         self.l2_snapshot_cache = HashMap::new();
+        self.pending_l2_changed_coins.clear();
         // Clear any stale cache
         self.fetched_snapshot_cache = None;
         info!("Order book ready at height {}", height);
@@ -344,6 +350,8 @@ impl OrderBookListener {
         // listening. Without the receiver-count gate we'd `get_bbos_for_coins` and
         // spawn a tokio task per change even with zero subscribers, wasting CPU.
         if !changed_coins.is_empty() {
+            self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
+
             if let Some(state) = &self.order_book_state {
                 if let Some(tx) = &self.internal_message_tx {
                     if tx.receiver_count() > 0 {
@@ -367,7 +375,8 @@ impl OrderBookListener {
         // Throttled L2 snapshot broadcast for L2Book subscribers.
         // l2_snapshots_uncached() walks every coin x every aggregation variant, so
         // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
-        // - there's nothing new to send and the per-client dedup would drop it anyway.
+        // since the previous L2 compute - there's nothing new to send and the
+        // per-client dedup would drop it anyway.
         // (Heartbeat resend for quiet coins is handled per-connection in handle_socket.)
         //
         // CRITICAL: the receiver_count gate must wrap l2_snapshots_uncached(), not
@@ -375,7 +384,7 @@ impl OrderBookListener {
         // only when receivers existed, so with zero subscribers the throttle reset
         // never fired and the par_iter ran on every event - tens of GB of allocator
         // churn per hour and a pinned listener mutex.
-        let should_broadcast_l2 = !changed_coins.is_empty()
+        let should_broadcast_l2 = !self.pending_l2_changed_coins.is_empty()
             && self.last_l2_broadcast.map(|t| t.elapsed() >= Duration::from_millis(50)).unwrap_or(true);
 
         if should_broadcast_l2 {
@@ -386,8 +395,9 @@ impl OrderBookListener {
             if has_receivers {
                 if let Some(state) = &self.order_book_state {
                     let l2_start = Instant::now();
+                    let changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
                     let (time, l2_snapshots) =
-                        state.l2_snapshots_incremental(&changed_coins, &mut self.l2_snapshot_cache);
+                        state.l2_snapshots_incremental(&changed_for_l2, &mut self.l2_snapshot_cache);
 
                     static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -589,5 +599,169 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Address;
+    use tokio::sync::broadcast::{Receiver, Sender, channel};
+
+    use super::*;
+    use crate::{
+        order_book::{OrderBook, Side, multi_book::Snapshots},
+        types::inner::InnerL4Order,
+    };
+
+    fn inner_order(oid: u64, coin: &str, side: Side, px: &str, sz: &str) -> InnerL4Order {
+        InnerL4Order {
+            user: Address::new([0; 20]),
+            coin: Coin::new(coin),
+            side,
+            limit_px: Px::parse_from_str(px).expect("valid px"),
+            sz: Sz::parse_from_str(sz).expect("valid sz"),
+            oid,
+            timestamp: 0,
+            trigger_condition: "N/A".to_string(),
+            is_trigger: false,
+            trigger_px: "0".to_string(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: "Limit".to_string(),
+            tif: Some("Gtc".to_string()),
+            cloid: None,
+        }
+    }
+
+    fn listener_with_btc_bid(tx: Sender<Arc<InternalMessage>>) -> OrderBookListener {
+        listener_with_btc_bids(tx, &[(1, "100", "1")])
+    }
+
+    fn listener_with_btc_bids(tx: Sender<Arc<InternalMessage>>, bids: &[(u64, &str, &str)]) -> OrderBookListener {
+        let mut book = OrderBook::new();
+        for (oid, px, sz) in bids {
+            book.add_order(inner_order(*oid, "BTC", Side::Bid, px, sz));
+        }
+
+        let snapshots = Snapshots::new(HashMap::from([(Coin::new("BTC"), book.to_snapshot())]));
+        let mut listener = OrderBookListener::new(Some(tx), false);
+        listener.init_from_snapshot(snapshots, 0);
+
+        // Seed the L2 cache with the original BTC size. The regression below verifies
+        // that a throttled BTC change invalidates this cached entry before the next L2 send.
+        let state = listener.order_book_state.as_ref().expect("state initialized");
+        let empty = HashSet::new();
+        let (_time, seeded) = state.l2_snapshots_incremental(&empty, &mut listener.l2_snapshot_cache);
+        assert_eq!(l2_best_bid_sz(&seeded, "BTC"), "1");
+        listener
+    }
+
+    fn update_diff_line(coin: &str, oid: u64, orig_sz: &str, new_sz: &str) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 1,
+            "events": [{
+                "user": "0x0000000000000000000000000000000000000000",
+                "oid": oid,
+                "px": "100",
+                "coin": coin,
+                "raw_book_diff": {
+                    "update": {
+                        "origSz": orig_sz,
+                        "newSz": new_sz
+                    }
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn empty_status_line() -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 2,
+            "events": []
+        })
+        .to_string()
+    }
+
+    fn drain_latest_l2(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
+        let mut latest = None;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg.as_ref(), InternalMessage::Snapshot { .. }) {
+                latest = Some(msg);
+            }
+        }
+        latest
+    }
+
+    fn l2_best_bid_sz(snapshots: &L2Snapshots, coin: &str) -> String {
+        l2_bid_sz_at_level(snapshots, coin, 0)
+    }
+
+    fn l2_bid_sz_at_level(snapshots: &L2Snapshots, coin: &str, level_index: usize) -> String {
+        let coin_snapshots = snapshots.as_ref().get(&Coin::new(coin)).expect("coin snapshot");
+        let snapshot = coin_snapshots.get(&L2SnapshotParams::new(None, None)).expect("default l2 snapshot").clone();
+        let levels = snapshot.truncate(level_index + 1).export_inner_snapshot();
+        levels[0].get(level_index).expect("bid level").sz().to_string()
+    }
+
+    #[test]
+    fn l2_dirty_coins_survive_throttle_window() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+
+        // Suppress the immediate L2 compute for this BTC change. BBO still broadcasts
+        // from live state, but L2 must remember that BTC's cached snapshot is stale.
+        listener.last_l2_broadcast = Some(Instant::now());
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        assert!(drain_latest_l2(&mut rx).is_none(), "the BTC update should be inside the L2 throttle window");
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+
+        // The next event after the throttle window has no changed coins of its own.
+        // Before the fix, this did not recompute BTC, leaving L2 stale until a later
+        // BTC event happened to land outside the global throttle window.
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(51));
+        listener.process_data_hft(empty_status_line(), EventSource::OrderStatuses).expect("empty status batch parses");
+
+        let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
+        match msg.as_ref() {
+            InternalMessage::Snapshot { l2_snapshots, .. } => {
+                assert_eq!(l2_best_bid_sz(l2_snapshots, "BTC"), "2");
+            }
+            _ => unreachable!("drain_latest_l2 only returns snapshots"),
+        }
+        assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn l2_dirty_coins_recompute_non_top_levels_after_throttle() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bids(tx, &[(1, "100", "1"), (2, "99", "1")]);
+
+        // Change only the second bid level while the top bid remains identical.
+        // This proves the pending dirty set invalidates the whole coin snapshot,
+        // not just the BBO-visible level that originally exposed the bug.
+        listener.last_l2_broadcast = Some(Instant::now());
+        listener.process_data_hft(update_diff_line("BTC", 2, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        assert!(drain_latest_l2(&mut rx).is_none(), "the second-level change should be inside the L2 throttle window");
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(51));
+        listener.process_data_hft(empty_status_line(), EventSource::OrderStatuses).expect("empty status batch parses");
+
+        let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
+        match msg.as_ref() {
+            InternalMessage::Snapshot { l2_snapshots, .. } => {
+                assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 0), "1");
+                assert_eq!(l2_bid_sz_at_level(l2_snapshots, "BTC", 1), "2");
+            }
+            _ => unreachable!("drain_latest_l2 only returns snapshots"),
+        }
+        assert!(listener.pending_l2_changed_coins.is_empty());
     }
 }
