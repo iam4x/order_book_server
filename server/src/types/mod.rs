@@ -72,6 +72,20 @@ pub(crate) struct Bbo {
     pub ask: Option<Level>,
 }
 
+/// Best Bid/Offer entry used by the batched allbbo stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AllBboEntry {
+    pub coin: String,
+    pub bid: Option<Level>,
+    pub ask: Option<Level>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AllBbo {
+    pub time: u64,
+    pub bbos: Vec<AllBboEntry>,
+}
+
 impl L2Book {
     pub(crate) const fn from_l2_snapshot(
         coin: String,

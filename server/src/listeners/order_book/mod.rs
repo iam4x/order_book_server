@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
     time::Duration,
 };
 
@@ -25,7 +28,7 @@ use crate::{
         ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
     },
     order_book::{
-        Coin, Px, Snapshot, Sz,
+        Coin, Px, RawBbo, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
@@ -43,6 +46,37 @@ mod utils;
 
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 const L2_FLUSH_TICK_MS: u64 = 10;
+const ALLBBO_BROADCAST_THROTTLE_MS: u64 = 50;
+
+#[derive(Default)]
+pub(crate) struct AllBboSubscriptionRegistry {
+    active: AtomicUsize,
+}
+
+impl AllBboSubscriptionRegistry {
+    pub(crate) fn register(&self) {
+        self.active.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub(crate) fn unregister(&self) {
+        let mut current = self.active.load(AtomicOrdering::Relaxed);
+        while current > 0 {
+            match self.active.compare_exchange_weak(
+                current,
+                current - 1,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub(crate) fn has_active(&self) -> bool {
+        self.active.load(AtomicOrdering::Relaxed) > 0
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct L2SubscriptionRegistry {
@@ -183,6 +217,9 @@ pub(crate) struct OrderBookListener {
     next_l2_version: u64,
     l2_generation: u64,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
+    last_allbbo_broadcast: Option<Instant>,
+    pending_allbbo_changed_coins: HashSet<Coin>,
+    allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     last_universe: HashSet<Coin>,
 }
 
@@ -205,6 +242,9 @@ impl OrderBookListener {
             next_l2_version: 1,
             l2_generation: 0,
             l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
+            last_allbbo_broadcast: None,
+            pending_allbbo_changed_coins: HashSet::new(),
+            allbbo_subscription_registry: Arc::new(AllBboSubscriptionRegistry::default()),
             last_universe: HashSet::new(),
         }
     }
@@ -219,6 +259,10 @@ impl OrderBookListener {
 
     pub(crate) fn l2_subscription_registry(&self) -> Arc<L2SubscriptionRegistry> {
         Arc::clone(&self.l2_subscription_registry)
+    }
+
+    pub(crate) fn allbbo_subscription_registry(&self) -> Arc<AllBboSubscriptionRegistry> {
+        Arc::clone(&self.allbbo_subscription_registry)
     }
 
     fn begin_caching(&mut self) {
@@ -244,6 +288,7 @@ impl OrderBookListener {
         self.next_l2_version = 1;
         self.l2_generation = self.l2_generation.wrapping_add(1);
         self.pending_l2_changed_coins.clear();
+        self.pending_allbbo_changed_coins.clear();
         // Clear any stale cache
         self.fetched_snapshot_cache = None;
         info!("Order book ready at height {}", height);
@@ -252,6 +297,10 @@ impl OrderBookListener {
     // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+    }
+
+    pub(crate) fn all_bbos(&self) -> Option<(u64, Vec<(Coin, RawBbo)>)> {
+        self.order_book_state.as_ref().map(OrderBookState::get_all_bbos)
     }
 
     fn broadcast_universe_if_changed(&mut self, changed_coins: &HashSet<Coin>) {
@@ -378,6 +427,49 @@ impl OrderBookListener {
         }
         L2_FLUSH_PHASE_LATENCY.with_label_values(&["publish"]).observe(publish_start.elapsed().as_secs_f64());
         L2_BROADCAST_LATENCY.observe(prepared.started_at.elapsed().as_secs_f64());
+    }
+
+    fn flush_allbbo_if_due(&mut self) {
+        if let Some(msg) = self.take_allbbo_update_if_due() {
+            if let Some(tx) = &self.internal_message_tx {
+                drop(tx.send(Arc::new(msg)));
+            }
+        }
+    }
+
+    fn take_allbbo_update_if_due(&mut self) -> Option<InternalMessage> {
+        if !self.features.allbbo() || self.pending_allbbo_changed_coins.is_empty() {
+            return None;
+        }
+
+        if !self.allbbo_subscription_registry.has_active() {
+            self.pending_allbbo_changed_coins.clear();
+            return None;
+        }
+
+        let should_broadcast = self
+            .last_allbbo_broadcast
+            .map(|t| t.elapsed() >= Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS))
+            .unwrap_or(true);
+        if !should_broadcast {
+            return None;
+        }
+
+        let tx = self.internal_message_tx.as_ref()?;
+        self.last_allbbo_broadcast = Some(Instant::now());
+        if tx.receiver_count() == 0 {
+            self.pending_allbbo_changed_coins.clear();
+            return None;
+        }
+
+        let state = self.order_book_state.as_ref()?;
+        let changed = std::mem::take(&mut self.pending_allbbo_changed_coins);
+        let (time, bbos) = state.get_bbos_for_changed_coins(&changed);
+        if bbos.is_empty() {
+            return None;
+        }
+
+        Some(InternalMessage::AllBboUpdate { bbos, time })
     }
 }
 
@@ -596,6 +688,12 @@ impl OrderBookListener {
             if self.features.l2book() {
                 self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
             }
+            if self.features.allbbo()
+                && self.allbbo_subscription_registry.has_active()
+                && self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0)
+            {
+                self.pending_allbbo_changed_coins.extend(changed_coins.iter().cloned());
+            }
             self.broadcast_universe_if_changed(&changed_coins);
 
             if self.features.bbo() {
@@ -730,6 +828,10 @@ pub(crate) enum InternalMessage {
     /// Fast BBO broadcast path - bypasses expensive L2 snapshot computation
     BboUpdate {
         bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
+        time: u64,
+    },
+    AllBboUpdate {
+        bbos: Vec<(Coin, RawBbo)>,
         time: u64,
     },
     /// HFT L4 streaming - order diffs without waiting for status pairing
@@ -868,9 +970,12 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         tokio::select! {
             biased;
 
-            // Flush throttled L2 changes on the scheduler, ahead of file events in
-            // this biased select, so a full file-event queue cannot starve L2.
+            // Flush throttled book-derived batches on the scheduler, ahead of file
+            // events in this biased select, so a full file-event queue cannot starve them.
             _ = l2_flush_ticker.tick() => {
+                if config.features.allbbo() {
+                    listener.lock().await.flush_allbbo_if_due();
+                }
                 if config.features.l2book() {
                     let job = listener.lock().await.take_l2_flush_job_if_due();
                     if let Some(job) = job {
@@ -1135,6 +1240,16 @@ mod tests {
         latest
     }
 
+    fn drain_latest_allbbo(rx: &mut Receiver<Arc<InternalMessage>>) -> Option<Arc<InternalMessage>> {
+        let mut latest = None;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. }) {
+                latest = Some(msg);
+            }
+        }
+        latest
+    }
+
     fn l2_best_bid_sz(snapshots: &L2Snapshots, coin: &str) -> String {
         l2_bid_sz_at_level(snapshots, coin, 0)
     }
@@ -1168,11 +1283,74 @@ mod tests {
 
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::Fills { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })));
         assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn allbbo_feature_only_batches_without_per_coin_bbo() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("allbbo"));
+        listener.allbbo_subscription_registry.register();
+        listener.last_allbbo_broadcast = Some(Instant::now() - Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS + 1));
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+        assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
+
+        listener.flush_allbbo_if_due();
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(listener.pending_allbbo_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn allbbo_flush_coalesces_changed_coins_after_throttle() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_coin_bids_for_features(
+            tx,
+            &[("BTC", &[(1, "100", "1")]), ("ETH", &[(2, "100", "1")])],
+            features("allbbo"),
+        );
+        listener.allbbo_subscription_registry.register();
+        listener.last_allbbo_broadcast = Some(Instant::now());
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("BTC applies");
+        listener.process_data_hft(update_diff_line("ETH", 2, "1", "3"), EventSource::OrderDiffs).expect("ETH applies");
+
+        listener.flush_allbbo_if_due();
+        assert!(drain_latest_allbbo(&mut rx).is_none(), "flush should respect the 50ms throttle");
+        assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
+        assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("ETH")));
+
+        listener.last_allbbo_broadcast = Some(Instant::now() - Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_allbbo_if_due();
+        let msg = drain_latest_allbbo(&mut rx).expect("pending allbbo changes should publish");
+        match msg.as_ref() {
+            InternalMessage::AllBboUpdate { bbos, .. } => {
+                assert_eq!(bbos.len(), 2);
+                assert!(bbos.iter().any(|(coin, _)| *coin == Coin::new("BTC")));
+                assert!(bbos.iter().any(|(coin, _)| *coin == Coin::new("ETH")));
+            }
+            _ => unreachable!("drain_latest_allbbo only returns allbbo updates"),
+        }
+        assert!(listener.pending_allbbo_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn allbbo_skips_pending_work_without_receivers() {
+        let (tx, rx) = channel::<Arc<InternalMessage>>(16);
+        drop(rx);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("allbbo"));
+        listener.allbbo_subscription_registry.register();
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+
+        assert!(listener.pending_allbbo_changed_coins.is_empty());
     }
 
     #[test]
@@ -1190,6 +1368,7 @@ mod tests {
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })));
     }

@@ -119,7 +119,7 @@ struct Args {
     #[arg(long, default_value = "all")]
     markets: Markets,
 
-    /// Which WebSocket features to serve: comma-separated bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all
+    /// Which WebSocket features to serve: comma-separated bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all
     #[arg(long, default_value = "all")]
     features: FeatureSet,
 
@@ -169,6 +169,11 @@ struct Args {
     /// when nothing has changed. Off by default (0 = disabled).
     #[arg(long, default_value = "0")]
     bbo_heartbeat_ms: u64,
+
+    /// Resend the last allbbo payload for each active subscription every N ms
+    /// when nothing has changed. Off by default (0 = disabled).
+    #[arg(long, default_value = "0")]
+    allbbo_heartbeat_ms: u64,
 
     /// Log level: error, warn, info, debug, trace
     #[arg(long, default_value = "info")]
@@ -230,6 +235,7 @@ async fn main() -> Result<()> {
         features: args.features,
         l2book_heartbeat_ms: args.l2book_heartbeat_ms,
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
+        allbbo_heartbeat_ms: args.allbbo_heartbeat_ms,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
@@ -374,10 +380,11 @@ mod tests {
 
     #[test]
     fn cli_parses_comma_delimited_features() {
-        let args = Args::try_parse_from(["orderbook_server", "--features", "bbo,l2book,trades"])
+        let args = Args::try_parse_from(["orderbook_server", "--features", "bbo,allbbo,l2book,trades"])
             .expect("comma-delimited features should parse");
 
         assert!(args.features.bbo());
+        assert!(args.features.allbbo());
         assert!(args.features.l2book());
         assert!(args.features.trades());
         assert!(!args.features.l4book());
@@ -387,7 +394,7 @@ mod tests {
 
     #[test]
     fn cli_parses_each_single_feature() {
-        for feature in ["bbo", "l2book", "l4book", "trades", "bookdiffs", "orderupdates"] {
+        for feature in ["bbo", "allbbo", "l2book", "l4book", "trades", "bookdiffs", "orderupdates"] {
             let args =
                 Args::try_parse_from(["orderbook_server", "--features", feature]).expect("single feature should parse");
 
@@ -400,6 +407,7 @@ mod tests {
         assert!(Args::try_parse_from(["orderbook_server", "--features", "foo"]).is_err());
         assert!(Args::try_parse_from(["orderbook_server", "--features", "bbo,,trades"]).is_err());
         assert!(Args::try_parse_from(["orderbook_server", "--features", "bbo,bbo"]).is_err());
+        assert!(Args::try_parse_from(["orderbook_server", "--features", "allbbo,allbbo"]).is_err());
         assert!(Args::try_parse_from(["orderbook_server", "--features", "all,bbo"]).is_err());
     }
 

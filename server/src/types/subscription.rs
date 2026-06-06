@@ -1,10 +1,16 @@
-use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
-use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
-use crate::types::{Bbo, L2Book, L4Book, Trade};
+use std::collections::HashSet;
+
 use alloy::primitives::Address;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
+use crate::{
+    metrics::WS_SUBSCRIPTIONS_ACTIVE,
+    types::{
+        AllBbo, Bbo, L2Book, L4Book, Trade,
+        node_data::{NodeDataOrderDiff, NodeDataOrderStatus},
+    },
+};
 
 pub(crate) const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
@@ -36,6 +42,8 @@ pub(crate) enum Subscription {
     L4Book { coin: String },
     #[serde(rename_all = "camelCase")]
     Bbo { coin: String },
+    #[serde(rename = "allbbo")]
+    AllBbo,
     #[serde(rename_all = "camelCase")]
     OrderUpdates { user: String },
     #[serde(rename_all = "camelCase")]
@@ -85,6 +93,10 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
+            Self::AllBbo => {
+                info!("Valid subscription");
+                true
+            }
             Self::OrderUpdates { user } => {
                 // Validate the user address format (must be valid hex address)
                 if user.len() != 42 || !user.starts_with("0x") {
@@ -106,6 +118,7 @@ impl Subscription {
     pub(crate) const fn type_label(&self) -> &str {
         match self {
             Self::Bbo { .. } => "bbo",
+            Self::AllBbo => "allbbo",
             Self::L2Book { .. } => "l2Book",
             Self::L4Book { .. } => "l4Book",
             Self::Trades { .. } => "trades",
@@ -140,6 +153,8 @@ pub(crate) enum ServerResponse {
     L4Book(L4Book),
     Trades(Vec<Trade>),
     Bbo(Bbo),
+    #[serde(rename = "allbbo")]
+    AllBbo(AllBbo),
     BookDiffs(Vec<NodeDataOrderDiff>),
     OrderUpdates(Vec<OrderUpdate>),
     Pong,
@@ -190,9 +205,8 @@ impl Drop for SubscriptionManager {
 
 #[cfg(test)]
 mod test {
-    use crate::types::subscription::Subscription;
-
     use super::{ClientMessage, ServerResponse};
+    use crate::types::subscription::Subscription;
 
     #[test]
     fn test_message_deserialization_subscription_response() {
@@ -286,6 +300,11 @@ mod test {
     }
 
     #[test]
+    fn test_validate_allbbo_valid_without_coin() {
+        assert!(Subscription::AllBbo.validate(&universe()));
+    }
+
+    #[test]
     fn test_validate_book_diffs_valid() {
         assert!(Subscription::BookDiffs { coin: "BTC".to_string() }.validate(&universe()));
     }
@@ -309,26 +328,30 @@ mod test {
     #[test]
     fn test_validate_l2book_n_levels_at_default_rejected() {
         // Setting n_levels to DEFAULT_LEVELS (20) explicitly is rejected
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(20), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(20), mantissa: None };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_n_levels_over_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(101), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(101), mantissa: None };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_n_levels_at_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None };
         assert!(sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_sig_figs_valid_range() {
         for sf in 2..=5 {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
+            let sub =
+                Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
             assert!(sub.validate(&universe()), "sig_figs={sf} should be valid");
         }
     }
@@ -336,7 +359,8 @@ mod test {
     #[test]
     fn test_validate_l2book_sig_figs_out_of_range() {
         for sf in [0, 1, 6, 10] {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
+            let sub =
+                Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
             assert!(!sub.validate(&universe()), "sig_figs={sf} should be invalid");
         }
     }
@@ -350,20 +374,27 @@ mod test {
     #[test]
     fn test_validate_l2book_mantissa_valid_with_sig_figs_5() {
         for m in [2, 5] {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(m) };
+            let sub = Subscription::L2Book {
+                coin: "BTC".to_string(),
+                n_sig_figs: Some(5),
+                n_levels: None,
+                mantissa: Some(m),
+            };
             assert!(sub.validate(&universe()), "mantissa={m} with sig_figs=5 should be valid");
         }
     }
 
     #[test]
     fn test_validate_l2book_mantissa_invalid_value() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(3) };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(3) };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_mantissa_invalid_with_low_sig_figs() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(3), n_levels: None, mantissa: Some(5) };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(3), n_levels: None, mantissa: Some(5) };
         assert!(!sub.validate(&universe()));
     }
 
@@ -396,7 +427,12 @@ mod test {
     #[test]
     fn test_type_labels() {
         assert_eq!(Subscription::Bbo { coin: "".to_string() }.type_label(), "bbo");
-        assert_eq!(Subscription::L2Book { coin: "".to_string(), n_sig_figs: None, n_levels: None, mantissa: None }.type_label(), "l2Book");
+        assert_eq!(Subscription::AllBbo.type_label(), "allbbo");
+        assert_eq!(
+            Subscription::L2Book { coin: "".to_string(), n_sig_figs: None, n_levels: None, mantissa: None }
+                .type_label(),
+            "l2Book"
+        );
         assert_eq!(Subscription::L4Book { coin: "".to_string() }.type_label(), "l4Book");
         assert_eq!(Subscription::Trades { coin: "".to_string() }.type_label(), "trades");
         assert_eq!(Subscription::OrderUpdates { user: "".to_string() }.type_label(), "orderUpdates");
@@ -485,6 +521,23 @@ mod test {
         assert!(json.contains("BTC"));
     }
 
+    #[test]
+    fn test_server_response_allbbo_serialization() {
+        let allbbo = crate::types::AllBbo {
+            time: 1000,
+            bbos: vec![crate::types::AllBboEntry {
+                coin: "BTC".to_string(),
+                bid: Some(crate::types::Level::new("100".to_string(), "1.5".to_string(), 2)),
+                ask: None,
+            }],
+        };
+        let json = serde_json::to_string(&ServerResponse::AllBbo(allbbo)).unwrap();
+        assert!(json.contains("\"channel\":\"allbbo\""));
+        assert!(json.contains("\"time\":1000"));
+        assert!(json.contains("\"bbos\""));
+        assert!(json.contains("BTC"));
+    }
+
     // ==================== ClientMessage Serde Tests ====================
 
     #[test]
@@ -492,10 +545,14 @@ mod test {
         let cases = [
             (r#"{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}"#, "trades"),
             (r#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#, "bbo"),
+            (r#"{"method":"subscribe","subscription":{"type":"allbbo"}}"#, "allbbo"),
             (r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#, "l4Book"),
             (r#"{"method":"subscribe","subscription":{"type":"bookDiffs","coin":"BTC"}}"#, "bookDiffs"),
             (r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#, "l2Book"),
-            (r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#, "orderUpdates"),
+            (
+                r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#,
+                "orderUpdates",
+            ),
         ];
         for (json, label) in cases {
             let msg: ClientMessage = serde_json::from_str(json).expect(&format!("failed to parse {label}"));

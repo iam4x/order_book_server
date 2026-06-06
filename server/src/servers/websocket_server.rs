@@ -21,17 +21,17 @@ use yawc::{FrameView, OpCode, WebSocket};
 use crate::{
     FeatureSet, ServerConfig,
     listeners::order_book::{
-        InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, OrderBookListener, PreparedL2Book, TimedSnapshots,
-        hl_listen_hft,
+        AllBboSubscriptionRegistry, InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, OrderBookListener,
+        PreparedL2Book, TimedSnapshots, hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
-    order_book::{Coin, Px, Sz},
+    order_book::{Coin, RawBbo},
     prelude::*,
     types::{
-        Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Trade,
+        AllBbo, AllBboEntry, Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Level, Trade,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -53,9 +53,24 @@ struct L2Entry {
 /// Per-coin cached BBO broadcast. `tuple` is used for change-based dedup;
 /// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
 struct BboEntry {
-    tuple: (String, String, String, String),
+    tuple: BboDedupTuple,
     last_sent: Instant,
     payload: Bbo,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct BboDedupTuple {
+    bid_px: String,
+    bid_sz: String,
+    ask_px: String,
+    ask_sz: String,
+}
+
+#[derive(Default)]
+struct AllBboCache {
+    tuples: HashMap<String, BboDedupTuple>,
+    last_sent: Option<Instant>,
+    payload: Option<AllBbo>,
 }
 
 struct ConnectionL2Registrations {
@@ -87,6 +102,39 @@ impl ConnectionL2Registrations {
     }
 }
 
+struct ConnectionAllBboRegistration {
+    registry: Arc<AllBboSubscriptionRegistry>,
+    registered: bool,
+}
+
+impl ConnectionAllBboRegistration {
+    fn new(registry: Arc<AllBboSubscriptionRegistry>) -> Self {
+        Self { registry, registered: false }
+    }
+
+    fn register(&mut self, subscription: &Subscription) {
+        if matches!(subscription, Subscription::AllBbo) && !self.registered {
+            self.registry.register();
+            self.registered = true;
+        }
+    }
+
+    fn unregister(&mut self, subscription: &Subscription) {
+        if matches!(subscription, Subscription::AllBbo) && self.registered {
+            self.registry.unregister();
+            self.registered = false;
+        }
+    }
+}
+
+impl Drop for ConnectionAllBboRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            self.registry.unregister();
+        }
+    }
+}
+
 impl Drop for ConnectionL2Registrations {
     fn drop(&mut self) {
         for key in self.subscriptions.drain() {
@@ -95,10 +143,15 @@ impl Drop for ConnectionL2Registrations {
     }
 }
 
-/// Build a tokio interval that fires often enough to drive both heartbeats with
-/// at most half the configured period of drift. Returns None when both heartbeats are disabled.
-fn build_heartbeat_ticker(l2book_heartbeat_ms: u64, bbo_heartbeat_ms: u64) -> Option<tokio::time::Interval> {
-    let enabled = [l2book_heartbeat_ms, bbo_heartbeat_ms].into_iter().filter(|&ms| ms > 0).min()?;
+/// Build a tokio interval that fires often enough to drive configured heartbeats with
+/// at most half the configured period of drift. Returns None when all heartbeats are disabled.
+fn build_heartbeat_ticker(
+    l2book_heartbeat_ms: u64,
+    bbo_heartbeat_ms: u64,
+    allbbo_heartbeat_ms: u64,
+) -> Option<tokio::time::Interval> {
+    let enabled =
+        [l2book_heartbeat_ms, bbo_heartbeat_ms, allbbo_heartbeat_ms].into_iter().filter(|&ms| ms > 0).min()?;
     let tick_ms = (enabled / 2).max(50).min(500);
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -163,6 +216,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let start_time = Instant::now();
     let listener_for_health = listener.clone();
     let l2_subscription_registry = listener.lock().await.l2_subscription_registry();
+    let allbbo_subscription_registry = listener.lock().await.allbbo_subscription_registry();
 
     let app: Router = Router::new()
         .route(
@@ -171,9 +225,11 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let internal_message_tx = internal_message_tx.clone();
                 let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
+                let allbbo_heartbeat_ms = config.allbbo_heartbeat_ms;
                 let features = config.features;
                 let listener = listener.clone();
                 let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
+                let allbbo_subscription_registry = Arc::clone(&allbbo_subscription_registry);
                 let websocket_secret = websocket_secret.clone();
                 move |Query(query): Query<WsAuthQuery>, ws_upgrade| {
                     let websocket_secret = websocket_secret.clone();
@@ -188,10 +244,12 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                             internal_message_tx.clone(),
                             listener.clone(),
                             Arc::clone(&l2_subscription_registry),
+                            Arc::clone(&allbbo_subscription_registry),
                             market_filter,
                             features,
                             l2book_heartbeat_ms,
                             bbo_heartbeat_ms,
+                            allbbo_heartbeat_ms,
                             websocket_opts,
                         )
                     }
@@ -237,10 +295,12 @@ fn ws_handler(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
+    allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
     features: FeatureSet,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
+    allbbo_heartbeat_ms: u64,
     websocket_opts: yawc::Options,
 ) -> axum::response::Response {
     // Reject malformed WS handshakes cleanly. The previous `.unwrap()` would panic
@@ -266,10 +326,12 @@ fn ws_handler(
             internal_message_tx,
             listener,
             l2_subscription_registry,
+            allbbo_subscription_registry,
             market_filter,
             features,
             l2book_heartbeat_ms,
             bbo_heartbeat_ms,
+            allbbo_heartbeat_ms,
         )
         .await
     });
@@ -313,10 +375,12 @@ async fn handle_socket(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
+    allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
     features: FeatureSet,
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
+    allbbo_heartbeat_ms: u64,
 ) {
     // Track connection metrics
     WS_CONNECTIONS_ACTIVE.inc();
@@ -342,7 +406,9 @@ async fn handle_socket(
     let mut last_l2: HashMap<L2SubscriptionKey, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
     let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
+    let mut last_allbbo = AllBboCache::default();
     let mut l2_registrations = ConnectionL2Registrations::new(l2_subscription_registry);
+    let mut allbbo_registration = ConnectionAllBboRegistration::new(allbbo_subscription_registry);
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         let _ = send_socket_message(&mut socket, msg).await;
@@ -353,7 +419,12 @@ async fn handle_socket(
     // so each subscription's last-sent timestamp can drift at most half a heartbeat from the configured value.
     let effective_l2book_heartbeat_ms = if features.l2book() { l2book_heartbeat_ms } else { 0 };
     let effective_bbo_heartbeat_ms = if features.bbo() { bbo_heartbeat_ms } else { 0 };
-    let mut heartbeat_ticker = build_heartbeat_ticker(effective_l2book_heartbeat_ms, effective_bbo_heartbeat_ms);
+    let effective_allbbo_heartbeat_ms = if features.allbbo() { allbbo_heartbeat_ms } else { 0 };
+    let mut heartbeat_ticker = build_heartbeat_ticker(
+        effective_l2book_heartbeat_ms,
+        effective_bbo_heartbeat_ms,
+        effective_allbbo_heartbeat_ms,
+    );
     let l2_hb = if effective_l2book_heartbeat_ms > 0 {
         Some(Duration::from_millis(effective_l2book_heartbeat_ms))
     } else {
@@ -361,6 +432,11 @@ async fn handle_socket(
     };
     let bbo_hb =
         if effective_bbo_heartbeat_ms > 0 { Some(Duration::from_millis(effective_bbo_heartbeat_ms)) } else { None };
+    let allbbo_hb = if effective_allbbo_heartbeat_ms > 0 {
+        Some(Duration::from_millis(effective_allbbo_heartbeat_ms))
+    } else {
+        None
+    };
 
     // `alive` flips to false the moment any `send_socket_message` returns false
     // (network error or send timeout). The outer loop checks it at every iteration
@@ -398,6 +474,18 @@ async fn handle_socket(
                                         alive &= send_ws_data_from_bbo(&mut socket, coin, bbos, *time, &mut last_bbo).await;
                                     }
                                 }
+                            },
+                            InternalMessage::AllBboUpdate{ bbos, time } => {
+                                if !features.allbbo() || !manager.subscriptions().contains(&Subscription::AllBbo) {
+                                    continue;
+                                }
+                                alive &= send_ws_data_from_allbbo(
+                                    &mut socket,
+                                    bbos,
+                                    *time,
+                                    market_filter,
+                                    &mut last_allbbo,
+                                ).await;
                             },
                             InternalMessage::Fills{ batch } => {
                                 if !features.trades() {
@@ -499,6 +587,21 @@ async fn handle_socket(
                                 }
                             }
                         }
+                        Subscription::AllBbo => {
+                            let Some(hb) = allbbo_hb else { continue };
+                            let Some(last_sent) = last_allbbo.last_sent else { continue };
+                            if now.duration_since(last_sent) >= hb {
+                                if let Some(payload) = last_allbbo.payload.as_mut() {
+                                    payload.time = now_ms;
+                                    last_allbbo.last_sent = Some(now);
+                                    BROADCASTS_TOTAL.with_label_values(&["allbbo_heartbeat"]).inc();
+                                    alive &= send_socket_message(
+                                        &mut socket,
+                                        ServerResponse::AllBbo(payload.clone()),
+                                    ).await;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -535,7 +638,9 @@ async fn handle_socket(
                                             market_filter,
                                             &mut last_l2,
                                             &mut last_bbo,
+                                            &mut last_allbbo,
                                             &mut l2_registrations,
+                                            &mut allbbo_registration,
                                         ).await;
                                     }
                                 }
@@ -572,7 +677,9 @@ async fn receive_client_message(
     market_filter: (bool, bool, bool),
     last_l2: &mut HashMap<L2SubscriptionKey, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
+    last_allbbo: &mut AllBboCache,
     l2_registrations: &mut ConnectionL2Registrations,
+    allbbo_registration: &mut ConnectionAllBboRegistration,
 ) -> bool {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -614,6 +721,10 @@ async fn receive_client_message(
                     Subscription::Bbo { coin } => {
                         last_bbo.remove(coin);
                     }
+                    Subscription::AllBbo => {
+                        *last_allbbo = AllBboCache::default();
+                        allbbo_registration.unregister(&subscription);
+                    }
                     _ => {}
                 }
             }
@@ -622,12 +733,18 @@ async fn receive_client_message(
         ClientMessage::Ping => unreachable!(),
     };
     if success {
+        if let ClientMessage::Subscribe { subscription } = &client_message {
+            l2_registrations.register(subscription);
+            allbbo_registration.register(subscription);
+        }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener).await;
+            let msg = subscription.handle_immediate_snapshot(listener, market_filter).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
+                    l2_registrations.unregister(subscription);
+                    allbbo_registration.unregister(subscription);
                     return send_socket_message(
                         socket,
                         ServerResponse::Error(format!("Unable to grab order book snapshot: {err}")),
@@ -638,18 +755,13 @@ async fn receive_client_message(
         } else {
             None
         };
-        let subscribed = if let ClientMessage::Subscribe { subscription } = &client_message {
-            Some(subscription.clone())
-        } else {
-            None
-        };
         if !send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await {
             return false;
         }
-        if let Some(subscription) = &subscribed {
-            l2_registrations.register(subscription);
-        }
         if let Some(snapshot_msg) = snapshot_msg {
+            if let ServerResponse::AllBbo(payload) = &snapshot_msg {
+                prime_allbbo_cache(last_allbbo, payload);
+            }
             return send_socket_message(socket, snapshot_msg).await;
         }
         true
@@ -663,24 +775,14 @@ async fn receive_client_message(
 async fn send_ws_data_from_bbo(
     socket: &mut WebSocket,
     coin: &str,
-    bbos: &HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
+    bbos: &HashMap<Coin, RawBbo>,
     time: u64,
     last_bbo: &mut HashMap<String, BboEntry>,
 ) -> bool {
     let coin_key = Coin::new(coin);
-    if let Some((best_bid, best_ask)) = bbos.get(&coin_key) {
-        // Use the canonical wire format (Px/Sz::to_str) instead of `format!("{:?}", ...)`.
-        // Debug for Px/Sz happens to produce the same output today, but going through
-        // to_str matches what the L2 path already emits and skips the Formatter machinery.
-        let bid = best_bid.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
-        let ask = best_ask.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
-
-        // Deduplication check
-        let bid_px = bid.as_ref().map(|b| b.px().to_string()).unwrap_or_default();
-        let bid_sz = bid.as_ref().map(|b| b.sz().to_string()).unwrap_or_default();
-        let ask_px = ask.as_ref().map(|a| a.px().to_string()).unwrap_or_default();
-        let ask_sz = ask.as_ref().map(|a| a.sz().to_string()).unwrap_or_default();
-        let current = (bid_px, bid_sz, ask_px, ask_sz);
+    if let Some(raw_bbo) = bbos.get(&coin_key).copied() {
+        let (bid, ask) = levels_from_raw_bbo(raw_bbo);
+        let current = dedup_tuple_from_levels(bid.as_ref(), ask.as_ref());
 
         if last_bbo.get(coin).map(|e| &e.tuple) != Some(&current) {
             BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
@@ -692,6 +794,69 @@ async fn send_ws_data_from_bbo(
         }
     }
     true
+}
+
+async fn send_ws_data_from_allbbo(
+    socket: &mut WebSocket,
+    bbos: &[(Coin, RawBbo)],
+    time: u64,
+    market_filter: (bool, bool, bool),
+    last_allbbo: &mut AllBboCache,
+) -> bool {
+    let mut changed = Vec::with_capacity(bbos.len());
+    for (coin, raw_bbo) in bbos {
+        if !market_filter_allows_coin_ref(coin, market_filter) {
+            continue;
+        }
+        let entry = allbbo_entry_from_raw(coin, *raw_bbo);
+        let current = dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref());
+        if last_allbbo.tuples.get(&entry.coin) == Some(&current) {
+            continue;
+        }
+        last_allbbo.tuples.insert(entry.coin.clone(), current);
+        changed.push(entry);
+    }
+
+    if changed.is_empty() {
+        return true;
+    }
+
+    BROADCASTS_TOTAL.with_label_values(&["allbbo"]).inc();
+    let payload = AllBbo { time, bbos: changed };
+    last_allbbo.last_sent = Some(Instant::now());
+    last_allbbo.payload = Some(payload.clone());
+    send_socket_message(socket, ServerResponse::AllBbo(payload)).await
+}
+
+fn level_from_raw(raw: Option<(crate::order_book::Px, crate::order_book::Sz, u32)>) -> Option<Level> {
+    raw.map(|(px, sz, n)| Level::new(px.to_str(), sz.to_str(), n as usize))
+}
+
+fn levels_from_raw_bbo(raw_bbo: RawBbo) -> (Option<Level>, Option<Level>) {
+    (level_from_raw(raw_bbo.0), level_from_raw(raw_bbo.1))
+}
+
+fn allbbo_entry_from_raw(coin: &Coin, raw_bbo: RawBbo) -> AllBboEntry {
+    let (bid, ask) = levels_from_raw_bbo(raw_bbo);
+    AllBboEntry { coin: coin.value(), bid, ask }
+}
+
+fn dedup_tuple_from_levels(bid: Option<&Level>, ask: Option<&Level>) -> BboDedupTuple {
+    BboDedupTuple {
+        bid_px: bid.map(Level::px).unwrap_or_default().to_string(),
+        bid_sz: bid.map(Level::sz).unwrap_or_default().to_string(),
+        ask_px: ask.map(Level::px).unwrap_or_default().to_string(),
+        ask_sz: ask.map(Level::sz).unwrap_or_default().to_string(),
+    }
+}
+
+fn prime_allbbo_cache(cache: &mut AllBboCache, payload: &AllBbo) {
+    cache.tuples.clear();
+    for entry in &payload.bbos {
+        cache.tuples.insert(entry.coin.clone(), dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref()));
+    }
+    cache.last_sent = Some(Instant::now());
+    cache.payload = Some(payload.clone());
 }
 
 /// Per-send timeout. A slow or hostile client whose TCP receive window stays full
@@ -752,6 +917,7 @@ fn filter_universe(
 fn subscription_feature_enabled(subscription: &Subscription, features: FeatureSet) -> bool {
     match subscription {
         Subscription::Bbo { .. } => features.bbo(),
+        Subscription::AllBbo => features.allbbo(),
         Subscription::L2Book { .. } => features.l2book(),
         Subscription::L4Book { .. } => features.l4book(),
         Subscription::Trades { .. } => features.trades(),
@@ -765,6 +931,10 @@ fn market_filter_allows_coin(coin: &str, market_filter: (bool, bool, bool)) -> b
         return false;
     }
     let coin = Coin::new(coin);
+    market_filter_allows_coin_ref(&coin, market_filter)
+}
+
+fn market_filter_allows_coin_ref(coin: &Coin, market_filter: (bool, bool, bool)) -> bool {
     (coin.is_perp() && market_filter.0) || (coin.is_spot() && market_filter.1) || (coin.is_hip3() && market_filter.2)
 }
 
@@ -779,6 +949,7 @@ fn validate_subscription_for_features(
     }
 
     match subscription {
+        Subscription::AllBbo => true,
         Subscription::Trades { coin } | Subscription::BookDiffs { coin } => {
             market_filter_allows_coin(coin, market_filter)
         }
@@ -859,6 +1030,7 @@ mod tests {
 
         assert!(subscription_feature_enabled(&Subscription::Bbo { coin: "BTC".to_string() }, features));
         assert!(subscription_feature_enabled(&Subscription::Trades { coin: "BTC".to_string() }, features));
+        assert!(!subscription_feature_enabled(&Subscription::AllBbo, features));
         assert!(!subscription_feature_enabled(
             &Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: None, mantissa: None },
             features
@@ -908,6 +1080,53 @@ mod tests {
             features,
             (true, true, true),
         ));
+    }
+
+    #[test]
+    fn allbbo_validation_follows_feature_gate_without_coin() {
+        let allbbo: FeatureSet = "allbbo".parse().expect("valid features");
+        let trades: FeatureSet = "trades".parse().expect("valid features");
+        let universe = HashSet::from(["BTC".to_string()]);
+
+        assert!(subscription_feature_enabled(&Subscription::AllBbo, allbbo));
+        assert!(validate_subscription_for_features(&Subscription::AllBbo, &universe, allbbo, (true, true, true)));
+        assert!(!subscription_feature_enabled(&Subscription::AllBbo, trades));
+    }
+
+    #[test]
+    fn allbbo_cache_suppresses_unchanged_entries() {
+        let mut cache = AllBboCache::default();
+        let first = AllBbo {
+            time: 1,
+            bbos: vec![AllBboEntry {
+                coin: "BTC".to_string(),
+                bid: Some(Level::new("100".to_string(), "1".to_string(), 1)),
+                ask: None,
+            }],
+        };
+        prime_allbbo_cache(&mut cache, &first);
+
+        let raw = vec![(
+            Coin::new("BTC"),
+            (
+                Some((
+                    crate::order_book::Px::parse_from_str("100").expect("valid px"),
+                    crate::order_book::Sz::parse_from_str("1").expect("valid sz"),
+                    1,
+                )),
+                None,
+            ),
+        )];
+        let mut changed = Vec::new();
+        for (coin, raw_bbo) in &raw {
+            let entry = allbbo_entry_from_raw(coin, *raw_bbo);
+            let current = dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref());
+            if cache.tuples.get(&entry.coin) != Some(&current) {
+                changed.push(entry);
+            }
+        }
+
+        assert!(changed.is_empty());
     }
 }
 
@@ -1008,6 +1227,7 @@ impl Subscription {
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
+        market_filter: (bool, bool, bool),
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();
@@ -1025,6 +1245,17 @@ impl Subscription {
                         levels,
                     })));
                 }
+            }
+            return Err("Snapshot Failed".into());
+        }
+        if matches!(self, Self::AllBbo) {
+            if let Some((time, bbos)) = listener.lock().await.all_bbos() {
+                let bbos = bbos
+                    .into_iter()
+                    .filter(|(coin, _)| market_filter_allows_coin_ref(coin, market_filter))
+                    .map(|(coin, raw_bbo)| allbbo_entry_from_raw(&coin, raw_bbo))
+                    .collect();
+                return Ok(Some(ServerResponse::AllBbo(AllBbo { time, bbos })));
             }
             return Err("Snapshot Failed".into());
         }

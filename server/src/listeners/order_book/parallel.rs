@@ -470,6 +470,10 @@ mod tests {
     #[test]
     fn enabled_sources_for_bbo_need_book_state_inputs() {
         assert_eq!(enabled_event_sources(features("bbo")), vec![EventSource::OrderStatuses, EventSource::OrderDiffs]);
+        assert_eq!(
+            enabled_event_sources(features("allbbo")),
+            vec![EventSource::OrderStatuses, EventSource::OrderDiffs]
+        );
     }
 
     #[test]

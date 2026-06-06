@@ -11,6 +11,7 @@ This project has been further developed and maintained by [Imperator](https://hy
 Real-time orderbook data from a local Hyperliquid node:
 
 - **bbo** - Best Bid/Offer (top of book) with deduplication
+- **allbbo** - Batched Best Bid/Offer feed for all enabled markets
 - **l2Book** - Aggregated Level 2 orderbook with deduplication
 - **trades** - Real-time trade feed
 - **bookDiffs** - Raw book diff stream per coin
@@ -32,7 +33,7 @@ The server runs co-located with a Hyperliquid node and is memory-light relative 
 |---------|-----|---------------------|-------|
 | **Full (`--features all --markets all`)** | 2 cores minimum, 4+ recommended | ~750 MB – 2 GB | Rises with connected clients and L2 subscription fanout. Reserve **4 GB** for headroom in production. |
 | **Perps only (`--markets perps`)** | 2 cores | ~400 MB – 1 GB | Smaller public universe and fewer L2 variants to compute. |
-| **BBO only (`--features bbo`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
+| **BBO only (`--features bbo` or `--features allbbo`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
 | **Raw streams only (`--features trades,bookdiffs,orderupdates`)** | 1 core | lowest | Skips startup snapshot and in-memory orderbook state. |
 
 Other requirements:
@@ -82,7 +83,7 @@ cargo build --release
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
 | `--secret` | unset | Require WebSocket clients to connect with `?token=<secret>` |
 | `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
-| `--features` | `all` | Comma-delimited `bbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, or `all` |
+| `--features` | `all` | Comma-delimited `bbo`, `allbbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -100,7 +101,7 @@ Your WebSocket client must support `permessage-deflate` for levels 1-9 to have a
 
 ### Snapshot Mode
 
-When `bbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` skip this snapshot and start serving as soon as their file watchers are running.
+When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` skip this snapshot and start serving as soon as their file watchers are running.
 
 The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
@@ -117,6 +118,7 @@ The `--features` flag controls both the WebSocket channels the server accepts an
 | Feature | WebSocket type | Requires snapshot/orderbook state | Watched node stream |
 |---------|----------------|------------------------------------|---------------------|
 | `bbo` | `bbo` | Yes | order diffs + order statuses |
+| `allbbo` | `allbbo` | Yes | order diffs + order statuses |
 | `l2book` | `l2Book` | Yes | order diffs + order statuses |
 | `l4book` | `l4Book` | Yes | order diffs + order statuses |
 | `trades` | `trades` | No | fills |
@@ -127,8 +129,9 @@ Examples:
 
 ```bash
 --features bbo
+--features allbbo
 --features l2book
---features bbo,l2book,trades
+--features bbo,allbbo,l2book,trades
 --features trades,orderupdates
 ```
 
@@ -164,12 +167,13 @@ The `--markets` flag accepts comma-delimited market names. The `all` value remai
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
+| `--allbbo-heartbeat-ms` | `0` | If > 0, resend the last `allbbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 
 ### Heartbeats
 
-By default, `l2Book` and `bbo` channels are **change-only**: a snapshot is only sent when the underlying book state actually moves. On quiet markets (low-liquidity coins like `Frudo`) this can produce zero messages for minutes at a time, which breaks downstream clients written against the official Hyperliquid API — that API pushes a snapshot every block as an implicit heartbeat, so consumers often treat silence as a dead stream and reconnect.
+By default, `l2Book`, `bbo`, and `allbbo` channels are **change-only**: a snapshot is only sent when the underlying book state actually moves. On quiet markets (low-liquidity coins like `Frudo`) this can produce zero messages for minutes at a time, which breaks downstream clients written against the official Hyperliquid API — that API pushes a snapshot every block as an implicit heartbeat, so consumers often treat silence as a dead stream and reconnect.
 
-The `--l2book-heartbeat-ms` and `--bbo-heartbeat-ms` flags add an opt-in periodic resend:
+The `--l2book-heartbeat-ms`, `--bbo-heartbeat-ms`, and `--allbbo-heartbeat-ms` flags add an opt-in periodic resend:
 
 - When set to `0` (default), the original change-only behavior is preserved. No new messages compared to previous versions.
 - When set to e.g. `1000`, every active subscription receives a cached payload at most every 1000 ms even if nothing changed. The `time` field is refreshed to the current server time on every heartbeat so clients can distinguish "fresh-but-unchanged" from "stale".
@@ -183,6 +187,7 @@ Pick a value that matches your downstream stall timer, typically `1000` ms for c
 ./target/release/orderbook_server \
     --l2book-heartbeat-ms 1000 \
     --bbo-heartbeat-ms 1000 \
+    --allbbo-heartbeat-ms 1000 \
     --data-dir /path/to/data
 ```
 
@@ -240,6 +245,15 @@ Without `--secret`, existing `/ws` connections remain accepted.
 Response:
 ```json
 { "channel": "bbo", "data": { "coin": "BTC", "time": 1702530000000, "bid": { "px": "100000.0", "sz": "0.5", "n": 1 }, "ask": { "px": "100001.0", "sz": "0.3", "n": 1 } } }
+```
+
+### Subscribe to All BBO
+```json
+{ "method": "subscribe", "subscription": { "type": "allbbo" } }
+```
+Initial response includes every current BBO matching `--markets`; later updates are throttled to 50 ms and include only changed coins.
+```json
+{ "channel": "allbbo", "data": { "time": 1702530000000, "bbos": [{ "coin": "BTC", "bid": { "px": "100000.0", "sz": "0.5", "n": 1 }, "ask": null }] } }
 ```
 
 ### Subscribe to Trades
@@ -382,10 +396,10 @@ curl http://localhost:9090/metrics
 |----------|--------|-------------|
 | **Connections** | `ws_connections_active` | Current WebSocket connections |
 | | `ws_connections_total` | Total connections since startup |
-| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/l2Book/l4Book/trades/bookDiffs/orderUpdates) |
+| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/allbbo/l2Book/l4Book/trades/bookDiffs/orderUpdates) |
 | | `broadcast_receivers` | Number of broadcast channel receivers |
 | **Throughput** | `events_processed_total{type}` | Events by type (orders/diffs/fills) |
-| | `broadcasts_total{channel}` | Broadcasts by channel (bbo/l2/l4/trades) |
+| | `broadcasts_total{channel}` | Broadcasts by channel (bbo/allbbo/l2/l4/trades) |
 | | `messages_sent_total` | Total WebSocket messages sent |
 | | `bbo_changes_total{coin}` | BBO changes per coin |
 | **Health** | `orderbook_height` | Current block height |
@@ -549,12 +563,13 @@ The original sends every update to every subscriber regardless of whether anythi
 
 This fork deduplicates at the WebSocket level:
 - **BBO**: only sends when bid/ask px/sz actually changes (~1us overhead)
+- **allbbo**: sends a full initial BBO snapshot, then 50 ms batches containing only changed coins
 - **L2Book**: only sends when the snapshot hash changes (~10us overhead)
 - Saves ~500us per unchanged update and significantly reduces client-side bandwidth
 
 ### Granular Feature Selection
 
-The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, and raw-only configurations such as `--features trades,orderupdates` skip the startup snapshot and in-memory orderbook maintenance entirely.
+The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, `--features allbbo` serves a single batched top-of-book stream, and raw-only configurations such as `--features trades,orderupdates` skip the startup snapshot and in-memory orderbook maintenance entirely.
 
 ### Snapshot Modes: Docker & Direct
 

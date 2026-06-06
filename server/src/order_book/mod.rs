@@ -1,7 +1,9 @@
-use crate::prelude::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use itertools::Itertools;
 use linked_list::LinkedList;
-use std::collections::{BTreeMap, HashMap, HashSet};
+
+use crate::prelude::*;
 
 pub(crate) mod levels;
 mod linked_list;
@@ -9,6 +11,8 @@ pub(crate) mod multi_book;
 pub(crate) mod types;
 
 pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
+
+pub(crate) type RawBbo = (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>);
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -200,7 +204,7 @@ impl<O: InnerOrder> OrderBook<O> {
     /// Get best bid and best ask in O(1) without computing full L2 snapshot.
     /// Returns (best_bid, best_ask) where each is (price, total_size, order_count).
     #[must_use]
-    pub(crate) fn get_bbo(&self) -> (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>) {
+    pub(crate) fn get_bbo(&self) -> RawBbo {
         // Best bid = highest price in bids (last key in BTreeMap)
         let best_bid = self.bid_totals.last_key_value().map(|(px, total)| total.as_bbo(*px));
 
@@ -333,10 +337,10 @@ fn match_order<O: InnerOrder>(
 
 #[cfg(test)]
 mod tests {
-    use crate::order_book::types::{Coin, Sz};
+    use std::collections::BTreeSet;
 
     use super::*;
-    use std::collections::BTreeSet;
+    use crate::order_book::types::{Coin, Sz};
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct MinimalOrder {
@@ -836,9 +840,6 @@ mod tests {
         let elapsed = start.elapsed();
         let per_call = elapsed / iterations;
 
-        eprintln!(
-            "[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)",
-            elapsed, per_call
-        );
+        eprintln!("[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)", elapsed, per_call);
     }
 }

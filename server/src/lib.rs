@@ -26,6 +26,7 @@ pub enum SnapshotMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureSet {
     bbo: bool,
+    allbbo: bool,
     l2book: bool,
     l4book: bool,
     trades: bool,
@@ -35,15 +36,27 @@ pub struct FeatureSet {
 
 impl FeatureSet {
     pub const fn all() -> Self {
-        Self { bbo: true, l2book: true, l4book: true, trades: true, bookdiffs: true, orderupdates: true }
+        Self { bbo: true, allbbo: true, l2book: true, l4book: true, trades: true, bookdiffs: true, orderupdates: true }
     }
 
     const fn empty() -> Self {
-        Self { bbo: false, l2book: false, l4book: false, trades: false, bookdiffs: false, orderupdates: false }
+        Self {
+            bbo: false,
+            allbbo: false,
+            l2book: false,
+            l4book: false,
+            trades: false,
+            bookdiffs: false,
+            orderupdates: false,
+        }
     }
 
     pub const fn bbo(self) -> bool {
         self.bbo
+    }
+
+    pub const fn allbbo(self) -> bool {
+        self.allbbo
     }
 
     pub const fn l2book(self) -> bool {
@@ -67,7 +80,7 @@ impl FeatureSet {
     }
 
     pub const fn requires_book_state(self) -> bool {
-        self.bbo || self.l2book || self.l4book
+        self.bbo || self.allbbo || self.l2book || self.l4book
     }
 
     pub const fn watch_order_statuses(self) -> bool {
@@ -96,7 +109,7 @@ impl FromStr for FeatureSet {
         let value = value.trim();
         if value.is_empty() {
             return Err(
-                "empty feature list; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                "empty feature list; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
                     .to_string(),
             );
         }
@@ -110,7 +123,7 @@ impl FromStr for FeatureSet {
             let feature = feature.trim();
             if feature.is_empty() {
                 return Err(
-                    "empty feature entry; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                    "empty feature entry; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
                         .to_string(),
                 );
             }
@@ -124,6 +137,8 @@ impl FromStr for FeatureSet {
                 }
                 "bbo" if !features.bbo => features.bbo = true,
                 "bbo" => return Err("duplicate feature `bbo`".to_string()),
+                "allbbo" if !features.allbbo => features.allbbo = true,
+                "allbbo" => return Err("duplicate feature `allbbo`".to_string()),
                 "l2book" if !features.l2book => features.l2book = true,
                 "l2book" => return Err("duplicate feature `l2book`".to_string()),
                 "l4book" if !features.l4book => features.l4book = true,
@@ -136,7 +151,7 @@ impl FromStr for FeatureSet {
                 "orderupdates" => return Err("duplicate feature `orderupdates`".to_string()),
                 unknown => {
                     return Err(format!(
-                        "unknown feature `{unknown}`; expected comma-separated values: bbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                        "unknown feature `{unknown}`; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
                     ));
                 }
             }
@@ -151,6 +166,7 @@ impl fmt::Display for FeatureSet {
         let mut first = true;
         for (enabled, name) in [
             (self.bbo, "bbo"),
+            (self.allbbo, "allbbo"),
             (self.l2book, "l2book"),
             (self.l4book, "l4book"),
             (self.trades, "trades"),
@@ -209,4 +225,7 @@ pub struct ServerConfig {
     /// Resend the last bbo payload every N ms when nothing has changed.
     /// 0 = disabled (default).
     pub bbo_heartbeat_ms: u64,
+    /// Resend the last allbbo payload every N ms when nothing has changed.
+    /// 0 = disabled (default).
+    pub allbbo_heartbeat_ms: u64,
 }

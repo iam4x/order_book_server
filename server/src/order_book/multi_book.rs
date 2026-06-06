@@ -1,14 +1,16 @@
-use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
-    prelude::*,
-};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
 };
+
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
+
+use crate::{
+    order_book::{Coin, InnerOrder, Oid, OrderBook, RawBbo, Snapshot, Sz},
+    prelude::*,
+};
 
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
@@ -88,11 +90,21 @@ impl<O: InnerOrder> OrderBooks<O> {
     /// Get BBO for specific coins only - faster for selective broadcast
     /// Only computes BBO for coins in the set, avoiding iteration over all coins
     #[must_use]
-    pub(crate) fn get_bbos_for_coins(
-        &self,
-        coins: &std::collections::HashSet<Coin>,
-    ) -> HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)> {
+    pub(crate) fn get_bbos_for_coins(&self, coins: &std::collections::HashSet<Coin>) -> HashMap<Coin, RawBbo> {
         coins.iter().filter_map(|coin| self.order_books.get(coin).map(|book| (coin.clone(), book.get_bbo()))).collect()
+    }
+
+    #[must_use]
+    pub(crate) fn get_bbos_for_changed_coins(&self, coins: &std::collections::HashSet<Coin>) -> Vec<(Coin, RawBbo)> {
+        coins
+            .iter()
+            .map(|coin| (coin.clone(), self.order_books.get(coin).map_or((None, None), OrderBook::get_bbo)))
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn get_all_bbos(&self) -> Vec<(Coin, RawBbo)> {
+        self.order_books.iter().map(|(coin, book)| (coin.clone(), book.get_bbo())).collect()
     }
 
     /// Compact slab allocators across every coin's orderbook. Returns the number
@@ -174,6 +186,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
+
+    use alloy::primitives::Address;
+    use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
+    use tokio::fs::read_to_string;
+
     use crate::{
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
@@ -186,11 +205,6 @@ mod tests {
             inner::{InnerL4Order, InnerLevel},
         },
     };
-    use alloy::primitives::Address;
-    use itertools::Itertools;
-    use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
-    use tokio::fs::read_to_string;
 
     fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
     where
