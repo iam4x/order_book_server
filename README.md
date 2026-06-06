@@ -83,7 +83,7 @@ cargo build --release
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
 | `--secret` | unset | Require WebSocket clients to connect with `?token=<secret>` |
 | `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
-| `--features` | `all` | Comma-delimited `bbo`, `allbbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, or `all` |
+| `--features` | `all` | Comma-delimited `bbo`, `allbbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, `stats`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -101,7 +101,7 @@ Your WebSocket client must support `permessage-deflate` for levels 1-9 to have a
 
 ### Snapshot Mode
 
-When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` skip this snapshot and start serving as soon as their file watchers are running.
+When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` or `--features stats` skip this snapshot and start serving as soon as their file watchers are running.
 
 The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
@@ -124,6 +124,7 @@ The `--features` flag controls both the WebSocket channels the server accepts an
 | `trades` | `trades` | No | fills |
 | `bookdiffs` | `bookDiffs` | No | order diffs |
 | `orderupdates` | `orderUpdates` | No | order statuses |
+| `stats` | `stats` | No | fills + order diffs |
 
 Examples:
 
@@ -133,6 +134,7 @@ Examples:
 --features l2book
 --features bbo,allbbo,l2book,trades
 --features trades,orderupdates
+--features stats
 ```
 
 If a client subscribes to a disabled channel, the server returns an error and does not register that subscription. Raw-only modes skip snapshot-derived coin validation; a syntactically valid coin in the selected `--markets` category is accepted and receives data only if the node emits it.
@@ -299,6 +301,16 @@ Response:
 ```
 > **Note:** Requires node to run with `--write-order-statuses` flag enabled.
 
+### Subscribe to Stats
+```json
+{ "method": "subscribe", "subscription": { "type": "stats" } }
+```
+Response, sent once per second:
+```json
+{ "channel": "stats", "data": { "time": 1750000000000, "tps": 123, "bps": 2, "height": 456789 } }
+```
+`tps` counts parsed `node_fills` events in the last second, `bps` counts distinct node block numbers observed in that interval, and `height` is the highest block seen.
+
 ### Ping/Pong
 ```json
 { "method": "ping" }
@@ -399,7 +411,7 @@ curl http://localhost:9090/metrics
 | | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/allbbo/l2Book/l4Book/trades/bookDiffs/orderUpdates) |
 | | `broadcast_receivers` | Number of broadcast channel receivers |
 | **Throughput** | `events_processed_total{type}` | Events by type (orders/diffs/fills) |
-| | `broadcasts_total{channel}` | Broadcasts by channel (bbo/allbbo/l2/l4/trades) |
+| | `broadcasts_total{channel}` | Broadcasts by channel (bbo/allbbo/l2/l4/trades/stats) |
 | | `messages_sent_total` | Total WebSocket messages sent |
 | | `bbo_changes_total{coin}` | BBO changes per coin |
 | **Health** | `orderbook_height` | Current block height |
@@ -569,7 +581,7 @@ This fork deduplicates at the WebSocket level:
 
 ### Granular Feature Selection
 
-The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, `--features allbbo` serves a single batched top-of-book stream, and raw-only configurations such as `--features trades,orderupdates` skip the startup snapshot and in-memory orderbook maintenance entirely.
+The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, `--features allbbo` serves a single batched top-of-book stream, and raw-only configurations such as `--features trades,orderupdates` or `--features stats` skip the startup snapshot and in-memory orderbook maintenance entirely.
 
 ### Snapshot Modes: Docker & Direct
 

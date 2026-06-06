@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     metrics::WS_SUBSCRIPTIONS_ACTIVE,
     types::{
-        AllBbo, Bbo, L2Book, L4Book, Trade,
+        AllBbo, Bbo, L2Book, L4Book, Stats, Trade,
         node_data::{NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
@@ -35,19 +35,35 @@ pub(crate) enum ClientMessage {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Subscription {
     #[serde(rename_all = "camelCase")]
-    Trades { coin: String },
+    Trades {
+        coin: String,
+    },
     #[serde(rename_all = "camelCase")]
-    L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
+    L2Book {
+        coin: String,
+        n_sig_figs: Option<u32>,
+        n_levels: Option<usize>,
+        mantissa: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
-    L4Book { coin: String },
+    L4Book {
+        coin: String,
+    },
     #[serde(rename_all = "camelCase")]
-    Bbo { coin: String },
+    Bbo {
+        coin: String,
+    },
     #[serde(rename = "allbbo")]
     AllBbo,
     #[serde(rename_all = "camelCase")]
-    OrderUpdates { user: String },
+    OrderUpdates {
+        user: String,
+    },
     #[serde(rename_all = "camelCase")]
-    BookDiffs { coin: String },
+    BookDiffs {
+        coin: String,
+    },
+    Stats,
 }
 
 impl Subscription {
@@ -110,6 +126,10 @@ impl Subscription {
                 info!("Valid orderUpdates subscription for user: {}", user);
                 true
             }
+            Self::Stats => {
+                info!("Valid stats subscription");
+                true
+            }
         }
     }
 }
@@ -124,6 +144,7 @@ impl Subscription {
             Self::Trades { .. } => "trades",
             Self::OrderUpdates { .. } => "orderUpdates",
             Self::BookDiffs { .. } => "bookDiffs",
+            Self::Stats => "stats",
         }
     }
 }
@@ -157,6 +178,7 @@ pub(crate) enum ServerResponse {
     AllBbo(AllBbo),
     BookDiffs(Vec<NodeDataOrderDiff>),
     OrderUpdates(Vec<OrderUpdate>),
+    Stats(Stats),
     Pong,
     Error(String),
 }
@@ -273,6 +295,15 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_stats_subscription_deserialization() {
+        let message = r#"
+            { "method": "subscribe", "subscription":{ "type": "stats" }}
+        "#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::Stats }));
+    }
+
     // ==================== Subscription Validation Tests ====================
 
     fn universe() -> std::collections::HashSet<String> {
@@ -302,6 +333,11 @@ mod test {
     #[test]
     fn test_validate_allbbo_valid_without_coin() {
         assert!(Subscription::AllBbo.validate(&universe()));
+    }
+
+    #[test]
+    fn test_validate_stats_valid_without_universe() {
+        assert!(Subscription::Stats.validate(&std::collections::HashSet::new()));
     }
 
     #[test]
@@ -437,6 +473,7 @@ mod test {
         assert_eq!(Subscription::Trades { coin: "".to_string() }.type_label(), "trades");
         assert_eq!(Subscription::OrderUpdates { user: "".to_string() }.type_label(), "orderUpdates");
         assert_eq!(Subscription::BookDiffs { coin: "".to_string() }.type_label(), "bookDiffs");
+        assert_eq!(Subscription::Stats.type_label(), "stats");
     }
 
     // ==================== SubscriptionManager Tests ====================
@@ -538,6 +575,13 @@ mod test {
         assert!(json.contains("BTC"));
     }
 
+    #[test]
+    fn test_server_response_stats_serialization() {
+        let stats = crate::types::Stats { time: 1750000000000, tps: 123, bps: 2, height: 456789 };
+        let json = serde_json::to_string(&ServerResponse::Stats(stats)).unwrap();
+        assert_eq!(json, r#"{"channel":"stats","data":{"time":1750000000000,"tps":123,"bps":2,"height":456789}}"#);
+    }
+
     // ==================== ClientMessage Serde Tests ====================
 
     #[test]
@@ -549,6 +593,7 @@ mod test {
             (r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#, "l4Book"),
             (r#"{"method":"subscribe","subscription":{"type":"bookDiffs","coin":"BTC"}}"#, "bookDiffs"),
             (r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#, "l2Book"),
+            (r#"{"method":"subscribe","subscription":{"type":"stats"}}"#, "stats"),
             (
                 r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#,
                 "orderUpdates",

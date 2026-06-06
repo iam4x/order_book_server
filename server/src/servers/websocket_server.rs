@@ -31,7 +31,7 @@ use crate::{
     order_book::{Coin, RawBbo},
     prelude::*,
     types::{
-        AllBbo, AllBboEntry, Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Level, Trade,
+        AllBbo, AllBboEntry, Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Level, Stats, Trade,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -541,6 +541,12 @@ async fn handle_socket(
                                     }
                                 }
                             },
+                            InternalMessage::Stats{ stats } => {
+                                if !features.stats() || !manager.subscriptions().contains(&Subscription::Stats) {
+                                    continue;
+                                }
+                                alive &= send_ws_stats(&mut socket, stats.clone()).await;
+                            },
                         }
 
                     }
@@ -923,6 +929,7 @@ fn subscription_feature_enabled(subscription: &Subscription, features: FeatureSe
         Subscription::Trades { .. } => features.trades(),
         Subscription::OrderUpdates { .. } => features.orderupdates(),
         Subscription::BookDiffs { .. } => features.bookdiffs(),
+        Subscription::Stats => features.stats(),
     }
 }
 
@@ -949,6 +956,7 @@ fn validate_subscription_for_features(
     }
 
     match subscription {
+        Subscription::Stats => true,
         Subscription::AllBbo => true,
         Subscription::Trades { coin } | Subscription::BookDiffs { coin } => {
             market_filter_allows_coin(coin, market_filter)
@@ -1041,6 +1049,8 @@ mod tests {
             &Subscription::OrderUpdates { user: "0x0000000000000000000000000000000000000000".to_string() },
             features
         ));
+        assert!(!subscription_feature_enabled(&Subscription::Stats, features));
+        assert!(subscription_feature_enabled(&Subscription::Stats, "stats".parse().expect("valid features")));
     }
 
     #[test]
@@ -1220,6 +1230,11 @@ async fn send_ws_data_from_trades(
         }
     }
     true
+}
+
+async fn send_ws_stats(socket: &mut WebSocket, stats: Stats) -> bool {
+    BROADCASTS_TOTAL.with_label_values(&["stats"]).inc();
+    send_socket_message(socket, ServerResponse::Stats(stats)).await
 }
 
 impl Subscription {

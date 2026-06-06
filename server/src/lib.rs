@@ -32,11 +32,21 @@ pub struct FeatureSet {
     trades: bool,
     bookdiffs: bool,
     orderupdates: bool,
+    stats: bool,
 }
 
 impl FeatureSet {
     pub const fn all() -> Self {
-        Self { bbo: true, allbbo: true, l2book: true, l4book: true, trades: true, bookdiffs: true, orderupdates: true }
+        Self {
+            bbo: true,
+            allbbo: true,
+            l2book: true,
+            l4book: true,
+            trades: true,
+            bookdiffs: true,
+            orderupdates: true,
+            stats: true,
+        }
     }
 
     const fn empty() -> Self {
@@ -48,6 +58,7 @@ impl FeatureSet {
             trades: false,
             bookdiffs: false,
             orderupdates: false,
+            stats: false,
         }
     }
 
@@ -79,6 +90,10 @@ impl FeatureSet {
         self.orderupdates
     }
 
+    pub const fn stats(self) -> bool {
+        self.stats
+    }
+
     pub const fn requires_book_state(self) -> bool {
         self.bbo || self.allbbo || self.l2book || self.l4book
     }
@@ -88,11 +103,11 @@ impl FeatureSet {
     }
 
     pub const fn watch_order_diffs(self) -> bool {
-        self.requires_book_state() || self.bookdiffs
+        self.requires_book_state() || self.bookdiffs || self.stats
     }
 
     pub const fn watch_fills(self) -> bool {
-        self.trades
+        self.trades || self.stats
     }
 }
 
@@ -109,7 +124,7 @@ impl FromStr for FeatureSet {
         let value = value.trim();
         if value.is_empty() {
             return Err(
-                "empty feature list; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                "empty feature list; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
                     .to_string(),
             );
         }
@@ -123,7 +138,7 @@ impl FromStr for FeatureSet {
             let feature = feature.trim();
             if feature.is_empty() {
                 return Err(
-                    "empty feature entry; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                    "empty feature entry; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
                         .to_string(),
                 );
             }
@@ -149,9 +164,11 @@ impl FromStr for FeatureSet {
                 "bookdiffs" => return Err("duplicate feature `bookdiffs`".to_string()),
                 "orderupdates" if !features.orderupdates => features.orderupdates = true,
                 "orderupdates" => return Err("duplicate feature `orderupdates`".to_string()),
+                "stats" if !features.stats => features.stats = true,
+                "stats" => return Err("duplicate feature `stats`".to_string()),
                 unknown => {
                     return Err(format!(
-                        "unknown feature `{unknown}`; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, or all"
+                        "unknown feature `{unknown}`; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
                     ));
                 }
             }
@@ -172,6 +189,7 @@ impl fmt::Display for FeatureSet {
             (self.trades, "trades"),
             (self.bookdiffs, "bookdiffs"),
             (self.orderupdates, "orderupdates"),
+            (self.stats, "stats"),
         ] {
             if enabled {
                 if !first {

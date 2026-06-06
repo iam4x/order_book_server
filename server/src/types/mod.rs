@@ -86,6 +86,14 @@ pub(crate) struct AllBbo {
     pub bbos: Vec<AllBboEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Stats {
+    pub time: u64,
+    pub tps: u64,
+    pub bps: u64,
+    pub height: u64,
+}
+
 impl L2Book {
     pub(crate) const fn from_l2_snapshot(
         coin: String,

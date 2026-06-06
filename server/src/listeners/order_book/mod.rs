@@ -33,7 +33,7 @@ use crate::{
     },
     prelude::*,
     types::{
-        L2Book, L4Order,
+        L2Book, L4Order, Stats,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::DEFAULT_LEVELS,
@@ -221,6 +221,7 @@ pub(crate) struct OrderBookListener {
     pending_allbbo_changed_coins: HashSet<Coin>,
     allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     last_universe: HashSet<Coin>,
+    stats: StatsAccumulator,
 }
 
 impl OrderBookListener {
@@ -246,6 +247,7 @@ impl OrderBookListener {
             pending_allbbo_changed_coins: HashSet::new(),
             allbbo_subscription_registry: Arc::new(AllBboSubscriptionRegistry::default()),
             last_universe: HashSet::new(),
+            stats: StatsAccumulator::default(),
         }
     }
 
@@ -471,6 +473,24 @@ impl OrderBookListener {
 
         Some(InternalMessage::AllBboUpdate { bbos, time })
     }
+
+    fn flush_stats_if_due(&mut self) {
+        if let Some(msg) = self.take_stats_update() {
+            if let Some(tx) = &self.internal_message_tx {
+                if tx.receiver_count() > 0 {
+                    drop(tx.send(Arc::new(msg)));
+                }
+            }
+        }
+    }
+
+    fn take_stats_update(&mut self) -> Option<InternalMessage> {
+        if !self.features.stats() {
+            return None;
+        }
+        let time = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        Some(InternalMessage::Stats { stats: self.stats.flush(time) })
+    }
 }
 
 impl OrderBookListener {
@@ -492,7 +512,7 @@ impl OrderBookListener {
         }
 
         let source_enabled = match event_source {
-            EventSource::Fills => self.features.trades(),
+            EventSource::Fills => self.features.watch_fills(),
             EventSource::OrderStatuses => self.features.watch_order_statuses(),
             EventSource::OrderDiffs => self.features.watch_order_diffs(),
         };
@@ -549,6 +569,9 @@ impl OrderBookListener {
                 "Dropping oversize batch from {source_label}: {events_len} events (cap {MAX_EVENTS_PER_BATCH}), height={height}"
             );
             return Ok(());
+        }
+        if self.features.stats() {
+            self.stats.record(event_source, height, events_len);
         }
 
         // Log successful parses periodically
@@ -814,6 +837,30 @@ pub(crate) struct TimedSnapshots {
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
+#[derive(Default)]
+struct StatsAccumulator {
+    fills: u64,
+    blocks: HashSet<u64>,
+    height: u64,
+}
+
+impl StatsAccumulator {
+    fn record(&mut self, event_source: EventSource, height: u64, events_len: usize) {
+        if matches!(event_source, EventSource::Fills) {
+            self.fills = self.fills.saturating_add(events_len as u64);
+        }
+        self.blocks.insert(height);
+        self.height = self.height.max(height);
+    }
+
+    fn flush(&mut self, time: u64) -> Stats {
+        let stats = Stats { time, tps: self.fills, bps: self.blocks.len() as u64, height: self.height };
+        self.fills = 0;
+        self.blocks.clear();
+        stats
+    }
+}
+
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     L2Update {
@@ -841,6 +888,9 @@ pub(crate) enum InternalMessage {
     /// HFT L4 streaming - order statuses without waiting for diff pairing
     L4OrderStatuses {
         batch: Batch<NodeDataOrderStatus>,
+    },
+    Stats {
+        stats: Stats,
     },
 }
 
@@ -962,6 +1012,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         Duration::from_millis(L2_FLUSH_TICK_MS),
     );
     l2_flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stats_ticker = tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
+    stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_fetch_pending = false;
 
     info!("Main event loop starting");
@@ -983,6 +1035,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         listener.lock().await.finish_l2_flush(prepared);
                     }
                 }
+            }
+
+            _ = stats_ticker.tick(), if config.features.stats() => {
+                listener.lock().await.flush_stats_if_due();
             }
 
             // Process events from file watchers (via bridge)
@@ -1048,6 +1104,26 @@ mod tests {
         order_book::{OrderBook, Side, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
+
+    #[test]
+    fn stats_accumulator_counts_fills_unique_blocks_and_preserves_height() {
+        let mut stats = StatsAccumulator::default();
+        stats.record(EventSource::Fills, 100, 3);
+        stats.record(EventSource::OrderDiffs, 100, 7);
+        stats.record(EventSource::OrderDiffs, 101, 2);
+        stats.record(EventSource::Fills, 99, 4);
+
+        let first = stats.flush(1_750_000_000_000);
+        assert_eq!(first.time, 1_750_000_000_000);
+        assert_eq!(first.tps, 7);
+        assert_eq!(first.bps, 3);
+        assert_eq!(first.height, 101);
+
+        let second = stats.flush(1_750_000_001_000);
+        assert_eq!(second.tps, 0);
+        assert_eq!(second.bps, 0);
+        assert_eq!(second.height, 101);
+    }
 
     fn inner_order(oid: u64, coin: &str, side: Side, px: &str, sz: &str) -> InnerL4Order {
         InnerL4Order {

@@ -486,4 +486,11 @@ mod tests {
         assert_eq!(enabled_event_sources(features("bookdiffs")), vec![EventSource::OrderDiffs]);
         assert_eq!(enabled_event_sources(features("orderupdates")), vec![EventSource::OrderStatuses]);
     }
+
+    #[test]
+    fn enabled_sources_for_stats_watch_fills_and_order_diffs_without_order_statuses() {
+        assert_eq!(enabled_event_sources(features("stats")), vec![EventSource::Fills, EventSource::OrderDiffs]);
+        assert!(!features("stats").requires_book_state());
+        assert!(!features("stats").watch_order_statuses());
+    }
 }
