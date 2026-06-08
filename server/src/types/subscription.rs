@@ -577,9 +577,12 @@ mod test {
 
     #[test]
     fn test_server_response_stats_serialization() {
-        let stats = crate::types::Stats { time: 1750000000000, tps: 123, bps: 2, height: 456789 };
+        let stats = crate::types::Stats { time: 1750000000000, tps: 123, bps: 2, height: 456789, ops: 456 };
         let json = serde_json::to_string(&ServerResponse::Stats(stats)).unwrap();
-        assert_eq!(json, r#"{"channel":"stats","data":{"time":1750000000000,"tps":123,"bps":2,"height":456789}}"#);
+        assert_eq!(
+            json,
+            r#"{"channel":"stats","data":{"time":1750000000000,"tps":123,"bps":2,"height":456789,"ops":456}}"#
+        );
     }
 
     // ==================== ClientMessage Serde Tests ====================

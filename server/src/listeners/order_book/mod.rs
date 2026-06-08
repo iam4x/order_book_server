@@ -571,7 +571,7 @@ impl OrderBookListener {
             return Ok(());
         }
         if self.features.stats() {
-            self.stats.record(event_source, height, events_len);
+            self.stats.record(&event_batch, height);
         }
 
         // Log successful parses periodically
@@ -840,22 +840,41 @@ pub(crate) struct TimedSnapshots {
 #[derive(Default)]
 struct StatsAccumulator {
     fills: u64,
+    ops: u64,
     blocks: HashSet<u64>,
     height: u64,
 }
 
 impl StatsAccumulator {
-    fn record(&mut self, event_source: EventSource, height: u64, events_len: usize) {
-        if matches!(event_source, EventSource::Fills) {
-            self.fills = self.fills.saturating_add(events_len as u64);
+    fn record(&mut self, event_batch: &EventBatch, height: u64) {
+        match event_batch {
+            EventBatch::Fills(batch) => {
+                let fills = batch.events_len() as u64;
+                self.fills = self.fills.saturating_add(fills);
+                self.ops = self.ops.saturating_add(fills);
+            }
+            EventBatch::BookDiffs(batch) => {
+                let ops = batch
+                    .events_ref()
+                    .iter()
+                    .map(|diff| match &diff.raw_book_diff {
+                        crate::types::OrderDiff::New { .. } => 1,
+                        crate::types::OrderDiff::Update { .. } => 1,
+                        crate::types::OrderDiff::Remove => 1,
+                    })
+                    .sum::<u64>();
+                self.ops = self.ops.saturating_add(ops);
+            }
+            EventBatch::Orders(_) => {}
         }
         self.blocks.insert(height);
         self.height = self.height.max(height);
     }
 
     fn flush(&mut self, time: u64) -> Stats {
-        let stats = Stats { time, tps: self.fills, bps: self.blocks.len() as u64, height: self.height };
+        let stats = Stats { time, tps: self.fills, bps: self.blocks.len() as u64, height: self.height, ops: self.ops };
         self.fills = 0;
+        self.ops = 0;
         self.blocks.clear();
         stats
     }
@@ -1106,21 +1125,99 @@ mod tests {
     };
 
     #[test]
-    fn stats_accumulator_counts_fills_unique_blocks_and_preserves_height() {
+    fn stats_accumulator_counts_ops_fills_unique_blocks_and_preserves_height() {
         let mut stats = StatsAccumulator::default();
-        stats.record(EventSource::Fills, 100, 3);
-        stats.record(EventSource::OrderDiffs, 100, 7);
-        stats.record(EventSource::OrderDiffs, 101, 2);
-        stats.record(EventSource::Fills, 99, 4);
+        let fills: Batch<NodeDataFill> = serde_json::from_value(serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 100,
+            "events": [
+                [
+                    "0x0000000000000000000000000000000000000001",
+                    {
+                        "coin": "BTC",
+                        "px": "50000.0",
+                        "sz": "0.1",
+                        "side": "A",
+                        "time": 1700000000000u64,
+                        "startPosition": "0",
+                        "dir": "Open Long",
+                        "closedPnl": "0",
+                        "hash": "0xabc",
+                        "oid": 123u64,
+                        "crossed": true,
+                        "fee": "0.5",
+                        "tid": 999u64,
+                        "feeToken": "USDC",
+                        "liquidation": null
+                    }
+                ],
+                [
+                    "0x0000000000000000000000000000000000000002",
+                    {
+                        "coin": "ETH",
+                        "px": "3000.0",
+                        "sz": "1.0",
+                        "side": "B",
+                        "time": 1700000000001u64,
+                        "startPosition": "0",
+                        "dir": "Open Short",
+                        "closedPnl": "0",
+                        "hash": "0xdef",
+                        "oid": 456u64,
+                        "crossed": true,
+                        "fee": "0.5",
+                        "tid": 1000u64,
+                        "feeToken": "USDC",
+                        "liquidation": null
+                    }
+                ]
+            ]
+        }))
+        .expect("fills parse");
+        let diffs: Batch<NodeDataOrderDiff> = serde_json::from_value(serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 101,
+            "events": [
+                {
+                    "user": "0x0000000000000000000000000000000000000000",
+                    "oid": 1u64,
+                    "px": "100",
+                    "coin": "BTC",
+                    "raw_book_diff": { "new": { "sz": "1" } }
+                },
+                {
+                    "user": "0x0000000000000000000000000000000000000000",
+                    "oid": 2u64,
+                    "px": "100",
+                    "coin": "BTC",
+                    "raw_book_diff": { "update": { "origSz": "1", "newSz": "2" } }
+                },
+                {
+                    "user": "0x0000000000000000000000000000000000000000",
+                    "oid": 3u64,
+                    "px": "100",
+                    "coin": "BTC",
+                    "raw_book_diff": "remove"
+                }
+            ]
+        }))
+        .expect("diffs parse");
+
+        stats.record(&EventBatch::Fills(fills), 100);
+        stats.record(&EventBatch::BookDiffs(diffs), 101);
 
         let first = stats.flush(1_750_000_000_000);
         assert_eq!(first.time, 1_750_000_000_000);
-        assert_eq!(first.tps, 7);
-        assert_eq!(first.bps, 3);
+        assert_eq!(first.tps, 2);
+        assert_eq!(first.ops, 5);
+        assert_eq!(first.bps, 2);
         assert_eq!(first.height, 101);
 
         let second = stats.flush(1_750_000_001_000);
         assert_eq!(second.tps, 0);
+        assert_eq!(second.ops, 0);
         assert_eq!(second.bps, 0);
         assert_eq!(second.height, 101);
     }

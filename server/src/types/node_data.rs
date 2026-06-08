@@ -97,6 +97,10 @@ impl<E> Batch<E> {
         self.events
     }
 
+    pub(crate) fn events_ref(&self) -> &[E] {
+        &self.events
+    }
+
     /// Number of events without consuming the batch.
     pub(crate) fn events_len(&self) -> usize {
         self.events.len()

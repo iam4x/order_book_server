@@ -92,6 +92,7 @@ pub(crate) struct Stats {
     pub tps: u64,
     pub bps: u64,
     pub height: u64,
+    pub ops: u64,
 }
 
 impl L2Book {

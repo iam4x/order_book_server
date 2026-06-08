@@ -307,9 +307,9 @@ Response:
 ```
 Response, sent once per second:
 ```json
-{ "channel": "stats", "data": { "time": 1750000000000, "tps": 123, "bps": 2, "height": 456789 } }
+{ "channel": "stats", "data": { "time": 1750000000000, "tps": 123, "bps": 2, "height": 456789, "ops": 456 } }
 ```
-`tps` counts parsed `node_fills` events in the last second, `bps` counts distinct node block numbers observed in that interval, and `height` is the highest block seen.
+`tps` counts parsed `node_fills` events in the last second, `bps` counts distinct node block numbers observed in that interval, `height` is the highest block seen, and `ops` counts place, update, cancel, and fill order operations.
 
 ### Ping/Pong
 ```json
