@@ -47,8 +47,10 @@ mod utils;
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 const L2_FLUSH_TICK_MS: u64 = 10;
 const ALLBBO_BROADCAST_THROTTLE_MS: u64 = 50;
-const SNAPSHOT_REPLAY_MAX_LINES: usize = 100_000;
-const SNAPSHOT_REPLAY_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 1_000_000;
+const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 2_000_000;
+const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotTaskKind {
@@ -78,15 +80,51 @@ struct SnapshotReplayLine {
     line: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotReplayLimits {
+    max_lines: usize,
+    max_bytes: usize,
+}
+
+impl SnapshotReplayLimits {
+    fn for_kind(kind: SnapshotTaskKind) -> Self {
+        match kind {
+            SnapshotTaskKind::Initial => Self {
+                max_lines: SNAPSHOT_REPLAY_INITIAL_MAX_LINES,
+                max_bytes: SNAPSHOT_REPLAY_INITIAL_MAX_BYTES,
+            },
+            SnapshotTaskKind::Refresh => Self {
+                max_lines: SNAPSHOT_REPLAY_REFRESH_MAX_LINES,
+                max_bytes: SNAPSHOT_REPLAY_REFRESH_MAX_BYTES,
+            },
+        }
+    }
+}
+
+impl Default for SnapshotReplayLimits {
+    fn default() -> Self {
+        Self::for_kind(SnapshotTaskKind::Refresh)
+    }
+}
+
 #[derive(Debug, Default)]
 struct SnapshotReplayCache {
     lines: VecDeque<SnapshotReplayLine>,
     total_bytes: usize,
     overflowed: bool,
     started_book_height: u64,
+    limits: SnapshotReplayLimits,
 }
 
 impl SnapshotReplayCache {
+    fn new(started_book_height: u64, kind: SnapshotTaskKind) -> Self {
+        Self {
+            started_book_height,
+            limits: SnapshotReplayLimits::for_kind(kind),
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, event_source: EventSource, line: &str) -> bool {
         if self.overflowed {
             return false;
@@ -94,7 +132,7 @@ impl SnapshotReplayCache {
 
         let next_lines = self.lines.len().saturating_add(1);
         let next_bytes = self.total_bytes.saturating_add(line.len());
-        if next_lines > SNAPSHOT_REPLAY_MAX_LINES || next_bytes > SNAPSHOT_REPLAY_MAX_BYTES {
+        if next_lines > self.limits.max_lines || next_bytes > self.limits.max_bytes {
             self.overflowed = true;
             return true;
         }
@@ -260,7 +298,7 @@ fn fetch_snapshot(
         // catch up to events written while hl-node is reading abci_state.rmp.
         {
             let mut listener = listener.lock().await;
-            listener.begin_snapshot_replay();
+            listener.begin_snapshot_replay_for(kind);
         };
 
         let res: Result<SnapshotInstallOutcome> = async {
@@ -435,10 +473,14 @@ impl OrderBookListener {
         Arc::clone(&self.allbbo_subscription_registry)
     }
 
+    #[cfg(test)]
     fn begin_snapshot_replay(&mut self) {
+        self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh);
+    }
+
+    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) {
         let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
-        self.snapshot_replay_cache =
-            Some(SnapshotReplayCache { started_book_height, ..SnapshotReplayCache::default() });
+        self.snapshot_replay_cache = Some(SnapshotReplayCache::new(started_book_height, kind));
     }
 
     fn clear_snapshot_replay(&mut self) {
@@ -453,9 +495,12 @@ impl OrderBookListener {
         let Some(cache) = &mut self.snapshot_replay_cache else { return };
         if cache.push(event_source, line) {
             warn!(
-                "Snapshot replay cache overflowed at {} lines / {} bytes; this snapshot will not be installed",
+                "Snapshot replay cache overflowed at {} lines / {} bytes (limits: {} lines / {} bytes); this snapshot \
+                 will not be installed",
                 cache.lines.len(),
-                cache.total_bytes
+                cache.total_bytes,
+                cache.limits.max_lines,
+                cache.limits.max_bytes
             );
         }
     }
@@ -1878,6 +1923,21 @@ mod tests {
         assert_eq!(next_snapshot_trigger(features("bbo"), true, false, Some(now + Duration::from_secs(1)), now), None);
         assert_eq!(next_snapshot_trigger(features("bbo"), false, true, None, now), None);
         assert_eq!(next_snapshot_trigger(features("trades"), true, false, Some(now), now), None);
+    }
+
+    #[test]
+    fn initial_snapshot_replay_uses_larger_startup_budget() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+
+        listener.begin_snapshot_replay();
+        let refresh_limits = listener.snapshot_replay_cache.as_ref().expect("refresh cache").limits;
+
+        listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial);
+        let initial_limits = listener.snapshot_replay_cache.as_ref().expect("initial cache").limits;
+
+        assert!(initial_limits.max_lines > refresh_limits.max_lines);
+        assert!(initial_limits.max_bytes > refresh_limits.max_bytes);
     }
 
     #[test]
