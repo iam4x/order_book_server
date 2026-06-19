@@ -67,11 +67,7 @@ struct SnapshotTaskResult {
 enum SnapshotInstallOutcome {
     Installed { replayed_lines: usize },
     SkippedReplayOverflow { cached_lines: usize, cached_bytes: usize },
-    SkippedStaleSnapshot {
-        snapshot_height: u64,
-        replay_cutoff_height: u64,
-        started_book_height: u64,
-    },
+    SkippedStaleSnapshot { snapshot_height: u64, replay_cutoff_height: u64, started_book_height: u64 },
 }
 
 #[derive(Debug)]
@@ -89,14 +85,12 @@ struct SnapshotReplayLimits {
 impl SnapshotReplayLimits {
     fn for_kind(kind: SnapshotTaskKind) -> Self {
         match kind {
-            SnapshotTaskKind::Initial => Self {
-                max_lines: SNAPSHOT_REPLAY_INITIAL_MAX_LINES,
-                max_bytes: SNAPSHOT_REPLAY_INITIAL_MAX_BYTES,
-            },
-            SnapshotTaskKind::Refresh => Self {
-                max_lines: SNAPSHOT_REPLAY_REFRESH_MAX_LINES,
-                max_bytes: SNAPSHOT_REPLAY_REFRESH_MAX_BYTES,
-            },
+            SnapshotTaskKind::Initial => {
+                Self { max_lines: SNAPSHOT_REPLAY_INITIAL_MAX_LINES, max_bytes: SNAPSHOT_REPLAY_INITIAL_MAX_BYTES }
+            }
+            SnapshotTaskKind::Refresh => {
+                Self { max_lines: SNAPSHOT_REPLAY_REFRESH_MAX_LINES, max_bytes: SNAPSHOT_REPLAY_REFRESH_MAX_BYTES }
+            }
         }
     }
 }
@@ -118,11 +112,7 @@ struct SnapshotReplayCache {
 
 impl SnapshotReplayCache {
     fn new(started_book_height: u64, kind: SnapshotTaskKind) -> Self {
-        Self {
-            started_book_height,
-            limits: SnapshotReplayLimits::for_kind(kind),
-            ..Self::default()
-        }
+        Self { started_book_height, limits: SnapshotReplayLimits::for_kind(kind), ..Self::default() }
     }
 
     fn push(&mut self, event_source: EventSource, line: &str) -> bool {
@@ -326,9 +316,7 @@ fn fetch_snapshot(
                      conservative replay cutoff"
                 );
             }
-            info!(
-                "Snapshot fetched at height {height} ({height_source:?}); replay cutoff {replay_cutoff_height}"
-            );
+            info!("Snapshot fetched at height {height} ({height_source:?}); replay cutoff {replay_cutoff_height}");
             // Give file watchers a short window to deliver any writes that landed
             // around the snapshot read before we close replay capture.
             sleep(Duration::from_secs(1)).await;
@@ -940,8 +928,8 @@ impl OrderBookListener {
             return Ok(());
         }
         let ignore_for_book_state = self.should_ignore_stream_batch(event_source, height);
-        let replay_guard_for_book_state = !ignore_for_book_state
-            && self.should_replay_guard_stream_batch(event_source, height);
+        let replay_guard_for_book_state =
+            !ignore_for_book_state && self.should_replay_guard_stream_batch(event_source, height);
         if !ignore_for_book_state {
             self.record_snapshot_replay_line(event_source, &line);
         }
@@ -1957,22 +1945,12 @@ mod tests {
     #[test]
     fn bare_snapshot_requires_visor_heights() {
         assert!(
-            snapshot_replay_cutoff_height(
-                SnapshotHeightSource::Visor,
-                42,
-                Err("missing before visor".into()),
-                Ok(43),
-            )
-            .is_err()
+            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Err("missing before visor".into()), Ok(43),)
+                .is_err()
         );
         assert!(
-            snapshot_replay_cutoff_height(
-                SnapshotHeightSource::Visor,
-                42,
-                Ok(41),
-                Err("missing after visor".into()),
-            )
-            .is_err()
+            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Ok(41), Err("missing after visor".into()),)
+                .is_err()
         );
     }
 
@@ -2148,7 +2126,12 @@ mod tests {
     fn refresh_with_visor_snapshot_height_installs() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
-        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.replace_order_book_state(
+            order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12),
+            12,
+            12,
+            false,
+        );
         listener.begin_snapshot_replay();
 
         listener
@@ -2171,7 +2154,12 @@ mod tests {
     fn refresh_visor_snapshot_uses_lower_replay_cutoff_when_height_advances() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
-        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.replace_order_book_state(
+            order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12),
+            12,
+            12,
+            false,
+        );
         listener.begin_snapshot_replay();
 
         listener
@@ -2194,7 +2182,12 @@ mod tests {
     fn refresh_visor_snapshot_with_cutoff_below_replay_start_is_skipped() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
-        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.replace_order_book_state(
+            order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12),
+            12,
+            12,
+            false,
+        );
         listener.begin_snapshot_replay();
 
         listener
@@ -2279,7 +2272,12 @@ mod tests {
     fn refresh_snapshot_below_replay_start_height_is_skipped() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
-        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.replace_order_book_state(
+            order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12),
+            12,
+            12,
+            false,
+        );
         listener.begin_snapshot_replay();
 
         listener

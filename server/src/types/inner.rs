@@ -208,9 +208,10 @@ impl TryFrom<OrderDiff> for InnerOrderDiff {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
+
     use super::*;
     use crate::order_book::types::{Coin, InnerOrder, Px, Side, Sz};
-    use alloy::primitives::Address;
 
     fn make_l4_order(coin: &str, side: Side, px: &str, sz: &str, oid: u64) -> L4Order {
         L4Order {
@@ -348,14 +349,12 @@ mod tests {
     fn test_order_diff_update() {
         let diff = OrderDiff::Update { orig_sz: "2.0".to_string(), new_sz: "1.0".to_string() };
         let inner: InnerOrderDiff = diff.try_into().unwrap();
-        assert!(
-            matches!(
-                inner,
-                InnerOrderDiff::Update { orig_sz, new_sz }
-                    if orig_sz == Sz::parse_from_str("2.0").unwrap()
-                        && new_sz == Sz::parse_from_str("1.0").unwrap()
-            )
-        );
+        assert!(matches!(
+            inner,
+            InnerOrderDiff::Update { orig_sz, new_sz }
+                if orig_sz == Sz::parse_from_str("2.0").unwrap()
+                    && new_sz == Sz::parse_from_str("1.0").unwrap()
+        ));
     }
 
     #[test]
@@ -376,11 +375,8 @@ mod tests {
 
     #[test]
     fn test_inner_level_to_level() {
-        let inner = InnerLevel {
-            px: Px::parse_from_str("100.5").unwrap(),
-            sz: Sz::parse_from_str("2.5").unwrap(),
-            n: 3,
-        };
+        let inner =
+            InnerLevel { px: Px::parse_from_str("100.5").unwrap(), sz: Sz::parse_from_str("2.5").unwrap(), n: 3 };
         let level: Level = inner.into();
         assert_eq!(level.px(), "100.5");
         assert_eq!(level.sz(), "2.5");
