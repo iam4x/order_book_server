@@ -8,7 +8,7 @@ use std::{
 };
 
 use alloy::primitives::Address;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::{
     sync::{
         Mutex,
@@ -29,7 +29,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, RawBbo, Snapshot, Sz,
-        multi_book::{Snapshots, load_snapshots_from_cli_json},
+        multi_book::{SnapshotHeightSource, Snapshots, load_snapshots_from_cli_json_at_height, read_visor_height},
     },
     prelude::*,
     types::{
@@ -47,6 +47,63 @@ mod utils;
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 const L2_FLUSH_TICK_MS: u64 = 10;
 const ALLBBO_BROADCAST_THROTTLE_MS: u64 = 50;
+const SNAPSHOT_REPLAY_MAX_LINES: usize = 100_000;
+const SNAPSHOT_REPLAY_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotTaskKind {
+    Initial,
+    Refresh,
+}
+
+struct SnapshotTaskResult {
+    kind: SnapshotTaskKind,
+    result: Result<SnapshotInstallOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotInstallOutcome {
+    Installed { replayed_lines: usize },
+    SkippedReplayOverflow { cached_lines: usize, cached_bytes: usize },
+    SkippedStaleSnapshot {
+        snapshot_height: u64,
+        replay_cutoff_height: u64,
+        started_book_height: u64,
+    },
+}
+
+#[derive(Debug)]
+struct SnapshotReplayLine {
+    event_source: EventSource,
+    line: String,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotReplayCache {
+    lines: VecDeque<SnapshotReplayLine>,
+    total_bytes: usize,
+    overflowed: bool,
+    started_book_height: u64,
+}
+
+impl SnapshotReplayCache {
+    fn push(&mut self, event_source: EventSource, line: &str) -> bool {
+        if self.overflowed {
+            return false;
+        }
+
+        let next_lines = self.lines.len().saturating_add(1);
+        let next_bytes = self.total_bytes.saturating_add(line.len());
+        if next_lines > SNAPSHOT_REPLAY_MAX_LINES || next_bytes > SNAPSHOT_REPLAY_MAX_BYTES {
+            self.overflowed = true;
+            return true;
+        }
+
+        self.total_bytes = next_bytes;
+        self.lines.push_back(SnapshotReplayLine { event_source, line: line.to_string() });
+        false
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct AllBboSubscriptionRegistry {
@@ -147,52 +204,154 @@ impl L2SubscriptionRegistry {
     }
 }
 
+fn snapshot_refresh_interval(hours: u64) -> Option<Duration> {
+    (hours > 0).then(|| Duration::from_secs(hours.saturating_mul(60 * 60)))
+}
+
+fn next_snapshot_trigger(
+    features: FeatureSet,
+    is_ready: bool,
+    snapshot_fetch_pending: bool,
+    next_refresh_at: Option<Instant>,
+    now: Instant,
+) -> Option<SnapshotTaskKind> {
+    if !features.requires_book_state() || snapshot_fetch_pending {
+        return None;
+    }
+    if !is_ready {
+        return Some(SnapshotTaskKind::Initial);
+    }
+    if next_refresh_at.is_some_and(|refresh_at| now >= refresh_at) {
+        return Some(SnapshotTaskKind::Refresh);
+    }
+    None
+}
+
+fn snapshot_replay_cutoff_height(
+    height_source: SnapshotHeightSource,
+    snapshot_height: u64,
+    visor_height_before: Result<u64>,
+    visor_height_after: Result<u64>,
+) -> Result<(u64, Option<(u64, u64)>)> {
+    match height_source {
+        SnapshotHeightSource::Embedded => Ok((snapshot_height, None)),
+        SnapshotHeightSource::Visor => {
+            let before = visor_height_before.map_err(|err| -> Error {
+                format!("Failed to read visor height before bare snapshot generation: {err}").into()
+            })?;
+            let after = visor_height_after.map_err(|err| -> Error {
+                format!("Failed to read visor height after bare snapshot generation: {err}").into()
+            })?;
+            Ok((before.min(after), Some((before, after))))
+        }
+    }
+}
+
 fn fetch_snapshot(
+    kind: SnapshotTaskKind,
     snapshot_config: SnapshotConfig,
     listener: Arc<Mutex<OrderBookListener>>,
-    tx: UnboundedSender<Result<()>>,
-    _ignore_spot: bool,
+    tx: UnboundedSender<SnapshotTaskResult>,
+    ignore_spot: bool,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        // CRITICAL: Start caching BEFORE generating snapshot
-        // This ensures we don't miss any events during snapshot generation.
-        // We don't clone the existing state here - it's discarded by init_from_snapshot
-        // below, and cloning the whole BTreeMap/Slab tree temporarily doubles peak RSS.
+        // Start replay capture before generating the snapshot so the new state can
+        // catch up to events written while hl-node is reading abci_state.rmp.
         {
             let mut listener = listener.lock().await;
-            listener.begin_caching();
-        }
-
-        // Now generate snapshot - any events during this time are cached
-        let visor_path = get_visor_path(&snapshot_config);
-        let res = match process_rmp_file(&snapshot_config).await {
-            Ok(output_fln) => {
-                let snapshot =
-                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let _cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        info!("Snapshot loaded at height {}", height);
-                        // Always reinitialize from snapshot to get fresh, accurate orderbook
-                        // This corrects any drift from missed streaming updates
-                        listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            Err(err) => Err(err),
+            listener.begin_snapshot_replay();
         };
-        let _unused = tx.send(res);
+
+        let res: Result<SnapshotInstallOutcome> = async {
+            let visor_path = get_visor_path(&snapshot_config);
+            let visor_height_before = read_visor_height(&visor_path).await;
+            let output_fln = process_rmp_file(&snapshot_config).await?;
+            let visor_height_after = read_visor_height(&visor_path).await;
+            let fallback_height =
+                visor_height_after.as_ref().or(visor_height_before.as_ref()).copied().unwrap_or_default();
+            let loaded_snapshot = load_snapshots_from_cli_json_at_height::<InnerL4Order, (Address, L4Order)>(
+                &output_fln,
+                fallback_height,
+            )
+            .await?;
+            let height_source = loaded_snapshot.height_source;
+            let height = loaded_snapshot.height;
+            let (replay_cutoff_height, visor_heights) =
+                snapshot_replay_cutoff_height(height_source, height, visor_height_before, visor_height_after)?;
+            if let Some((visor_height_before, visor_height_after)) =
+                visor_heights.filter(|(before, after)| before != after)
+            {
+                warn!(
+                    "Bare snapshot output used visor height, and visor changed from {visor_height_before} to \
+                     {visor_height_after} while hl-node generated the snapshot; using {replay_cutoff_height} as \
+                     conservative replay cutoff"
+                );
+            }
+            info!(
+                "Snapshot fetched at height {height} ({height_source:?}); replay cutoff {replay_cutoff_height}"
+            );
+            // Give file watchers a short window to deliver any writes that landed
+            // around the snapshot read before we close replay capture.
+            sleep(Duration::from_secs(1)).await;
+
+            let new_order_book = OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, true, ignore_spot);
+            let outcome = listener.lock().await.install_snapshot_state_with_replay_cutoff(
+                new_order_book,
+                height,
+                replay_cutoff_height,
+                kind,
+            )?;
+            Ok(outcome)
+        }
+        .await;
+
+        if res.is_err() {
+            listener.lock().await.clear_snapshot_replay();
+        }
+        let _unused = tx.send(SnapshotTaskResult { kind, result: res });
         Ok::<(), Error>(())
     });
+}
+
+fn replay_snapshot_cache(state: &mut OrderBookState, snapshot_height: u64, replay_cache: SnapshotReplayCache) -> usize {
+    let mut replayed_lines = 0;
+    for replay_line in replay_cache.lines {
+        match replay_line.event_source {
+            EventSource::OrderStatuses => match sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(&replay_line.line) {
+                Ok(batch) => {
+                    if batch.block_number() <= snapshot_height {
+                        continue;
+                    }
+                    if let Err(err) = state.apply_order_statuses_hft(batch) {
+                        warn!(
+                            "Skipping cached order-status replay line above snapshot height {snapshot_height}: {err}"
+                        );
+                    }
+                    replayed_lines += 1;
+                }
+                Err(err) => {
+                    warn!("Skipping unparsable cached order-status replay line: {err}");
+                }
+            },
+            EventSource::OrderDiffs => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(&replay_line.line) {
+                Ok(batch) => {
+                    if batch.block_number() <= snapshot_height {
+                        continue;
+                    }
+                    if let Err(err) = state.replay_order_diffs_hft(batch) {
+                        warn!("Skipping cached order-diff replay line above snapshot height {snapshot_height}: {err}");
+                    }
+                    replayed_lines += 1;
+                }
+                Err(err) => {
+                    warn!("Skipping unparsable cached order-diff replay line: {err}");
+                }
+            },
+            EventSource::Fills => {}
+        }
+    }
+    replayed_lines
 }
 
 pub(crate) struct OrderBookListener {
@@ -200,8 +359,15 @@ pub(crate) struct OrderBookListener {
     features: FeatureSet,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
-    // Only Some when we want it to collect updates
-    fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
+    // Stream batches at or below this height are already represented by the
+    // latest installed snapshot and must not be applied from queued file events.
+    stream_ignore_through_height: u64,
+    // Stream order-diff batches above `stream_ignore_through_height` but at or
+    // below this height may already be represented by a bare snapshot. Apply
+    // them with replay semantics so stale updates cannot roll the snapshot back.
+    stream_replay_guard_through_height: u64,
+    // Only Some while a snapshot task is running and needs live stream replay.
+    snapshot_replay_cache: Option<SnapshotReplayCache>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
@@ -234,7 +400,9 @@ impl OrderBookListener {
             ignore_spot,
             features,
             order_book_state: None,
-            fetched_snapshot_cache: None,
+            stream_ignore_through_height: 0,
+            stream_replay_guard_through_height: 0,
+            snapshot_replay_cache: None,
             internal_message_tx,
             last_l2_broadcast: None,
             pending_l2_changed_coins: HashSet::new(),
@@ -267,33 +435,141 @@ impl OrderBookListener {
         Arc::clone(&self.allbbo_subscription_registry)
     }
 
-    fn begin_caching(&mut self) {
-        self.fetched_snapshot_cache = Some(VecDeque::new());
+    fn begin_snapshot_replay(&mut self) {
+        let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
+        self.snapshot_replay_cache =
+            Some(SnapshotReplayCache { started_book_height, ..SnapshotReplayCache::default() });
     }
 
-    // take the cached updates and stop collecting updates
-    fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.fetched_snapshot_cache.take().unwrap_or_default()
+    fn clear_snapshot_replay(&mut self) {
+        self.snapshot_replay_cache = None;
     }
 
+    fn record_snapshot_replay_line(&mut self, event_source: EventSource, line: &str) {
+        if !matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+            return;
+        }
+
+        let Some(cache) = &mut self.snapshot_replay_cache else { return };
+        if cache.push(event_source, line) {
+            warn!(
+                "Snapshot replay cache overflowed at {} lines / {} bytes; this snapshot will not be installed",
+                cache.lines.len(),
+                cache.total_bytes
+            );
+        }
+    }
+
+    #[cfg(test)]
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
-        // On initial startup, just trust the snapshot and start fresh
-        // Don't try to apply cached updates - they may have gaps
         let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        self.replace_order_book_state(new_order_book, height, height, true);
+        self.snapshot_replay_cache = None;
+        info!("Order book ready at height {}", height);
+    }
+
+    fn replace_order_book_state(
+        &mut self,
+        new_order_book: OrderBookState,
+        replay_cutoff_height: u64,
+        snapshot_height: u64,
+        reset_l2_version: bool,
+    ) {
         self.order_book_state = Some(new_order_book);
+        self.stream_ignore_through_height = self.stream_ignore_through_height.max(replay_cutoff_height);
+        self.stream_replay_guard_through_height = snapshot_height;
         self.last_universe = self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe);
         // The incremental L2 cache references the previous book's coins/levels;
         // drop it so the next broadcast does a full rebuild against the new state.
         self.l2_snapshot_cache = HashMap::new();
         self.l2_prepared_hashes.clear();
-        self.next_l2_version = 1;
+        if reset_l2_version {
+            self.next_l2_version = 1;
+        }
         self.l2_generation = self.l2_generation.wrapping_add(1);
         self.pending_l2_changed_coins.clear();
         self.pending_allbbo_changed_coins.clear();
-        // Clear any stale cache
-        self.fetched_snapshot_cache = None;
-        info!("Order book ready at height {}", height);
+    }
+
+    #[cfg(test)]
+    fn install_snapshot_state(
+        &mut self,
+        new_order_book: OrderBookState,
+        snapshot_height: u64,
+        kind: SnapshotTaskKind,
+    ) -> Result<SnapshotInstallOutcome> {
+        self.install_snapshot_state_with_replay_cutoff(new_order_book, snapshot_height, snapshot_height, kind)
+    }
+
+    fn install_snapshot_state_with_replay_cutoff(
+        &mut self,
+        mut new_order_book: OrderBookState,
+        snapshot_height: u64,
+        replay_cutoff_height: u64,
+        kind: SnapshotTaskKind,
+    ) -> Result<SnapshotInstallOutcome> {
+        let replay_cache = self.snapshot_replay_cache.take().unwrap_or_default();
+        if replay_cache.overflowed {
+            let cached_lines = replay_cache.lines.len();
+            let cached_bytes = replay_cache.total_bytes;
+            if kind == SnapshotTaskKind::Refresh {
+                warn!(
+                    "Skipping background snapshot refresh at height {snapshot_height}: replay cache overflowed \
+                     ({cached_lines} lines / {cached_bytes} bytes)"
+                );
+                return Ok(SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes });
+            }
+            return Err(format!(
+                "Snapshot replay cache overflowed during initial snapshot ({cached_lines} lines / {cached_bytes} bytes)"
+            )
+            .into());
+        }
+
+        if kind == SnapshotTaskKind::Refresh && replay_cutoff_height < replay_cache.started_book_height {
+            warn!(
+                "Skipping background snapshot refresh at height {snapshot_height}: replay cutoff {replay_cutoff_height} \
+                 was behind current book height {} when replay capture started",
+                replay_cache.started_book_height
+            );
+            return Ok(SnapshotInstallOutcome::SkippedStaleSnapshot {
+                snapshot_height,
+                replay_cutoff_height,
+                started_book_height: replay_cache.started_book_height,
+            });
+        }
+
+        let current_time = (kind == SnapshotTaskKind::Refresh)
+            .then(|| self.order_book_state.as_ref().map(OrderBookState::time))
+            .flatten();
+        let replayed_lines = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache);
+        if let Some(current_time) = current_time {
+            if new_order_book.time() < current_time {
+                new_order_book.set_time(current_time);
+            }
+        }
+        let old_universe = self.last_universe.clone();
+        let reset_l2_version = kind == SnapshotTaskKind::Initial;
+        self.replace_order_book_state(new_order_book, replay_cutoff_height, snapshot_height, reset_l2_version);
+        self.broadcast_universe_after_snapshot(old_universe);
+        self.force_snapshot_refresh_updates();
+        info!(
+            "Order book ready at height {snapshot_height}; replay cutoff {replay_cutoff_height}; replayed \
+             {replayed_lines} cached stream lines"
+        );
+        Ok(SnapshotInstallOutcome::Installed { replayed_lines })
+    }
+
+    fn should_ignore_stream_batch(&self, event_source: EventSource, height: u64) -> bool {
+        matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs)
+            && self.features.requires_book_state()
+            && height <= self.stream_ignore_through_height
+    }
+
+    fn should_replay_guard_stream_batch(&self, event_source: EventSource, height: u64) -> bool {
+        matches!(event_source, EventSource::OrderDiffs)
+            && self.features.requires_book_state()
+            && height <= self.stream_replay_guard_through_height
     }
 
     // forcibly grab current snapshot
@@ -303,6 +579,54 @@ impl OrderBookListener {
 
     pub(crate) fn all_bbos(&self) -> Option<(u64, Vec<(Coin, RawBbo)>)> {
         self.order_book_state.as_ref().map(OrderBookState::get_all_bbos)
+    }
+
+    fn broadcast_universe_after_snapshot(&mut self, old_universe: HashSet<Coin>) {
+        let Some(state) = &self.order_book_state else { return };
+        let universe = state.compute_universe();
+        self.last_universe = universe.clone();
+        if universe == old_universe {
+            return;
+        }
+
+        if let Some(tx) = &self.internal_message_tx {
+            if tx.receiver_count() > 0 {
+                drop(tx.send(Arc::new(InternalMessage::Universe { universe })));
+            }
+        }
+    }
+
+    fn force_snapshot_refresh_updates(&mut self) {
+        let Some(tx) = self.internal_message_tx.as_ref().cloned() else { return };
+        if tx.receiver_count() == 0 {
+            return;
+        }
+
+        let Some(state) = &self.order_book_state else { return };
+        let universe = state.compute_universe();
+
+        if self.features.bbo() && !universe.is_empty() {
+            let (time, bbos) = state.get_bbos_for_coins(&universe);
+            if !bbos.is_empty() {
+                drop(tx.send(Arc::new(InternalMessage::BboUpdate { bbos, time })));
+            }
+        }
+
+        if self.features.allbbo() && self.allbbo_subscription_registry.has_active() {
+            let (time, bbos) = state.get_all_bbos();
+            if !bbos.is_empty() {
+                self.last_allbbo_broadcast = Some(Instant::now());
+                drop(tx.send(Arc::new(InternalMessage::AllBboUpdate { bbos, time })));
+            }
+        }
+
+        if self.features.l2book() {
+            let active_keys = self.l2_subscription_registry.active_keys();
+            if !active_keys.is_empty() {
+                self.pending_l2_changed_coins.extend(active_keys.into_iter().map(|key| key.coin));
+                self.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+            }
+        }
     }
 
     fn broadcast_universe_if_changed(&mut self, changed_coins: &HashSet<Coin>) {
@@ -570,6 +894,12 @@ impl OrderBookListener {
             );
             return Ok(());
         }
+        let ignore_for_book_state = self.should_ignore_stream_batch(event_source, height);
+        let replay_guard_for_book_state = !ignore_for_book_state
+            && self.should_replay_guard_stream_batch(event_source, height);
+        if !ignore_for_book_state {
+            self.record_snapshot_replay_line(event_source, &line);
+        }
         if self.features.stats() {
             self.stats.record(&event_batch, height);
         }
@@ -610,7 +940,7 @@ impl OrderBookListener {
                     }
                 }
                 EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
-                if self.features.requires_book_state() {
+                if self.features.requires_book_state() && !ignore_for_book_state {
                     self.order_book_state
                         .as_mut()
                         .map_or_else(|| Ok(HashSet::new()), |state| state.apply_order_statuses_hft(batch))
@@ -636,10 +966,17 @@ impl OrderBookListener {
                     }
                 }
                 EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
-                if self.features.requires_book_state() {
-                    self.order_book_state
-                        .as_mut()
-                        .map_or_else(|| Ok(HashSet::new()), |state| state.apply_order_diffs_hft(batch))
+                if self.features.requires_book_state() && !ignore_for_book_state {
+                    self.order_book_state.as_mut().map_or_else(
+                        || Ok(HashSet::new()),
+                        |state| {
+                            if replay_guard_for_book_state {
+                                state.replay_order_diffs_hft(batch)
+                            } else {
+                                state.apply_order_diffs_hft(batch)
+                            }
+                        },
+                    )
                 } else {
                     Ok(HashSet::new())
                 }
@@ -1022,7 +1359,13 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     });
 
     // Snapshot fetch channel
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
+    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<SnapshotTaskResult>();
+    let refresh_interval = snapshot_refresh_interval(config.snapshot_refresh_hours);
+    if let Some(interval) = refresh_interval {
+        info!("Snapshot refresh enabled every {} seconds", interval.as_secs());
+    } else {
+        info!("Snapshot refresh disabled after startup snapshot");
+    }
 
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(10));
@@ -1034,6 +1377,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let mut stats_ticker = tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_fetch_pending = false;
+    let mut next_refresh_at: Option<Instant> = None;
 
     info!("Main event loop starting");
 
@@ -1091,22 +1435,65 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     None => {
                         return Err("Snapshot fetch task sender dropped".into());
                     }
-                    Some(Err(err)) => {
+                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Initial, result: Err(err), .. }) => {
                         return Err(format!("Abci state reading error: {err}").into());
                     }
-                    Some(Ok(())) => {}
+                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
+                        warn!("Background snapshot refresh failed; keeping current order book: {err}");
+                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                    }
+                    Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
+                        match outcome {
+                            SnapshotInstallOutcome::Installed { replayed_lines } => {
+                                info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
+                            }
+                            SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes } => {
+                                warn!(
+                                    "{kind:?} snapshot was not installed because replay cache overflowed \
+                                     ({cached_lines} lines / {cached_bytes} bytes)"
+                                );
+                            }
+                            SnapshotInstallOutcome::SkippedStaleSnapshot {
+                                snapshot_height,
+                                replay_cutoff_height,
+                                started_book_height,
+                            } => {
+                                warn!(
+                                    "{kind:?} snapshot was not installed because replay cutoff {replay_cutoff_height} \
+                                     for snapshot height {snapshot_height} was behind the served book height \
+                                     {started_book_height} at replay start"
+                                );
+                            }
+                        }
+                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                    }
                 }
             }
 
-            // Periodic snapshot fetch (initial only)
+            // Periodic snapshot fetch: startup snapshot until ready, then recurring refreshes.
             _ = ticker.tick() => {
+                let now = Instant::now();
                 let is_ready = listener.lock().await.is_ready();
-                info!("Ticker: is_ready={}, snapshot_fetch_pending={}", is_ready, snapshot_fetch_pending);
-                if config.features.requires_book_state() && !is_ready && !snapshot_fetch_pending {
+                if config.features.requires_book_state() && is_ready && next_refresh_at.is_none() {
+                    next_refresh_at = refresh_interval.map(|interval| now + interval);
+                }
+                info!(
+                    "Ticker: is_ready={}, snapshot_fetch_pending={}, next_refresh_s={:?}",
+                    is_ready,
+                    snapshot_fetch_pending,
+                    next_refresh_at.map(|refresh_at| refresh_at.saturating_duration_since(now).as_secs())
+                );
+                if let Some(kind) = next_snapshot_trigger(
+                    config.features,
+                    is_ready,
+                    snapshot_fetch_pending,
+                    next_refresh_at,
+                    now,
+                ) {
                     snapshot_fetch_pending = true;
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                    fetch_snapshot(snapshot_config.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                    fetch_snapshot(kind, snapshot_config.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
                 }
             }
         }
@@ -1274,16 +1661,7 @@ mod tests {
         books: &[(&str, &[(u64, &str, &str)])],
         features: FeatureSet,
     ) -> OrderBookListener {
-        let mut snapshot_map = HashMap::new();
-        for (coin, bids) in books {
-            let mut book = OrderBook::new();
-            for (oid, px, sz) in *bids {
-                book.add_order(inner_order(*oid, coin, Side::Bid, px, sz));
-            }
-            snapshot_map.insert(Coin::new(coin), book.to_snapshot());
-        }
-
-        let snapshots = Snapshots::new(snapshot_map);
+        let snapshots = snapshots_from_coin_bids(books);
         let mut listener = OrderBookListener::new(Some(tx), false, features);
         listener.init_from_snapshot(snapshots, 0);
         if !features.l2book() {
@@ -1302,6 +1680,30 @@ mod tests {
         listener
     }
 
+    fn snapshots_from_coin_bids(books: &[(&str, &[(u64, &str, &str)])]) -> Snapshots<InnerL4Order> {
+        let mut snapshot_map = HashMap::new();
+        for (coin, bids) in books {
+            let mut book = OrderBook::new();
+            for (oid, px, sz) in *bids {
+                book.add_order(inner_order(*oid, coin, Side::Bid, px, sz));
+            }
+            snapshot_map.insert(Coin::new(coin), book.to_snapshot());
+        }
+        Snapshots::new(snapshot_map)
+    }
+
+    fn order_book_state_with_bids(books: &[(&str, &[(u64, &str, &str)])], height: u64) -> OrderBookState {
+        order_book_state_with_bids_and_time(books, height, 0)
+    }
+
+    fn order_book_state_with_bids_and_time(
+        books: &[(&str, &[(u64, &str, &str)])],
+        height: u64,
+        time: u64,
+    ) -> OrderBookState {
+        OrderBookState::from_snapshot(snapshots_from_coin_bids(books), height, time, true, false)
+    }
+
     fn listener_without_snapshot(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
         OrderBookListener::new(Some(tx), false, features)
     }
@@ -1311,10 +1713,14 @@ mod tests {
     }
 
     fn update_diff_line(coin: &str, oid: u64, orig_sz: &str, new_sz: &str) -> String {
+        update_diff_line_at_block(coin, oid, orig_sz, new_sz, 1)
+    }
+
+    fn update_diff_line_at_block(coin: &str, oid: u64, orig_sz: &str, new_sz: &str, block_number: u64) -> String {
         serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 1,
+            "block_number": block_number,
             "events": [{
                 "user": "0x0000000000000000000000000000000000000000",
                 "oid": oid,
@@ -1445,6 +1851,516 @@ mod tests {
     ) -> String {
         let prepared = l2_books.get(&default_l2_key(coin)).expect("prepared l2 book");
         prepared.payload().levels()[0].get(level_index).expect("bid level").sz().to_string()
+    }
+
+    fn current_bid_sz(listener: &OrderBookListener, coin: &str) -> String {
+        let state = listener.order_book_state.as_ref().expect("state initialized");
+        let coins = HashSet::from([Coin::new(coin)]);
+        let (_time, bbos) = state.get_bbos_for_coins(&coins);
+        bbos.get(&Coin::new(coin)).expect("coin bbo").0.as_ref().expect("bid").1.to_str()
+    }
+
+    #[test]
+    fn snapshot_refresh_interval_treats_zero_as_disabled() {
+        assert_eq!(snapshot_refresh_interval(0), None);
+        assert_eq!(snapshot_refresh_interval(4).expect("enabled").as_secs(), 14_400);
+    }
+
+    #[test]
+    fn snapshot_scheduler_triggers_initial_and_refresh_only_when_due() {
+        let now = Instant::now();
+        assert_eq!(next_snapshot_trigger(features("bbo"), false, false, None, now), Some(SnapshotTaskKind::Initial));
+        assert_eq!(
+            next_snapshot_trigger(features("bbo"), true, false, Some(now), now),
+            Some(SnapshotTaskKind::Refresh)
+        );
+        assert_eq!(next_snapshot_trigger(features("bbo"), true, false, None, now), None);
+        assert_eq!(next_snapshot_trigger(features("bbo"), true, false, Some(now + Duration::from_secs(1)), now), None);
+        assert_eq!(next_snapshot_trigger(features("bbo"), false, true, None, now), None);
+        assert_eq!(next_snapshot_trigger(features("trades"), true, false, Some(now), now), None);
+    }
+
+    #[test]
+    fn embedded_height_snapshot_does_not_require_visor_height() {
+        let (replay_cutoff_height, visor_heights) = snapshot_replay_cutoff_height(
+            SnapshotHeightSource::Embedded,
+            42,
+            Err("missing before visor".into()),
+            Err("missing after visor".into()),
+        )
+        .expect("embedded height does not need visor fallback");
+
+        assert_eq!(replay_cutoff_height, 42);
+        assert_eq!(visor_heights, None);
+    }
+
+    #[test]
+    fn bare_snapshot_requires_visor_heights() {
+        assert!(
+            snapshot_replay_cutoff_height(
+                SnapshotHeightSource::Visor,
+                42,
+                Err("missing before visor".into()),
+                Ok(43),
+            )
+            .is_err()
+        );
+        assert!(
+            snapshot_replay_cutoff_height(
+                SnapshotHeightSource::Visor,
+                42,
+                Ok(41),
+                Err("missing after visor".into()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_snapshot_uses_lower_observed_visor_height_as_replay_cutoff() {
+        let (replay_cutoff_height, visor_heights) =
+            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Ok(40), Ok(42))
+                .expect("visor heights are available");
+
+        assert_eq!(replay_cutoff_height, 40);
+        assert_eq!(visor_heights, Some((40, 42)));
+    }
+
+    #[test]
+    fn initial_snapshot_ignores_cached_and_queued_lines_at_or_below_snapshot_height() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "4", 10), EventSource::OrderDiffs)
+            .expect("cached diff records during startup replay");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 20);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 20, 20, SnapshotTaskKind::Initial)
+            .expect("initial snapshot installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "2");
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "4", "5", 12), EventSource::OrderDiffs)
+            .expect("queued diff below snapshot height is ignored");
+
+        assert_eq!(current_bid_sz(&listener, "BTC"), "2");
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "5", 21), EventSource::OrderDiffs)
+            .expect("queued diff above snapshot height applies");
+
+        assert_eq!(current_bid_sz(&listener, "BTC"), "5");
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn initial_snapshot_replays_cached_lines_above_snapshot_height() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "4", 21), EventSource::OrderDiffs)
+            .expect("cached diff records during startup replay");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 20);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 20, 20, SnapshotTaskKind::Initial)
+            .expect("initial snapshot installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+    }
+
+    #[test]
+    fn initial_visor_snapshot_uses_lower_replay_cutoff_when_height_advances() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "4", 21), EventSource::OrderDiffs)
+            .expect("cached diff records during startup replay");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 22, 20, SnapshotTaskKind::Initial)
+            .expect("initial visor snapshot installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        assert!(listener.snapshot_replay_cache.is_none());
+    }
+
+    #[test]
+    fn queued_line_above_visor_replay_cutoff_applies_after_swap() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 22, 20, SnapshotTaskKind::Initial)
+            .expect("initial visor snapshot installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "5", 21), EventSource::OrderDiffs)
+            .expect("queued diff above replay cutoff applies after swap");
+
+        assert_eq!(current_bid_sz(&listener, "BTC"), "5");
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn queued_line_in_visor_guard_window_does_not_roll_back_snapshot() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "5")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 22, 20, SnapshotTaskKind::Initial)
+            .expect("initial visor snapshot installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 21), EventSource::OrderDiffs)
+            .expect("queued diff in snapshot window is replay-guarded");
+
+        assert_eq!(current_bid_sz(&listener, "BTC"), "5");
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn queued_line_above_snapshot_height_uses_live_semantics_after_swap() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "5")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 22, 20, SnapshotTaskKind::Initial)
+            .expect("initial visor snapshot installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 23), EventSource::OrderDiffs)
+            .expect("queued diff above snapshot height uses live self-healing semantics");
+
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn replay_update_with_mismatched_orig_size_does_not_roll_back_snapshot() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 21), EventSource::OrderDiffs)
+            .expect("cached diff records during startup replay");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "5")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(new_state, 22, 20, SnapshotTaskKind::Initial)
+            .expect("initial visor snapshot installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "5");
+    }
+
+    #[test]
+    fn refresh_with_visor_snapshot_height_installs() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 13), EventSource::OrderDiffs)
+            .expect("live diff applies");
+        drop(drain_all(&mut rx));
+
+        let refreshed_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 20);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(refreshed_state, 20, 20, SnapshotTaskKind::Refresh)
+            .expect("visor-height refresh installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "2");
+        assert!(listener.snapshot_replay_cache.is_none());
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn refresh_visor_snapshot_uses_lower_replay_cutoff_when_height_advances() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 21), EventSource::OrderDiffs)
+            .expect("live diff applies");
+        drop(drain_all(&mut rx));
+
+        let refreshed_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(refreshed_state, 22, 20, SnapshotTaskKind::Refresh)
+            .expect("refresh installs with conservative replay cutoff");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        assert!(listener.snapshot_replay_cache.is_none());
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn refresh_visor_snapshot_with_cutoff_below_replay_start_is_skipped() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 13), EventSource::OrderDiffs)
+            .expect("live diff applies");
+        drop(drain_all(&mut rx));
+
+        let refreshed_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 22);
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(refreshed_state, 22, 11, SnapshotTaskKind::Refresh)
+            .expect("unsafe refresh skips without failing");
+
+        assert_eq!(
+            outcome,
+            SnapshotInstallOutcome::SkippedStaleSnapshot {
+                snapshot_height: 22,
+                replay_cutoff_height: 11,
+                started_book_height: 12,
+            }
+        );
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        assert!(listener.snapshot_replay_cache.is_none());
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn refresh_replay_applies_cached_lines_above_snapshot_height() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "1", "4", 11), EventSource::OrderDiffs)
+            .expect("live diff applies");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 10);
+        let outcome =
+            listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+    }
+
+    #[test]
+    fn refresh_replay_ignores_cached_lines_at_or_below_snapshot_height() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "1", "4", 10), EventSource::OrderDiffs)
+            .expect("live diff applies");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let outcome =
+            listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "2");
+    }
+
+    #[test]
+    fn refresh_replay_applies_cached_lines_above_captured_watermark() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "1", "4", 10), EventSource::OrderDiffs)
+            .expect("live diff applies");
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 9);
+        let outcome = listener
+            .install_snapshot_state(new_state, 9, SnapshotTaskKind::Refresh)
+            .expect("refresh installs with conservative watermark");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+    }
+
+    #[test]
+    fn refresh_snapshot_below_replay_start_height_is_skipped() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.replace_order_book_state(order_book_state_with_bids(&[("BTC", &[(1, "100", "3")])], 12), 12, 12, false);
+        listener.begin_snapshot_replay();
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 13), EventSource::OrderDiffs)
+            .expect("live diff applies");
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        drop(drain_all(&mut rx));
+
+        let stale_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let outcome = listener
+            .install_snapshot_state(stale_state, 10, SnapshotTaskKind::Refresh)
+            .expect("stale refresh should skip without failing");
+
+        assert_eq!(
+            outcome,
+            SnapshotInstallOutcome::SkippedStaleSnapshot {
+                snapshot_height: 10,
+                replay_cutoff_height: 10,
+                started_book_height: 12,
+            }
+        );
+        assert_eq!(current_bid_sz(&listener, "BTC"), "4");
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn refresh_without_replay_preserves_current_book_time() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.replace_order_book_state(
+            order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "1")])], 7, 123_456),
+            7,
+            7,
+            false,
+        );
+        listener.begin_snapshot_replay();
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let outcome =
+            listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(listener.order_book_state.as_ref().expect("state initialized").time(), 123_456);
+        assert!(
+            drain_all(&mut rx)
+                .iter()
+                .any(|msg| { matches!(msg.as_ref(), InternalMessage::BboUpdate { time: 123_456, .. }) })
+        );
+    }
+
+    #[test]
+    fn refresh_replay_overflow_skips_refresh_but_initial_overflow_is_fatal() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.snapshot_replay_cache =
+            Some(SnapshotReplayCache { overflowed: true, ..SnapshotReplayCache::default() });
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let outcome =
+            listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh overflow skips");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines: 0, cached_bytes: 0 });
+        assert_eq!(current_bid_sz(&listener, "BTC"), "1");
+
+        listener.snapshot_replay_cache =
+            Some(SnapshotReplayCache { overflowed: true, ..SnapshotReplayCache::default() });
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        assert!(listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Initial).is_err());
+    }
+
+    #[test]
+    fn stream_batches_at_or_below_snapshot_height_preserve_raw_streams_after_swap() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("all"));
+        listener.begin_snapshot_replay();
+
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "1", "4", 9), EventSource::OrderDiffs)
+            .expect("stale queued diff preserves raw stream but skips book state");
+        assert_eq!(current_bid_sz(&listener, "BTC"), "2");
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+
+        listener
+            .process_data_hft(
+                order_status_line("BTC", 1, "0x0000000000000000000000000000000000000001"),
+                EventSource::OrderStatuses,
+            )
+            .expect("stale queued status preserves raw stream but skips book state");
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+
+        listener
+            .process_data_hft(update_diff_line_at_block("BTC", 1, "2", "5", 11), EventSource::OrderDiffs)
+            .expect("fresh diff applies");
+        assert_eq!(current_bid_sz(&listener, "BTC"), "5");
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn refresh_swap_defers_l2_update_to_flush_without_resetting_versions() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+        listener.allbbo_subscription_registry.register();
+
+        listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+        let first_l2 = drain_latest_l2(&mut rx).expect("first l2 update");
+        let first_version = match first_l2.as_ref() {
+            InternalMessage::L2Update { l2_books } => {
+                l2_books.get(&default_l2_key("BTC")).expect("prepared l2 book").version()
+            }
+            _ => unreachable!("drain_latest_l2 only returns L2 updates"),
+        };
+
+        listener.begin_snapshot_replay();
+        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+
+        let messages = drain_all(&mut rx);
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
+        assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+
+        listener.flush_l2_if_due();
+        let msg = drain_latest_l2(&mut rx).expect("scheduled l2 refresh update");
+        let l2_books = match msg.as_ref() {
+            InternalMessage::L2Update { l2_books } => l2_books,
+            _ => unreachable!("drain_latest_l2 only returns L2 updates"),
+        };
+        let prepared = l2_books.get(&default_l2_key("BTC")).expect("prepared l2 book");
+        assert!(prepared.version() > first_version, "refresh must not reset versions for existing clients");
+        assert_eq!(prepared.payload().levels()[0][0].sz().to_string(), "2");
     }
 
     #[test]

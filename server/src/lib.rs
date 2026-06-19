@@ -232,6 +232,9 @@ pub struct ServerConfig {
     pub snapshot_output_path: Option<PathBuf>,
     /// Path to visor_abci_state.json (optional)
     pub visor_state_path: Option<PathBuf>,
+    /// Periodically refresh the in-memory order book from a fresh snapshot every N hours.
+    /// 0 = disabled after the startup snapshot.
+    pub snapshot_refresh_hours: u64,
     /// Port for Prometheus metrics endpoint (0 to disable)
     pub metrics_port: u16,
     /// Enabled WebSocket features and the upstream processing required by them

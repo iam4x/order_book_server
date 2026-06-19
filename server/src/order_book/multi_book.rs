@@ -24,6 +24,18 @@ impl<O> Snapshots<O> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotHeightSource {
+    Embedded,
+    Visor,
+}
+
+pub(crate) struct LoadedSnapshots<O> {
+    pub(crate) height: u64,
+    pub(crate) height_source: SnapshotHeightSource,
+    pub(crate) snapshots: Snapshots<O>,
+}
+
 #[derive(Clone)]
 pub(crate) struct OrderBooks<O> {
     order_books: BTreeMap<Coin, OrderBook<O>>,
@@ -87,6 +99,10 @@ impl<O: InnerOrder> OrderBooks<O> {
         success
     }
 
+    pub(crate) fn order_sz(&self, oid: &Oid, coin: &Coin) -> Option<Sz> {
+        self.order_books.get(coin)?.order_sz(oid)
+    }
+
     /// Get BBO for specific coins only - faster for selective broadcast
     /// Only computes BBO for coins in the set, avoiding iteration over all coins
     #[must_use]
@@ -141,47 +157,65 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-/// Load snapshots from CLI-generated JSON (without height prefix)
-/// Height is read separately from visor_abci_state.json
-pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
+fn snapshots_from_cli_entries<O, R>(snapshot: Vec<(String, [Vec<R>; 2])>) -> Result<Snapshots<O>>
+where
+    O: TryFrom<R, Error = Error>,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    Ok(Snapshots::new(
+        snapshot
+            .into_iter()
+            .map(|(coin, [bids, asks])| {
+                let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                Ok((Coin::new(&coin), Snapshot([bids, asks])))
+            })
+            .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
+    ))
+}
+
+/// Load snapshots from CLI-generated JSON. Some hl-node builds emit
+/// `[height, snapshot]`; older/current builds emit only the bare snapshot array,
+/// which the caller pairs with the current visor height.
+pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, fallback_height: u64) -> Result<LoadedSnapshots<O>>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     #[allow(clippy::type_complexity)]
+    if let Ok((height, snapshot)) = serde_json::from_str::<(u64, Vec<(String, [Vec<R>; 2])>)>(str) {
+        return Ok(LoadedSnapshots {
+            height,
+            height_source: SnapshotHeightSource::Embedded,
+            snapshots: snapshots_from_cli_entries(snapshot)?,
+        });
+    }
+
+    #[allow(clippy::type_complexity)]
     let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
-    Ok((
-        height,
-        Snapshots::new(
-            snapshot
-                .into_iter()
-                .map(|(coin, [bids, asks])| {
-                    let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    Ok((Coin::new(&coin), Snapshot([bids, asks])))
-                })
-                .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
-        ),
-    ))
+    Ok(LoadedSnapshots {
+        height: fallback_height,
+        height_source: SnapshotHeightSource::Visor,
+        snapshots: snapshots_from_cli_entries(snapshot)?,
+    })
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state
-pub(crate) async fn load_snapshots_from_cli_json<O, R>(
+pub(crate) async fn read_visor_height(visor_state_path: &Path) -> Result<u64> {
+    let visor_state = read_to_string(visor_state_path).await?;
+    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
+    visor["height"].as_u64().ok_or("Missing height in visor state".into())
+}
+
+pub(crate) async fn load_snapshots_from_cli_json_at_height<O, R>(
     snapshot_path: &Path,
-    visor_state_path: &Path,
-) -> Result<(u64, Snapshots<O>)>
+    fallback_height: u64,
+) -> Result<LoadedSnapshots<O>>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    // Read height from visor_abci_state.json
-    let visor_state = read_to_string(visor_state_path).await?;
-    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
-    let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
-
-    // Read snapshot
     let file_contents = read_to_string(snapshot_path).await?;
-    load_snapshots_from_cli_str(&file_contents, height)
+    load_snapshots_from_cli_str(&file_contents, fallback_height)
 }
 
 #[cfg(test)]
@@ -405,6 +439,25 @@ mod tests {
     #[test]
     fn test_deserialization() -> Result<()> {
         load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_loader_marks_embedded_height_as_verified() -> Result<()> {
+        let loaded = super::load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON, 999)?;
+
+        assert_eq!(loaded.height, 100);
+        assert_eq!(loaded.height_source, super::SnapshotHeightSource::Embedded);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_loader_marks_bare_snapshot_height_as_visor() -> Result<()> {
+        let loaded =
+            super::load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(r#"[["BTC",[[],[]]]]"#, 999)?;
+
+        assert_eq!(loaded.height, 999);
+        assert_eq!(loaded.height_source, super::SnapshotHeightSource::Visor);
         Ok(())
     }
 

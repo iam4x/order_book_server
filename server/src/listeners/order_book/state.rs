@@ -26,6 +26,12 @@ pub(super) struct OrderBookState {
     pending_new_diffs: HashMap<Oid, crate::order_book::types::Sz>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OrderDiffApplyMode {
+    Live,
+    Replay,
+}
+
 impl OrderBookState {
     pub(super) fn from_snapshot(
         snapshot: Snapshots<InnerL4Order>,
@@ -50,6 +56,10 @@ impl OrderBookState {
 
     pub(super) const fn time(&self) -> u64 {
         self.time
+    }
+
+    pub(super) fn set_time(&mut self, time: u64) {
+        self.time = time;
     }
 
     // forcibly take snapshot - (time, height, snapshot)
@@ -207,6 +217,18 @@ impl OrderBookState {
     /// Uses bidirectional caching - if status already arrived, add order immediately
     /// Returns the set of coins that were modified (for selective BBO broadcast)
     pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
+        self.apply_order_diffs_hft_inner(batch, OrderDiffApplyMode::Live)
+    }
+
+    pub(super) fn replay_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
+        self.apply_order_diffs_hft_inner(batch, OrderDiffApplyMode::Replay)
+    }
+
+    fn apply_order_diffs_hft_inner(
+        &mut self,
+        batch: Batch<NodeDataOrderDiff>,
+        mode: OrderDiffApplyMode,
+    ) -> Result<HashSet<Coin>> {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
@@ -243,9 +265,34 @@ impl OrderBookState {
                         self.pending_new_diffs.insert(oid.clone(), sz);
                     }
                 }
-                InnerOrderDiff::Update { new_sz, .. } => {
-                    let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
-                    changed_coins.insert(coin);
+                InnerOrderDiff::Update { orig_sz, new_sz } => {
+                    if mode == OrderDiffApplyMode::Live {
+                        let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
+                        changed_coins.insert(coin);
+                    } else {
+                        match self.order_book.order_sz(&oid, &coin) {
+                            Some(current_sz) if current_sz == orig_sz => {
+                                if self.order_book.modify_sz(oid, coin.clone(), new_sz) {
+                                    changed_coins.insert(coin);
+                                }
+                            }
+                            Some(current_sz) if current_sz == new_sz => {
+                                log::debug!("Ignoring duplicate OrderDiff::Update for oid={oid:?} coin={coin:?}");
+                            }
+                            Some(current_sz) => {
+                                log::debug!(
+                                    "Skipping stale replayed OrderDiff::Update for oid={oid:?} coin={coin:?}: current \
+                                     size {current_sz:?} did not match orig {orig_sz:?} or new {new_sz:?}"
+                                );
+                            }
+                            None => {
+                                log::debug!(
+                                    "Skipping replayed OrderDiff::Update for unknown oid={oid:?} coin={coin:?}; order \
+                                     is absent"
+                                );
+                            }
+                        }
+                    }
                 }
                 InnerOrderDiff::Remove => {
                     let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
@@ -264,8 +311,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        order_book::multi_book::Snapshots,
-        types::{L4Order, OrderDiff, inner::InnerL4Order},
+        order_book::{Sz, multi_book::Snapshots},
+        types::{L4Order, OrderDiff},
     };
 
     fn empty_state() -> OrderBookState {
@@ -413,6 +460,44 @@ mod tests {
             make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
         assert!(changed.contains(&Coin::new("BTC")));
+    }
+
+    #[test]
+    fn test_live_diff_update_with_mismatched_orig_size_still_applies() {
+        let mut state = empty_state();
+        let status = make_order_status("BTC", 1, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        let update =
+            make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "3.0".to_string(), new_sz: "4.0".to_string() });
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+
+        let coins = HashSet::from([Coin::new("BTC")]);
+        let (_time, bbos) = state.get_bbos_for_coins(&coins);
+        let bid_sz = bbos.get(&Coin::new("BTC")).expect("BTC bbo").0.as_ref().expect("bid").1;
+        assert!(changed.contains(&Coin::new("BTC")));
+        assert_eq!(bid_sz, Sz::parse_from_str("4.0").unwrap());
+    }
+
+    #[test]
+    fn test_replay_diff_update_with_mismatched_orig_size_is_ignored() {
+        let mut state = empty_state();
+        let status = make_order_status("BTC", 1, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "5.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        let stale_update =
+            make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "3.0".to_string(), new_sz: "4.0".to_string() });
+        let changed = state.replay_order_diffs_hft(make_diff_batch(vec![stale_update])).unwrap();
+
+        let coins = HashSet::from([Coin::new("BTC")]);
+        let (_time, bbos) = state.get_bbos_for_coins(&coins);
+        let bid_sz = bbos.get(&Coin::new("BTC")).expect("BTC bbo").0.as_ref().expect("bid").1;
+        assert!(changed.is_empty());
+        assert_eq!(bid_sz, Sz::parse_from_str("5.0").unwrap());
     }
 
     #[test]

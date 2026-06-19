@@ -117,6 +117,10 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         if let Some(sid) = self.key_to_sid.get(key) { Some(&mut self.slab[*sid].value) } else { None }
     }
 
+    pub(crate) fn node_value(&self, key: &K) -> Option<&T> {
+        self.key_to_sid.get(key).map(|sid| &self.slab[*sid].value)
+    }
+
     #[must_use]
     pub(crate) fn to_vec(&self) -> Vec<&T> {
         let mut res = Vec::new();

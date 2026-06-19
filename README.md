@@ -109,7 +109,7 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
 **`direct`** - Use when your node runs directly on the host via systemctl or bare metal. The server calls the `hl-node` binary directly on the host to generate the snapshot.
 
-After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify. No further snapshots are needed unless the server restarts.
+After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify. By default it also refreshes the in-memory order book from a fresh background snapshot every 4 hours to bound long-running drift without disconnecting clients. Snapshot output with an embedded height uses that height as the replay cutoff; current bare snapshot output is paired with `visor_abci_state.json`. If the visor height changes while generating a bare snapshot, the server uses the lower observed visor height as a conservative replay cutoff, replays stream batches above that height, and keeps queued batches above that height eligible after the swap. Set `--snapshot-refresh-hours 0` to disable recurring refreshes.
 
 ### Feature Selection
 
@@ -148,6 +148,7 @@ If a client subscribes to a disabled channel, the server returns an error and do
 | `--abci-state-path` | auto | Path to `abci_state.rmp`. Auto-detected at `<data-dir>/hl/hyperliquid_data/abci_state.rmp` in direct mode. Override if your node stores state in a non-standard location |
 | `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
 | `--visor-state-path` | auto | Path to `visor_abci_state.json`, which contains the current block height. Auto-detected relative to `--data-dir`. Override if your visor state is in a non-standard location |
+| `--snapshot-refresh-hours` | `4` | Refresh the in-memory order book from a new background snapshot every N hours. `0` disables recurring refreshes after startup |
 
 ### Market Types
 
@@ -351,7 +352,7 @@ The Hyperliquid node must run with **all** of these flags enabled:
 │                      │     │  ┌──────────▼───────────────────┐           │
 │  snapshot via:       │     │  │ OrderBook State              │           │
 │  hl-node CLI ◀───────│─────│  │  - L4 in-memory book         │           │
-│  (startup only)      │     │  │  - L2 snapshot computation   │           │
+│  (startup + refresh) │     │  │  - L2 snapshot computation   │           │
 │                      │     │  │  - BBO deduplication         │           │
 │                      │     │  └──────────┬───────────────────┘           │
 │                      │     │             │ broadcast channel             │
@@ -372,7 +373,8 @@ The Hyperliquid node must run with **all** of these flags enabled:
 2. Three parallel inotify file watchers detect changes immediately (one per event source)
 3. Events are bridged from crossbeam channels (blocking I/O threads) to the tokio async runtime
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
-5. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication
+5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
+6. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication
 
 ## Performance
 

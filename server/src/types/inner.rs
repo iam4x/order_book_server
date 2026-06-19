@@ -188,7 +188,7 @@ impl From<InnerLevel> for Level {
 #[derive(Debug, Clone)]
 pub(crate) enum InnerOrderDiff {
     New { sz: Sz },
-    Update { _orig_sz: Sz, new_sz: Sz },
+    Update { orig_sz: Sz, new_sz: Sz },
     Remove,
 }
 
@@ -199,7 +199,7 @@ impl TryFrom<OrderDiff> for InnerOrderDiff {
         Ok(match value {
             OrderDiff::New { sz } => Self::New { sz: Sz::parse_from_str(&sz)? },
             OrderDiff::Update { orig_sz, new_sz } => {
-                Self::Update { _orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
+                Self::Update { orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
             }
             OrderDiff::Remove => Self::Remove,
         })
@@ -348,7 +348,14 @@ mod tests {
     fn test_order_diff_update() {
         let diff = OrderDiff::Update { orig_sz: "2.0".to_string(), new_sz: "1.0".to_string() };
         let inner: InnerOrderDiff = diff.try_into().unwrap();
-        assert!(matches!(inner, InnerOrderDiff::Update { new_sz, .. } if new_sz == Sz::parse_from_str("1.0").unwrap()));
+        assert!(
+            matches!(
+                inner,
+                InnerOrderDiff::Update { orig_sz, new_sz }
+                    if orig_sz == Sz::parse_from_str("2.0").unwrap()
+                        && new_sz == Sz::parse_from_str("1.0").unwrap()
+            )
+        );
     }
 
     #[test]

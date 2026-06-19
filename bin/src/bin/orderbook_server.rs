@@ -154,6 +154,11 @@ struct Args {
     #[arg(long)]
     visor_state_path: Option<PathBuf>,
 
+    /// Refresh the in-memory order book from a fresh snapshot every N hours.
+    /// 0 disables recurring refreshes after the startup snapshot.
+    #[arg(long, default_value = "4")]
+    snapshot_refresh_hours: u64,
+
     /// Port for Prometheus metrics endpoint (0 to disable)
     #[arg(long, default_value = "9090")]
     metrics_port: u16,
@@ -231,6 +236,7 @@ async fn main() -> Result<()> {
         abci_state_path: args.abci_state_path,
         snapshot_output_path: args.snapshot_output_path,
         visor_state_path: args.visor_state_path,
+        snapshot_refresh_hours: args.snapshot_refresh_hours,
         metrics_port: args.metrics_port,
         features: args.features,
         l2book_heartbeat_ms: args.l2book_heartbeat_ms,
@@ -257,6 +263,14 @@ async fn main() -> Result<()> {
             }
         }
     }
+    println!(
+        "  Snapshot refresh: {}",
+        if config.snapshot_refresh_hours == 0 {
+            "disabled".to_string()
+        } else {
+            format!("every {}h", config.snapshot_refresh_hours)
+        }
+    );
     if let Some(ref dir) = config.data_dir {
         println!("  Data dir: {}", dir.display());
     }
@@ -377,6 +391,29 @@ mod tests {
 
         assert_eq!(args.features, FeatureSet::all());
         assert!(args.features.stats());
+    }
+
+    #[test]
+    fn cli_snapshot_refresh_defaults_to_four_hours() {
+        let args = Args::try_parse_from(["orderbook_server"]).expect("default args should parse");
+
+        assert_eq!(args.snapshot_refresh_hours, 4);
+    }
+
+    #[test]
+    fn cli_parses_snapshot_refresh_hours() {
+        let args = Args::try_parse_from(["orderbook_server", "--snapshot-refresh-hours", "12"])
+            .expect("snapshot refresh hours should parse");
+
+        assert_eq!(args.snapshot_refresh_hours, 12);
+    }
+
+    #[test]
+    fn cli_allows_disabling_snapshot_refresh() {
+        let args = Args::try_parse_from(["orderbook_server", "--snapshot-refresh-hours", "0"])
+            .expect("snapshot refresh hours should parse");
+
+        assert_eq!(args.snapshot_refresh_hours, 0);
     }
 
     #[test]

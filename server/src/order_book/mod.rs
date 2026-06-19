@@ -201,6 +201,15 @@ impl<O: InnerOrder> OrderBook<O> {
         false
     }
 
+    pub(crate) fn order_sz(&self, oid: &Oid) -> Option<Sz> {
+        let (side, px) = self.oid_to_side_px.get(oid).copied()?;
+        let map = match side {
+            Side::Ask => &self.asks,
+            Side::Bid => &self.bids,
+        };
+        map.get(&px)?.node_value(oid).map(InnerOrder::sz)
+    }
+
     /// Get best bid and best ask in O(1) without computing full L2 snapshot.
     /// Returns (best_bid, best_ask) where each is (price, total_size, order_count).
     #[must_use]
