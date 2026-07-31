@@ -1,5 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -47,10 +50,12 @@ mod utils;
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
 const L2_FLUSH_TICK_MS: u64 = 10;
 const ALLBBO_BROADCAST_THROTTLE_MS: u64 = 50;
-const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 1_000_000;
-const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 256 * 1024 * 1024;
-const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 2_000_000;
-const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 512 * 1024 * 1024;
+// Replay is journaled to a temporary file instead of retaining a second copy of
+// every JSON line in RAM. These are disk-safety limits, not memory budgets.
+const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 10_000_000;
+const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 20_000_000;
+const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotTaskKind {
@@ -68,12 +73,6 @@ enum SnapshotInstallOutcome {
     Installed { replayed_lines: usize },
     SkippedReplayOverflow { cached_lines: usize, cached_bytes: usize },
     SkippedStaleSnapshot { snapshot_height: u64, replay_cutoff_height: u64, started_book_height: u64 },
-}
-
-#[derive(Debug)]
-struct SnapshotReplayLine {
-    event_source: EventSource,
-    line: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,34 +102,115 @@ impl Default for SnapshotReplayLimits {
 
 #[derive(Debug, Default)]
 struct SnapshotReplayCache {
-    lines: VecDeque<SnapshotReplayLine>,
+    writer: Option<BufWriter<File>>,
+    journal_path: Option<PathBuf>,
+    line_count: usize,
     total_bytes: usize,
     overflowed: bool,
+    failure_reason: Option<String>,
     started_book_height: u64,
     limits: SnapshotReplayLimits,
 }
 
 impl SnapshotReplayCache {
-    fn new(started_book_height: u64, kind: SnapshotTaskKind) -> Self {
-        Self { started_book_height, limits: SnapshotReplayLimits::for_kind(kind), ..Self::default() }
+    fn new(started_book_height: u64, kind: SnapshotTaskKind) -> std::io::Result<Self> {
+        let (file, journal_path) = create_replay_journal()?;
+        Ok(Self {
+            writer: Some(BufWriter::new(file)),
+            journal_path,
+            line_count: 0,
+            total_bytes: 0,
+            overflowed: false,
+            failure_reason: None,
+            started_book_height,
+            limits: SnapshotReplayLimits::for_kind(kind),
+        })
     }
 
-    fn push(&mut self, event_source: EventSource, line: &str) -> bool {
+    fn push(&mut self, event_source: EventSource, line: &str) -> Option<String> {
         if self.overflowed {
-            return false;
+            return None;
         }
 
-        let next_lines = self.lines.len().saturating_add(1);
+        let next_lines = self.line_count.saturating_add(1);
         let next_bytes = self.total_bytes.saturating_add(line.len());
         if next_lines > self.limits.max_lines || next_bytes > self.limits.max_bytes {
             self.overflowed = true;
-            return true;
+            self.failure_reason = Some(format!(
+                "replay journal exceeded its limits of {} lines / {} bytes",
+                self.limits.max_lines, self.limits.max_bytes
+            ));
+            return self.failure_reason.clone();
         }
 
+        let tag = match event_source {
+            EventSource::OrderStatuses => b'S',
+            EventSource::OrderDiffs => b'D',
+            EventSource::Fills => return None,
+        };
+        let write_result = self.writer.as_mut().map_or_else(
+            || Err(std::io::Error::other("replay journal is unavailable")),
+            |writer| {
+                writer
+                    .write_all(&[tag])
+                    .and_then(|()| writer.write_all(line.as_bytes()))
+                    .and_then(|()| writer.write_all(b"\n"))
+            },
+        );
+        if let Err(err) = write_result {
+            self.overflowed = true;
+            self.failure_reason = Some(format!("could not write replay journal: {err}"));
+            return self.failure_reason.clone();
+        }
+
+        self.line_count = next_lines;
         self.total_bytes = next_bytes;
-        self.lines.push_back(SnapshotReplayLine { event_source, line: line.to_string() });
-        false
+        None
     }
+}
+
+impl Drop for SnapshotReplayCache {
+    fn drop(&mut self) {
+        // Close the file before unlinking it so cleanup also works on platforms
+        // that do not allow deleting an open file.
+        drop(self.writer.take());
+        if let Some(path) = self.journal_path.take() {
+            drop(fs::remove_file(path));
+        }
+    }
+}
+
+fn create_replay_journal() -> std::io::Result<(File, Option<PathBuf>)> {
+    static NEXT_REPLAY_JOURNAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    for _ in 0..100 {
+        let id = NEXT_REPLAY_JOURNAL_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!("orderbook-server-replay-{}-{id}.journal", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                // Unix keeps the inode alive through the open file descriptor, so
+                // unlink immediately to avoid stale multi-GB journals after SIGKILL.
+                #[cfg(unix)]
+                {
+                    fs::remove_file(&path)?;
+                    return Ok((file, None));
+                }
+                #[cfg(not(unix))]
+                return Ok((file, Some(path)));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not allocate a unique snapshot replay journal"))
 }
 
 #[derive(Default)]
@@ -284,14 +364,11 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        // Start replay capture before generating the snapshot so the new state can
-        // catch up to events written while hl-node is reading abci_state.rmp.
-        {
-            let mut listener = listener.lock().await;
-            listener.begin_snapshot_replay_for(kind);
-        };
-
         let res: Result<SnapshotInstallOutcome> = async {
+            // Start replay capture before generating the snapshot so the new state can
+            // catch up to events written while hl-node is reading abci_state.rmp.
+            listener.lock().await.begin_snapshot_replay_for(kind)?;
+
             let visor_path = get_visor_path(&snapshot_config);
             let visor_height_before = read_visor_height(&visor_path).await;
             let output_fln = process_rmp_file(&snapshot_config).await?;
@@ -340,11 +417,31 @@ fn fetch_snapshot(
     });
 }
 
-fn replay_snapshot_cache(state: &mut OrderBookState, snapshot_height: u64, replay_cache: SnapshotReplayCache) -> usize {
+fn replay_snapshot_cache(
+    state: &mut OrderBookState,
+    snapshot_height: u64,
+    mut replay_cache: SnapshotReplayCache,
+) -> Result<usize> {
+    let Some(writer) = replay_cache.writer.take() else {
+        if replay_cache.line_count == 0 {
+            return Ok(0);
+        }
+        return Err("Snapshot replay journal was unavailable".into());
+    };
+    let mut file = writer.into_inner().map_err(std::io::IntoInnerError::into_error)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
     let mut replayed_lines = 0;
-    for replay_line in replay_cache.lines {
-        match replay_line.event_source {
-            EventSource::OrderStatuses => match sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(&replay_line.line) {
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let Some((tag, json)) = line.as_bytes().split_first() else { continue };
+        let json = std::str::from_utf8(json)?.trim_end_matches(['\r', '\n']);
+        match tag {
+            b'S' => match sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(json) {
                 Ok(batch) => {
                     if batch.block_number() <= snapshot_height {
                         continue;
@@ -360,7 +457,7 @@ fn replay_snapshot_cache(state: &mut OrderBookState, snapshot_height: u64, repla
                     warn!("Skipping unparsable cached order-status replay line: {err}");
                 }
             },
-            EventSource::OrderDiffs => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(&replay_line.line) {
+            b'D' => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(json) {
                 Ok(batch) => {
                     if batch.block_number() <= snapshot_height {
                         continue;
@@ -374,10 +471,10 @@ fn replay_snapshot_cache(state: &mut OrderBookState, snapshot_height: u64, repla
                     warn!("Skipping unparsable cached order-diff replay line: {err}");
                 }
             },
-            EventSource::Fills => {}
+            _ => warn!("Skipping replay journal line with unknown source tag {tag}"),
         }
     }
-    replayed_lines
+    Ok(replayed_lines)
 }
 
 pub(crate) struct OrderBookListener {
@@ -463,12 +560,13 @@ impl OrderBookListener {
 
     #[cfg(test)]
     fn begin_snapshot_replay(&mut self) {
-        self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh);
+        self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh).expect("temporary replay journal should open");
     }
 
-    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) {
+    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<()> {
         let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
-        self.snapshot_replay_cache = Some(SnapshotReplayCache::new(started_book_height, kind));
+        self.snapshot_replay_cache = Some(SnapshotReplayCache::new(started_book_height, kind)?);
+        Ok(())
     }
 
     fn clear_snapshot_replay(&mut self) {
@@ -481,14 +579,10 @@ impl OrderBookListener {
         }
 
         let Some(cache) = &mut self.snapshot_replay_cache else { return };
-        if cache.push(event_source, line) {
+        if let Some(reason) = cache.push(event_source, line) {
             warn!(
-                "Snapshot replay cache overflowed at {} lines / {} bytes (limits: {} lines / {} bytes); this snapshot \
-                 will not be installed",
-                cache.lines.len(),
-                cache.total_bytes,
-                cache.limits.max_lines,
-                cache.limits.max_bytes
+                "Snapshot replay journal failed at {} lines / {} bytes: {}; this snapshot will not be installed",
+                cache.line_count, cache.total_bytes, reason
             );
         }
     }
@@ -544,17 +638,19 @@ impl OrderBookListener {
     ) -> Result<SnapshotInstallOutcome> {
         let replay_cache = self.snapshot_replay_cache.take().unwrap_or_default();
         if replay_cache.overflowed {
-            let cached_lines = replay_cache.lines.len();
+            let cached_lines = replay_cache.line_count;
             let cached_bytes = replay_cache.total_bytes;
+            let failure_reason = replay_cache.failure_reason.as_deref().unwrap_or("unknown replay journal failure");
             if kind == SnapshotTaskKind::Refresh {
                 warn!(
-                    "Skipping background snapshot refresh at height {snapshot_height}: replay cache overflowed \
-                     ({cached_lines} lines / {cached_bytes} bytes)"
+                    "Skipping background snapshot refresh at height {snapshot_height}: replay journal failed \
+                     ({cached_lines} lines / {cached_bytes} bytes): {failure_reason}"
                 );
                 return Ok(SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes });
             }
             return Err(format!(
-                "Snapshot replay cache overflowed during initial snapshot ({cached_lines} lines / {cached_bytes} bytes)"
+                "Snapshot replay journal failed during initial snapshot ({cached_lines} lines / {cached_bytes} bytes): \
+                 {failure_reason}"
             )
             .into());
         }
@@ -575,7 +671,7 @@ impl OrderBookListener {
         let current_time = (kind == SnapshotTaskKind::Refresh)
             .then(|| self.order_book_state.as_ref().map(OrderBookState::time))
             .flatten();
-        let replayed_lines = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache);
+        let replayed_lines = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache)?;
         if let Some(current_time) = current_time {
             if new_order_book.time() < current_time {
                 new_order_book.set_time(current_time);
@@ -1437,6 +1533,50 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 listener.lock().await.flush_stats_if_due();
             }
 
+            // Handle completed snapshots ahead of a continuously ready file-event
+            // queue. In a biased select, placing this after file events can delay the
+            // result until a large upstream backlog has been fully drained.
+            snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
+                snapshot_fetch_pending = false;
+                match snapshot_fetch_res {
+                    None => {
+                        return Err("Snapshot fetch task sender dropped".into());
+                    }
+                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Initial, result: Err(err), .. }) => {
+                        warn!("Initial snapshot failed; retrying on the next scheduler tick: {err}");
+                    }
+                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
+                        warn!("Background snapshot refresh failed; keeping current order book: {err}");
+                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                    }
+                    Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
+                        match outcome {
+                            SnapshotInstallOutcome::Installed { replayed_lines } => {
+                                info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
+                            }
+                            SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes } => {
+                                warn!(
+                                    "{kind:?} snapshot was not installed because the replay journal failed \
+                                     ({cached_lines} lines / {cached_bytes} bytes)"
+                                );
+                            }
+                            SnapshotInstallOutcome::SkippedStaleSnapshot {
+                                snapshot_height,
+                                replay_cutoff_height,
+                                started_book_height,
+                            } => {
+                                warn!(
+                                    "{kind:?} snapshot was not installed because replay cutoff {replay_cutoff_height} \
+                                     for snapshot height {snapshot_height} was behind the served book height \
+                                     {started_book_height} at replay start"
+                                );
+                            }
+                        }
+                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                    }
+                }
+            }
+
             // Process events from file watchers (via bridge)
             Some(event) = tokio_rx.recv() => {
                 match event {
@@ -1457,48 +1597,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::Fills) {
                             error!("Fill error: {err}");
                         }
-                    }
-                }
-            }
-
-            // Snapshot fetch result
-            snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
-                snapshot_fetch_pending = false;
-                match snapshot_fetch_res {
-                    None => {
-                        return Err("Snapshot fetch task sender dropped".into());
-                    }
-                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Initial, result: Err(err), .. }) => {
-                        return Err(format!("Abci state reading error: {err}").into());
-                    }
-                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
-                        warn!("Background snapshot refresh failed; keeping current order book: {err}");
-                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
-                    }
-                    Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
-                        match outcome {
-                            SnapshotInstallOutcome::Installed { replayed_lines } => {
-                                info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
-                            }
-                            SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes } => {
-                                warn!(
-                                    "{kind:?} snapshot was not installed because replay cache overflowed \
-                                     ({cached_lines} lines / {cached_bytes} bytes)"
-                                );
-                            }
-                            SnapshotInstallOutcome::SkippedStaleSnapshot {
-                                snapshot_height,
-                                replay_cutoff_height,
-                                started_book_height,
-                            } => {
-                                warn!(
-                                    "{kind:?} snapshot was not installed because replay cutoff {replay_cutoff_height} \
-                                     for snapshot height {snapshot_height} was behind the served book height \
-                                     {started_book_height} at replay start"
-                                );
-                            }
-                        }
-                        next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
                     }
                 }
             }
@@ -1921,11 +2019,25 @@ mod tests {
         listener.begin_snapshot_replay();
         let refresh_limits = listener.snapshot_replay_cache.as_ref().expect("refresh cache").limits;
 
-        listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial);
+        listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial).expect("initial replay journal should open");
         let initial_limits = listener.snapshot_replay_cache.as_ref().expect("initial cache").limits;
 
         assert!(initial_limits.max_lines > refresh_limits.max_lines);
         assert!(initial_limits.max_bytes > refresh_limits.max_bytes);
+    }
+
+    #[test]
+    fn snapshot_replay_journal_enforces_its_disk_safety_limit() {
+        let mut cache = SnapshotReplayCache::new(0, SnapshotTaskKind::Initial).expect("replay journal should open");
+        cache.limits = SnapshotReplayLimits { max_lines: 1, max_bytes: usize::MAX };
+
+        assert_eq!(cache.push(EventSource::OrderDiffs, "{}"), None);
+        let failure = cache.push(EventSource::OrderDiffs, "{}").expect("second line should exceed the limit");
+
+        assert!(cache.overflowed);
+        assert_eq!(cache.line_count, 1);
+        assert_eq!(cache.total_bytes, 2);
+        assert!(failure.contains("exceeded its limits"));
     }
 
     #[test]
@@ -2332,8 +2444,9 @@ mod tests {
     fn refresh_replay_overflow_skips_refresh_but_initial_overflow_is_fatal() {
         let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
-        listener.snapshot_replay_cache =
-            Some(SnapshotReplayCache { overflowed: true, ..SnapshotReplayCache::default() });
+        let mut overflowed_cache = SnapshotReplayCache::default();
+        overflowed_cache.overflowed = true;
+        listener.snapshot_replay_cache = Some(overflowed_cache);
 
         let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
         let outcome =
@@ -2342,8 +2455,9 @@ mod tests {
         assert_eq!(outcome, SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines: 0, cached_bytes: 0 });
         assert_eq!(current_bid_sz(&listener, "BTC"), "1");
 
-        listener.snapshot_replay_cache =
-            Some(SnapshotReplayCache { overflowed: true, ..SnapshotReplayCache::default() });
+        let mut overflowed_cache = SnapshotReplayCache::default();
+        overflowed_cache.overflowed = true;
+        listener.snapshot_replay_cache = Some(overflowed_cache);
         let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
         assert!(listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Initial).is_err());
     }
