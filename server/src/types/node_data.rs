@@ -48,7 +48,7 @@ pub(crate) struct NodeDataOrderStatus {
 
 impl NodeDataOrderStatus {
     pub(crate) fn is_inserted_into_book(&self) -> bool {
-        (self.status == "open" && !self.order.is_trigger && (self.order.tif != Some("Ioc".to_string())))
+        (self.status == "open" && !self.order.is_trigger && self.order.tif.as_deref() != Some("Ioc"))
             || (self.order.is_trigger && self.status == "triggered")
     }
 }
