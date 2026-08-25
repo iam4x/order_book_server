@@ -17,7 +17,14 @@ use crossbeam_channel::{Sender, bounded};
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 
-use crate::{FeatureSet, types::node_data::EventSource};
+use crate::{
+    FeatureSet,
+    metrics::{EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL, FILE_LINES_PARSED_TOTAL, PARSE_ERRORS_TOTAL},
+    order_sync::OrderSyncRecorder,
+    types::node_data::EventSource,
+};
+
+static ORDER_SYNC_PARSE_ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Message sent from file watcher threads to the main processor
 #[derive(Debug)]
@@ -25,6 +32,62 @@ pub(crate) enum FileEvent {
     OrderStatus(String),
     OrderDiff(String),
     Fill(String),
+}
+
+enum FileLineSink {
+    Events { source: EventSource, tx: Sender<FileEvent> },
+    FillProgress { recorder: OrderSyncRecorder, _event_tx: Sender<FileEvent> },
+}
+
+impl FileLineSink {
+    const fn source(&self) -> EventSource {
+        match self {
+            Self::Events { source, .. } => *source,
+            Self::FillProgress { .. } => EventSource::Fills,
+        }
+    }
+
+    fn submit(&self, line: String) -> bool {
+        match self {
+            Self::Events { source, tx } => {
+                let event = match source {
+                    EventSource::OrderStatuses => FileEvent::OrderStatus(line),
+                    EventSource::OrderDiffs => FileEvent::OrderDiff(line),
+                    EventSource::Fills => FileEvent::Fill(line),
+                };
+                tx.send(event).is_ok()
+            }
+            Self::FillProgress { recorder, .. } => {
+                match recorder.observe_fill_line(&line) {
+                    Ok(_) => {
+                        FILE_EVENTS_TOTAL.with_label_values(&["fills"]).inc();
+                        FILE_LINES_PARSED_TOTAL.with_label_values(&["fills"]).inc_by(line.len() as u64);
+                        EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
+                    }
+                    Err(err) => {
+                        PARSE_ERRORS_TOTAL.with_label_values(&["fills"]).inc();
+                        let count = ORDER_SYNC_PARSE_ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                        if count.is_multiple_of(1_000) {
+                            error!("Order-sync fill parse error #{count}: {err}");
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+fn file_line_sink(
+    source: EventSource,
+    features: FeatureSet,
+    tx: Sender<FileEvent>,
+    order_sync_recorder: Option<OrderSyncRecorder>,
+) -> Option<FileLineSink> {
+    if source == EventSource::Fills && !features.needs_fill_batches() {
+        return order_sync_recorder.map(|recorder| FileLineSink::FillProgress { recorder, _event_tx: tx });
+    }
+    Some(FileLineSink::Events { source, tx })
 }
 
 pub(super) fn enabled_event_sources(features: FeatureSet) -> Vec<EventSource> {
@@ -266,12 +329,8 @@ impl FileReader {
 
 /// Spawn a file watcher thread for a single event source
 /// Uses polling with inotify hints for streaming files
-pub(super) fn spawn_file_watcher(
-    source: EventSource,
-    dir: PathBuf,
-    tx: Sender<FileEvent>,
-    last_event: Arc<AtomicU64>,
-) -> thread::JoinHandle<()> {
+fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU64>) -> thread::JoinHandle<()> {
+    let source = sink.source();
     let source_name = match source {
         EventSource::OrderStatuses => "OrderStatuses",
         EventSource::Fills => "Fills",
@@ -322,12 +381,7 @@ pub(super) fn spawn_file_watcher(
                             info!("{} new file: {:?}", source_name, path.file_name());
                             let old_lines = reader.on_create(path);
                             for line in old_lines {
-                                let evt = match source {
-                                    EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                    EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                    EventSource::Fills => FileEvent::Fill(line),
-                                };
-                                if tx.send(evt).is_err() {
+                                if !sink.submit(line) {
                                     error!("{} channel closed, exiting", source_name);
                                     return;
                                 }
@@ -341,13 +395,7 @@ pub(super) fn spawn_file_watcher(
                         // EVENT-DRIVEN: Read data when inotify fires modify event
                         let lines = reader.on_modify();
                         for line in lines {
-                            let event = match source {
-                                EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                EventSource::Fills => FileEvent::Fill(line),
-                            };
-
-                            if tx.send(event).is_err() {
+                            if !sink.submit(line) {
                                 error!("{} channel closed, exiting", source_name);
                                 return;
                             }
@@ -365,13 +413,7 @@ pub(super) fn spawn_file_watcher(
                     // This runs every 500ms instead of every 10ms
                     let lines = reader.on_modify();
                     for line in lines {
-                        let event = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
-                        };
-
-                        if tx.send(event).is_err() {
+                        if !sink.submit(line) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -409,12 +451,7 @@ pub(super) fn spawn_file_watcher(
                     // Switch to the new file
                     let old_lines = reader.on_create(&newer_file);
                     for line in old_lines {
-                        let evt = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
-                        };
-                        if tx.send(evt).is_err() {
+                        if !sink.submit(line) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -430,6 +467,7 @@ pub(super) fn spawn_file_watcher(
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     features: FeatureSet,
+    order_sync_recorder: Option<OrderSyncRecorder>,
 ) -> (crossbeam_channel::Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)
 {
     // Bounded so a slow downstream actually back-pressures the file readers
@@ -453,7 +491,11 @@ pub(crate) fn start_parallel_file_watchers(
             EventSource::Fills => last_fills.clone(),
             EventSource::OrderDiffs => last_order_diffs.clone(),
         };
-        handles.push(spawn_file_watcher(source, dir, tx.clone(), last_event));
+        let Some(sink) = file_line_sink(source, features, tx.clone(), order_sync_recorder.clone()) else {
+            error!("Order-sync fill watcher could not start without a recorder");
+            continue;
+        };
+        handles.push(spawn_file_watcher(dir, sink, last_event));
     }
 
     (rx, handles, last_order_status, last_fills, last_order_diffs)
@@ -492,5 +534,37 @@ mod tests {
         assert_eq!(enabled_event_sources(features("stats")), vec![EventSource::Fills, EventSource::OrderDiffs]);
         assert!(!features("stats").requires_book_state());
         assert!(!features("stats").watch_order_statuses());
+    }
+
+    #[test]
+    fn ordersync_only_watches_fills_without_full_fill_batches() {
+        let order_sync = features("ordersync");
+        assert_eq!(enabled_event_sources(order_sync), vec![EventSource::Fills]);
+        assert!(order_sync.watch_fills());
+        assert!(!order_sync.needs_fill_batches());
+        assert!(!order_sync.requires_book_state());
+    }
+
+    #[test]
+    fn bbo_and_ordersync_fill_lines_bypass_the_shared_event_queue() {
+        let (tx, rx) = bounded(1);
+        let recorder = OrderSyncRecorder::default();
+        let sink = file_line_sink(EventSource::Fills, features("bbo,ordersync"), tx, Some(recorder.clone()))
+            .expect("ordersync recorder creates a fill sink");
+
+        assert!(sink.submit(r#"{"events":[[null,{"time":300000}]]}"#.to_string()));
+        assert_eq!(recorder.status_at(600_000).last_order_at, Some(300));
+        assert!(matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn trades_and_ordersync_keep_the_existing_full_fill_path() {
+        let (tx, rx) = bounded(1);
+        let sink =
+            file_line_sink(EventSource::Fills, features("trades,ordersync"), tx, Some(OrderSyncRecorder::default()))
+                .expect("fill sink exists");
+
+        assert!(sink.submit("fill line".to_string()));
+        assert!(matches!(rx.try_recv(), Ok(FileEvent::Fill(line)) if line == "fill line"));
     }
 }

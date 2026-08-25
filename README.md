@@ -17,6 +17,8 @@ Real-time orderbook data from a local Hyperliquid node:
 - **bookDiffs** - Raw book diff stream per coin
 - **l4Book** - Full Level 4 orderbook with individual order details
 - **orderUpdates** - User-specific order status stream
+- **stats** - One-second node throughput counters
+- **orderSync** - Fill processing lag in seconds, published every 30 seconds
 
 ## Quick Start
 
@@ -34,7 +36,7 @@ The server runs co-located with a Hyperliquid node and is memory-light relative 
 | **Full (`--features all --markets all`)** | 2 cores minimum, 4+ recommended | ~750 MB – 2 GB | Rises with connected clients and L2 subscription fanout. Reserve **4 GB** for headroom in production. |
 | **Perps only (`--markets perps`)** | 2 cores | ~400 MB – 1 GB | Smaller public universe and fewer L2 variants to compute. |
 | **BBO only (`--features bbo` or `--features allbbo`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
-| **Raw streams only (`--features trades,bookdiffs,orderupdates`)** | 1 core | lowest | Skips startup snapshot and in-memory orderbook state. |
+| **Raw streams only (`--features trades,bookdiffs,orderupdates,ordersync`)** | 1 core | lowest | Skips startup snapshot and in-memory orderbook state. |
 
 Other requirements:
 
@@ -83,7 +85,7 @@ cargo build --release
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
 | `--secret` | unset | Require WebSocket clients to connect with `?token=<secret>` |
 | `--markets` | `all` | Comma-delimited `perps`, `spot`, `hip3`, or `all` |
-| `--features` | `all` | Comma-delimited `bbo`, `allbbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, `stats`, or `all` |
+| `--features` | `all` | Comma-delimited `bbo`, `allbbo`, `l2book`, `l4book`, `trades`, `bookdiffs`, `orderupdates`, `stats`, `ordersync`, or `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -101,7 +103,7 @@ Your WebSocket client must support `permessage-deflate` for levels 1-9 to have a
 
 ### Snapshot Mode
 
-When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades` or `--features stats` skip this snapshot and start serving as soon as their file watchers are running.
+When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **full L4 orderbook snapshot** to initialize its in-memory state. It obtains this by calling the `hl-node` binary's CLI, which reads the node's `abci_state.rmp` file (the node's persistent state) and dumps a JSON snapshot of every order currently on the book. Raw-only configurations such as `--features trades`, `--features stats`, or `--features ordersync` skip this snapshot and start serving as soon as their file watchers are running.
 
 The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
@@ -125,6 +127,7 @@ The `--features` flag controls both the WebSocket channels the server accepts an
 | `bookdiffs` | `bookDiffs` | No | order diffs |
 | `orderupdates` | `orderUpdates` | No | order statuses |
 | `stats` | `stats` | No | fills + order diffs |
+| `ordersync` | `orderSync` | No | fills |
 
 Examples:
 
@@ -135,6 +138,8 @@ Examples:
 --features bbo,allbbo,l2book,trades
 --features trades,orderupdates
 --features stats
+--features ordersync
+--features bbo,ordersync
 ```
 
 If a client subscribes to a disabled channel, the server returns an error and does not register that subscription. Raw-only modes skip snapshot-derived coin validation; a syntactically valid coin in the selected `--markets` category is accepted and receives data only if the node emits it.
@@ -312,6 +317,28 @@ Response, sent once per second:
 ```
 `tps` counts parsed `node_fills` events in the last second, `bps` counts distinct node block numbers observed in that interval, `height` is the highest block seen, and `ops` counts place, update, cancel, and fill order operations.
 
+### Subscribe to order sync
+
+```json
+{ "method": "subscribe", "subscription": { "type": "orderSync" } }
+```
+
+Response, sent on one server-wide 30-second cadence:
+
+```json
+{ "channel": "orderSync", "data": { "last_order_at": 300 } }
+```
+
+`last_order_at` is the number of complete seconds between the server's current UTC time and the greatest `Fill.time` accepted by this process. A value of `300` means that the latest processed fill is five minutes behind the server clock. Older or duplicate fill batches cannot move the timestamp backward. A future fill timestamp reports `0`.
+
+The subscription does not send an immediate data sample. Its first sample arrives on the next global 30-second tick. Until this process accepts a fill after startup, the field is `null`:
+
+```json
+{ "channel": "orderSync", "data": { "last_order_at": null } }
+```
+
+`null` means that the process has not accepted a fill. A value of `0` means that the latest fill is less than one second old. This channel measures fill freshness, so a quiet market and a stalled fill stream can produce the same rising value.
+
 ### Ping/Pong
 ```json
 { "method": "ping" }
@@ -328,12 +355,13 @@ Response:
 
 ## Node Requirements
 
-The Hyperliquid node must run with **all** of these flags enabled:
-- `--write-fills`
-- `--write-order-statuses`
-- `--write-raw-book-diffs`
-- `--stream-with-block-info` — **required**, the server only reads from `*_streaming` directories
-- `--disable-output-file-buffering` — ensures data is flushed immediately for low latency
+Enable the node output flags required by your selected features:
+
+- `--write-fills` for `trades`, `stats`, or `ordersync`
+- `--write-order-statuses` for `bbo`, `allbbo`, `l2book`, `l4book`, or `orderupdates`
+- `--write-raw-book-diffs` for `bbo`, `allbbo`, `l2book`, `l4book`, `bookdiffs`, or `stats`
+- `--stream-with-block-info` for every feature because the server reads only `*_streaming` directories
+- `--disable-output-file-buffering` to flush updates without extra buffering latency
 
 ## Architecture
 
@@ -371,7 +399,7 @@ The Hyperliquid node must run with **all** of these flags enabled:
 **Data flow:**
 1. The Hyperliquid node writes real-time events to `*_streaming/` directories as newline-delimited JSON
 2. Three parallel inotify file watchers detect changes immediately (one per event source)
-3. Events are bridged from crossbeam channels (blocking I/O threads) to the tokio async runtime
+3. Market events are bridged from crossbeam channels to the Tokio async runtime. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses both shared queues and the orderbook mutex.
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
 5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
 6. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication
@@ -385,6 +413,7 @@ The Hyperliquid node must run with **all** of these flags enabled:
 | BBO | Only sends when bid/ask px/sz changes |
 | L2Book | Only sends when snapshot hash changes |
 | Trades | Only sends on fills |
+| Order Sync | Sends the current fill age every 30 seconds |
 
 ### Latency
 
@@ -410,10 +439,10 @@ curl http://localhost:9090/metrics
 |----------|--------|-------------|
 | **Connections** | `ws_connections_active` | Current WebSocket connections |
 | | `ws_connections_total` | Total connections since startup |
-| | `ws_subscriptions_active{type}` | Active subscriptions by type (bbo/allbbo/l2Book/l4Book/trades/bookDiffs/orderUpdates) |
+| | `ws_subscriptions_active{type}` | Active subscriptions by type (`bbo`, `allbbo`, `l2Book`, `l4Book`, `trades`, `bookDiffs`, `orderUpdates`, `stats`, `orderSync`) |
 | | `broadcast_receivers` | Number of broadcast channel receivers |
 | **Throughput** | `events_processed_total{type}` | Events by type (orders/diffs/fills) |
-| | `broadcasts_total{channel}` | Broadcasts by channel (bbo/allbbo/l2/l4/trades/stats) |
+| | `broadcasts_total{channel}` | Broadcasts by channel (`bbo`, `allbbo`, `l2`, `l4`, `trades`, `bookDiffs`, `stats`, `orderSync`, and heartbeat labels) |
 | | `messages_sent_total` | Total WebSocket messages sent |
 | | `bbo_changes_total{coin}` | BBO changes per coin |
 | **Health** | `orderbook_height` | Current block height |
@@ -583,7 +612,7 @@ This fork deduplicates at the WebSocket level:
 
 ### Granular Feature Selection
 
-The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, `--features allbbo` serves a single batched top-of-book stream, and raw-only configurations such as `--features trades,orderupdates` or `--features stats` skip the startup snapshot and in-memory orderbook maintenance entirely.
+The `--features` flag lets operators enable only the channels they need. For example, `--features bbo` replaces the old BBO-only mode, `--features allbbo` serves a single batched top-of-book stream, and raw-only configurations such as `--features trades,orderupdates`, `--features stats`, or `--features ordersync` skip the startup snapshot and in-memory orderbook maintenance entirely.
 
 ### Snapshot Modes: Docker & Direct
 
