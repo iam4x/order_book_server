@@ -12,7 +12,7 @@ use tokio::{
     net::TcpListener,
     select,
     sync::{
-        Mutex,
+        Mutex, OwnedSemaphorePermit, Semaphore,
         broadcast::{Sender, channel},
         mpsc, watch,
     },
@@ -422,7 +422,7 @@ async fn handle_socket(
     let (mut ws_read, outbound, writer) = spawn_writer(socket);
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
-        let _unused = outbound.send_message(msg).await;
+        let _unused = outbound.send_message(msg);
         close_writer(outbound, writer).await;
         return;
     }
@@ -465,7 +465,7 @@ async fn handle_socket(
                                     if !alive { break; }
                                     // Partial L2 updates intentionally omit unchanged coins.
                                     if matches!(sub, Subscription::L2Book { .. }) {
-                                        alive &= send_ws_data_from_l2_update(&outbound, sub, l2_books, &mut last_l2).await;
+                                        alive &= send_ws_data_from_l2_update(&outbound, sub, l2_books, &mut last_l2);
                                     }
                                 }
                             },
@@ -480,7 +480,7 @@ async fn handle_socket(
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     if let Subscription::Bbo { coin } = sub {
-                                        alive &= send_ws_data_from_bbo(&outbound, coin, bbos, *time, &mut last_bbo).await;
+                                        alive &= send_ws_data_from_bbo(&outbound, coin, bbos, *time, &mut last_bbo);
                                     }
                                 }
                             },
@@ -488,9 +488,13 @@ async fn handle_socket(
                                 if !features.allbbo() || !manager.subscriptions().contains(&Subscription::AllBbo) {
                                     continue;
                                 }
-                                alive &=
-                                    send_ws_data_from_allbbo(&outbound, bbos, *time, market_filter, &mut last_allbbo)
-                                        .await;
+                                alive &= send_ws_data_from_allbbo(
+                                    &outbound,
+                                    bbos,
+                                    *time,
+                                    market_filter,
+                                    &mut last_allbbo,
+                                );
                             },
                             InternalMessage::Fills{ batch } => {
                                 if !features.trades() {
@@ -501,7 +505,7 @@ async fn handle_socket(
                                     let mut trades = coin_to_trades(batch);
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_data_from_trades(&outbound, sub, &mut trades).await;
+                                        alive &= send_ws_data_from_trades(&outbound, sub, &mut trades);
                                     }
                                 }
                             },
@@ -517,11 +521,11 @@ async fn handle_socket(
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
                                         if let Some(ref mut updates) = book_updates {
-                                            alive &= send_ws_data_from_book_updates(&outbound, sub, updates).await;
+                                            alive &= send_ws_data_from_book_updates(&outbound, sub, updates);
                                         }
                                         if !alive { break; }
                                         if let Some(ref mut diffs) = raw_diffs {
-                                            alive &= send_ws_data_from_book_diffs_raw(&outbound, sub, diffs).await;
+                                            alive &= send_ws_data_from_book_diffs_raw(&outbound, sub, diffs);
                                         }
                                     }
                                 }
@@ -536,13 +540,13 @@ async fn handle_socket(
                                     let mut book_updates = coin_to_book_statuses_only(batch);
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_data_from_book_updates(&outbound, sub, &mut book_updates).await;
+                                        alive &= send_ws_data_from_book_updates(&outbound, sub, &mut book_updates);
                                     }
                                 }
                                 if has_order_updates {
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_order_updates(&outbound, sub, batch).await;
+                                        alive &= send_ws_order_updates(&outbound, sub, batch);
                                     }
                                 }
                             },
@@ -550,7 +554,7 @@ async fn handle_socket(
                                 if !features.stats() || !manager.subscriptions().contains(&Subscription::Stats) {
                                     continue;
                                 }
-                                alive &= send_ws_stats(&outbound, stats.clone()).await;
+                                alive &= send_ws_stats(&outbound, stats.clone());
                             },
                         }
 
@@ -582,7 +586,7 @@ async fn handle_socket(
                                     entry.last_sent = now;
                                     BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
                                     let payload = entry.payload.clone();
-                                    alive &= outbound.send_message(ServerResponse::L2Book(payload)).await;
+                                    alive &= outbound.send_message(ServerResponse::L2Book(payload));
                                 }
                             }
                         }
@@ -594,7 +598,7 @@ async fn handle_socket(
                                     entry.last_sent = now;
                                     BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
                                     let payload = entry.payload.clone();
-                                    alive &= outbound.send_message(ServerResponse::Bbo(payload)).await;
+                                    alive &= outbound.send_message(ServerResponse::Bbo(payload));
                                 }
                             }
                         }
@@ -606,7 +610,7 @@ async fn handle_socket(
                                     payload.time = now_ms;
                                     last_allbbo.last_sent = Some(now);
                                     BROADCASTS_TOTAL.with_label_values(&["allbbo_heartbeat"]).inc();
-                                    alive &= outbound.send_message(ServerResponse::AllBbo(payload.clone())).await;
+                                    alive &= outbound.send_message(ServerResponse::AllBbo(payload.clone()));
                                 }
                             }
                         }
@@ -617,7 +621,7 @@ async fn handle_socket(
 
             status = receive_order_sync(&mut order_sync_rx) => {
                 BROADCASTS_TOTAL.with_label_values(&["orderSync"]).inc();
-                alive &= outbound.send_message(ServerResponse::OrderSync(status)).await;
+                alive &= outbound.send_message(ServerResponse::OrderSync(status));
             }
 
             msg = ws_read.next() => {
@@ -662,7 +666,7 @@ async fn handle_socket(
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
-                                alive &= outbound.send_message(msg).await;
+                                alive &= outbound.send_message(msg);
                             }
                         }
                         OpCode::Close => {
@@ -682,7 +686,7 @@ async fn handle_socket(
             }
         }
     }
-    info!("Dropping connection: socket write failed or timed out");
+    info!("Dropping connection: outbound writer closed or queue limit reached");
     close_writer(outbound, writer).await;
 }
 
@@ -708,24 +712,22 @@ async fn receive_client_message(
         ClientMessage::Ping => unreachable!("Ping is handled before receive_client_message"),
     };
     if !subscription_feature_enabled(&subscription, features) {
-        return outbound
-            .send_message(ServerResponse::Error(format!(
-                "Feature disabled for subscription type: {}",
-                subscription.type_label()
-            )))
-            .await;
+        return outbound.send_message(ServerResponse::Error(format!(
+            "Feature disabled for subscription type: {}",
+            subscription.type_label()
+        )));
     }
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !validate_subscription_for_features(&subscription, universe, features, market_filter) {
-        return outbound.send_message(ServerResponse::Error(format!("Invalid subscription: {sub}"))).await;
+        return outbound.send_message(ServerResponse::Error(format!("Invalid subscription: {sub}")));
     }
 
     let (word, success) = match &client_message {
         ClientMessage::Subscribe { .. } => match manager.subscribe(subscription.clone()) {
             Ok(inserted) => ("", inserted),
             Err(err) => {
-                return outbound.send_message(ServerResponse::Error(format!("Rejected subscription: {err}"))).await;
+                return outbound.send_message(ServerResponse::Error(format!("Rejected subscription: {err}")));
             }
         },
         ClientMessage::Unsubscribe { .. } => {
@@ -777,31 +779,30 @@ async fn receive_client_message(
                     l2_registrations.unregister(subscription);
                     allbbo_registration.unregister(subscription);
                     return outbound
-                        .send_message(ServerResponse::Error(format!("Unable to grab order book snapshot: {err}")))
-                        .await;
+                        .send_message(ServerResponse::Error(format!("Unable to grab order book snapshot: {err}")));
                 }
             }
         } else {
             None
         };
-        if !outbound.send_message(ServerResponse::SubscriptionResponse(client_message)).await {
+        if !outbound.send_message(ServerResponse::SubscriptionResponse(client_message)) {
             return false;
         }
         if let Some(snapshot_msg) = snapshot_msg {
             if let ServerResponse::AllBbo(payload) = &snapshot_msg {
                 prime_allbbo_cache(last_allbbo, payload);
             }
-            return outbound.send_message(snapshot_msg).await;
+            return outbound.send_message(snapshot_msg);
         }
         true
     } else {
-        outbound.send_message(ServerResponse::Error(format!("Already {word}subscribed: {sub}"))).await
+        outbound.send_message(ServerResponse::Error(format!("Already {word}subscribed: {sub}")))
     }
 }
 
 /// Fast BBO broadcast - directly from BBO HashMap without L2 snapshot computation.
-/// Returns false if the socket send failed/timed out (caller must drop the connection).
-async fn send_ws_data_from_bbo(
+/// Returns false if outbound admission fails (caller must drop the connection).
+fn send_ws_data_from_bbo(
     outbound: &Outbound,
     coin: &str,
     bbos: &HashMap<Coin, RawBbo>,
@@ -819,13 +820,13 @@ async fn send_ws_data_from_bbo(
             let bbo = Bbo { coin: coin.to_string(), time, bid, ask };
             last_bbo
                 .insert(coin.to_string(), BboEntry { tuple: current, last_sent: Instant::now(), payload: bbo.clone() });
-            return outbound.send_message(ServerResponse::Bbo(bbo)).await;
+            return outbound.send_message(ServerResponse::Bbo(bbo));
         }
     }
     true
 }
 
-async fn send_ws_data_from_allbbo(
+fn send_ws_data_from_allbbo(
     outbound: &Outbound,
     bbos: &[(Coin, RawBbo)],
     time: u64,
@@ -854,7 +855,7 @@ async fn send_ws_data_from_allbbo(
     let payload = AllBbo { time, bbos: changed };
     last_allbbo.last_sent = Some(Instant::now());
     last_allbbo.payload = Some(payload.clone());
-    outbound.send_message(ServerResponse::AllBbo(payload)).await
+    outbound.send_message(ServerResponse::AllBbo(payload))
 }
 
 fn level_from_raw(raw: Option<(crate::order_book::Px, crate::order_book::Sz, u32)>) -> Option<Level> {
@@ -890,19 +891,30 @@ fn prime_allbbo_cache(cache: &mut AllBboCache, payload: &AllBbo) {
 
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTBOUND_QUEUE_DEPTH: usize = 128;
+const OUTBOUND_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 const PONG_QUEUE_DEPTH: usize = 8;
 const PONG_FRAME: &[u8] = br#"{"channel":"pong"}"#;
 
 type WsRead = futures_util::stream::SplitStream<WebSocket>;
 type WsWriter = tokio::task::JoinHandle<()>;
 
+struct QueuedData {
+    payload: bytes::Bytes,
+    budget: OwnedSemaphorePermit,
+}
+
 struct Outbound {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::Sender<QueuedData>,
+    data_budget: Arc<Semaphore>,
     pong_tx: mpsc::Sender<bytes::Bytes>,
 }
 
 impl Outbound {
-    async fn send_message(&self, msg: ServerResponse) -> bool {
+    fn new(data_tx: mpsc::Sender<QueuedData>, pong_tx: mpsc::Sender<bytes::Bytes>) -> Self {
+        Self { data_tx, data_budget: Arc::new(Semaphore::new(OUTBOUND_BYTE_BUDGET)), pong_tx }
+    }
+
+    fn send_message(&self, msg: ServerResponse) -> bool {
         let payload = match serde_json::to_string(&msg) {
             Ok(payload) => payload,
             Err(err) => {
@@ -910,18 +922,26 @@ impl Outbound {
                 return true;
             }
         };
-        self.send_payload(bytes::Bytes::from(payload)).await
+        self.send_payload(bytes::Bytes::from(payload))
     }
 
-    async fn send_payload(&self, payload: bytes::Bytes) -> bool {
-        match tokio::time::timeout(WS_SEND_TIMEOUT, self.data_tx.send(payload)).await {
-            Ok(Ok(())) => true,
-            Ok(Err(_)) => false,
-            Err(_) => {
-                error!("Outbound queue full for >{WS_SEND_TIMEOUT:?}; dropping slow client");
+    fn send_payload(&self, payload: bytes::Bytes) -> bool {
+        let max_permits = u32::try_from(OUTBOUND_BYTE_BUDGET).unwrap_or(u32::MAX);
+        let permits = u32::try_from(payload.len()).unwrap_or(u32::MAX).clamp(1, max_permits);
+        let Ok(budget) = Arc::clone(&self.data_budget).try_acquire_many_owned(permits) else {
+            error!("Outbound byte budget exhausted; dropping slow client");
+            WS_SEND_ERRORS_TOTAL.inc();
+            return false;
+        };
+        let frame = QueuedData { payload, budget };
+        match self.data_tx.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                error!("Outbound queue full; dropping slow client");
                 WS_SEND_ERRORS_TOTAL.inc();
                 false
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -947,32 +967,29 @@ fn spawn_writer(socket: WebSocket) -> (WsRead, Outbound, WsWriter) {
     let (data_tx, data_rx) = mpsc::channel(OUTBOUND_QUEUE_DEPTH);
     let (pong_tx, pong_rx) = mpsc::channel(PONG_QUEUE_DEPTH);
     let writer = tokio::spawn(write_task(sink, data_rx, pong_rx));
-    (ws_read, Outbound { data_tx, pong_tx }, writer)
+    (ws_read, Outbound::new(data_tx, pong_tx), writer)
 }
 
-async fn write_task<S>(
-    mut sink: S,
-    mut data_rx: mpsc::Receiver<bytes::Bytes>,
-    mut pong_rx: mpsc::Receiver<bytes::Bytes>,
-) where
+async fn write_task<S>(mut sink: S, mut data_rx: mpsc::Receiver<QueuedData>, mut pong_rx: mpsc::Receiver<bytes::Bytes>)
+where
     S: futures_util::Sink<FrameView> + Unpin,
     S::Error: std::fmt::Display,
 {
     let mut data_open = true;
     let mut pong_open = true;
     while data_open || pong_open {
-        let frame = select! {
+        let (payload, _budget) = select! {
             biased;
 
             pong = pong_rx.recv(), if pong_open => match pong {
-                Some(frame) => frame,
+                Some(payload) => (payload, None),
                 None => {
                     pong_open = false;
                     continue;
                 }
             },
             data = data_rx.recv(), if data_open => match data {
-                Some(frame) => frame,
+                Some(frame) => (frame.payload, Some(frame.budget)),
                 None => {
                     data_open = false;
                     continue;
@@ -980,7 +997,7 @@ async fn write_task<S>(
             },
         };
 
-        match tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(FrameView::text(frame))).await {
+        match tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(FrameView::text(payload))).await {
             Ok(Ok(())) => {
                 MESSAGES_SENT_TOTAL.inc();
             }
@@ -1082,7 +1099,7 @@ async fn receive_order_sync(receiver: &mut Option<watch::Receiver<OrderSyncStatu
     }
 }
 
-async fn send_ws_data_from_l2_update(
+fn send_ws_data_from_l2_update(
     outbound: &Outbound,
     subscription: &Subscription,
     l2_books: &HashMap<L2SubscriptionKey, Arc<PreparedL2Book>>,
@@ -1104,7 +1121,7 @@ async fn send_ws_data_from_l2_update(
     BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
     let payload = prepared.payload().clone();
     last_l2.insert(key, L2Entry { version: prepared.version(), last_sent: Instant::now(), payload: payload.clone() });
-    outbound.send_message(ServerResponse::L2Book(payload)).await
+    outbound.send_message(ServerResponse::L2Book(payload))
 }
 
 #[cfg(test)]
@@ -1322,11 +1339,12 @@ mod tests {
     async fn write_task_sends_pongs_before_queued_data() {
         let (data_tx, data_rx) = mpsc::channel(8);
         let (pong_tx, pong_rx) = mpsc::channel(8);
+        let outbound = Outbound::new(data_tx, pong_tx);
         for i in 0..3 {
-            data_tx.send(bytes::Bytes::from(format!("data{i}"))).await.unwrap();
+            assert!(outbound.send_payload(bytes::Bytes::from(format!("data{i}"))));
         }
-        pong_tx.send(bytes::Bytes::from_static(PONG_FRAME)).await.unwrap();
-        drop((data_tx, pong_tx));
+        assert!(outbound.send_pong());
+        drop(outbound);
 
         let sink = RecordingSink::default();
         write_task(sink.clone(), data_rx, pong_rx).await;
@@ -1342,34 +1360,61 @@ mod tests {
         let (pong_tx, pong_rx) = mpsc::channel(8);
         drop((data_rx, pong_rx));
 
-        let outbound = Outbound { data_tx, pong_tx };
+        let outbound = Outbound::new(data_tx, pong_tx);
 
-        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"x")));
         assert!(!outbound.send_pong());
         outbound.closed().await;
+        drop(outbound);
     }
 
     #[tokio::test]
     async fn full_pong_lane_drops_connection() {
         let (data_tx, _data_rx) = mpsc::channel(8);
         let (pong_tx, _pong_rx) = mpsc::channel(2);
-        let outbound = Outbound { data_tx, pong_tx };
+        let outbound = Outbound::new(data_tx, pong_tx);
 
         assert!(outbound.send_pong());
         assert!(outbound.send_pong());
         assert!(!outbound.send_pong());
+        drop(outbound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_data_lane_drops_connection_without_waiting() {
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (pong_tx, _pong_rx) = mpsc::channel(1);
+        let outbound = Outbound::new(data_tx, pong_tx);
+
+        assert!(outbound.send_payload(bytes::Bytes::from_static(b"first")));
+        let started = tokio::time::Instant::now();
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"second")));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        drop(outbound);
+    }
+
+    #[test]
+    fn oversized_frame_uses_the_whole_byte_budget() {
+        let (data_tx, _data_rx) = mpsc::channel(2);
+        let (pong_tx, _pong_rx) = mpsc::channel(1);
+        let outbound = Outbound::new(data_tx, pong_tx);
+
+        assert!(outbound.send_payload(bytes::Bytes::from(vec![0; OUTBOUND_BYTE_BUDGET + 1])));
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"blocked")));
+        drop(outbound);
     }
 
     #[tokio::test(start_paused = true)]
     async fn stuck_writer_times_out_and_closes_queue() {
         let (data_tx, data_rx) = mpsc::channel(1);
         let (pong_tx, pong_rx) = mpsc::channel(1);
-        let outbound = Outbound { data_tx, pong_tx };
+        let outbound = Outbound::new(data_tx, pong_tx);
         let writer = tokio::spawn(write_task(StuckSink, data_rx, pong_rx));
 
-        assert!(outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
+        assert!(outbound.send_payload(bytes::Bytes::from_static(b"x")));
         writer.await.unwrap();
-        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"y")).await);
+        assert!(!outbound.send_payload(bytes::Bytes::from_static(b"y")));
+        drop(outbound);
     }
 }
 
@@ -1423,7 +1468,7 @@ fn coin_to_book_diffs_raw(batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, V
     grouped
 }
 
-async fn send_ws_data_from_book_diffs_raw(
+fn send_ws_data_from_book_diffs_raw(
     outbound: &Outbound,
     subscription: &Subscription,
     book_diffs: &mut HashMap<String, Vec<NodeDataOrderDiff>>,
@@ -1431,13 +1476,13 @@ async fn send_ws_data_from_book_diffs_raw(
     if let Subscription::BookDiffs { coin } = subscription {
         if let Some(diffs) = book_diffs.remove(coin) {
             BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
-            return outbound.send_message(ServerResponse::BookDiffs(diffs)).await;
+            return outbound.send_message(ServerResponse::BookDiffs(diffs));
         }
     }
     true
 }
 
-async fn send_ws_data_from_book_updates(
+fn send_ws_data_from_book_updates(
     outbound: &Outbound,
     subscription: &Subscription,
     book_updates: &mut HashMap<String, L4BookUpdates>,
@@ -1445,13 +1490,13 @@ async fn send_ws_data_from_book_updates(
     if let Subscription::L4Book { coin } = subscription {
         if let Some(updates) = book_updates.remove(coin) {
             BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
-            return outbound.send_message(ServerResponse::L4Book(L4Book::Updates(updates))).await;
+            return outbound.send_message(ServerResponse::L4Book(L4Book::Updates(updates)));
         }
     }
     true
 }
 
-async fn send_ws_data_from_trades(
+fn send_ws_data_from_trades(
     outbound: &Outbound,
     subscription: &Subscription,
     trades: &mut HashMap<String, Vec<Trade>>,
@@ -1459,15 +1504,15 @@ async fn send_ws_data_from_trades(
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
             BROADCASTS_TOTAL.with_label_values(&["trades"]).inc();
-            return outbound.send_message(ServerResponse::Trades(trades)).await;
+            return outbound.send_message(ServerResponse::Trades(trades));
         }
     }
     true
 }
 
-async fn send_ws_stats(outbound: &Outbound, stats: Stats) -> bool {
+fn send_ws_stats(outbound: &Outbound, stats: Stats) -> bool {
     BROADCASTS_TOTAL.with_label_values(&["stats"]).inc();
-    outbound.send_message(ServerResponse::Stats(stats)).await
+    outbound.send_message(ServerResponse::Stats(stats))
 }
 
 impl Subscription {
@@ -1512,11 +1557,7 @@ impl Subscription {
 }
 
 /// Send order updates to OrderUpdates subscribers filtered by user address
-async fn send_ws_order_updates(
-    outbound: &Outbound,
-    subscription: &Subscription,
-    batch: &Batch<NodeDataOrderStatus>,
-) -> bool {
+fn send_ws_order_updates(outbound: &Outbound, subscription: &Subscription, batch: &Batch<NodeDataOrderStatus>) -> bool {
     if let Subscription::OrderUpdates { user } = subscription {
         // Parse the user address from the subscription
         let user_addr = match user.parse::<alloy::primitives::Address>() {
@@ -1536,7 +1577,7 @@ async fn send_ws_order_updates(
             .collect();
 
         if !user_updates.is_empty() {
-            return outbound.send_message(ServerResponse::OrderUpdates(user_updates)).await;
+            return outbound.send_message(ServerResponse::OrderUpdates(user_updates));
         }
     }
     true
