@@ -373,12 +373,12 @@ Enable the node output flags required by your selected features:
 │   (Docker/Direct)    │     │                                             │
 │                      │     │  ┌──────────────────────────────┐           │
 │  writes to:          │     │  │ Parallel File Watchers       │           │
-│  - fills_streaming/  │─────▶  │ (3 inotify threads)          │           │
+│  - fills_streaming/  │─────▶  │ (enabled inotify threads)    │           │
 │  - order_statuses_   │     │  │  - order diffs (BBO-critical)│           │
 │    streaming/        │     │  │  - order statuses            │           │
 │  - book_diffs_       │     │  │  - fills                     │           │
 │    streaming/        │     │  └──────────┬───────────────────┘           │
-│                      │     │             │ crossbeam → tokio bridge      │
+│                      │     │             │ bounded tokio channel         │
 │                      │     │  ┌──────────▼───────────────────┐           │
 │  snapshot via:       │     │  │ OrderBook State              │           │
 │  hl-node CLI ◀───────│─────│  │  - L4 in-memory book         │           │
@@ -400,8 +400,8 @@ Enable the node output flags required by your selected features:
 
 **Data flow:**
 1. The Hyperliquid node writes real-time events to `*_streaming/` directories as newline-delimited JSON
-2. Three parallel inotify file watchers detect changes immediately (one per event source)
-3. Market events are bridged from crossbeam channels to the Tokio async runtime. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses both shared queues and the orderbook mutex.
+2. One inotify watcher thread runs for each event source required by `--features`
+3. Watcher threads send events directly into a bounded Tokio channel. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
 5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
 6. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication
@@ -590,7 +590,7 @@ This fork processes every order diff, status, and fill **the instant it arrives*
 
 The original uses a single file watcher thread that handles all three event sources (order statuses, book diffs, fills) sequentially.
 
-This fork spawns dedicated inotify threads for the event sources required by `--features`, with independent crossbeam channels bridged to the tokio async runtime. Order diffs (the BBO-critical path) are never blocked by slow fill or status parsing.
+This fork spawns dedicated inotify threads for the event sources required by `--features`. They send directly into one bounded tokio channel, so a sustained processing stall back-pressures the file readers instead of growing an unbounded queue.
 
 ### New Subscription Types
 
