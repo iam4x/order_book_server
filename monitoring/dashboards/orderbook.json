@@ -242,11 +242,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 1000
+                                "value": 35000
                             },
                             {
                                 "color": "red",
-                                "value": 5000
+                                "value": 45000
                             }
                         ]
                     },
@@ -276,7 +276,7 @@
                     "refId": "A"
                 }
             ],
-            "title": "\u23f3 Pending",
+            "title": "\u23f3 Pending Statuses",
             "type": "stat"
         },
         {
@@ -845,7 +845,45 @@
                         }
                     },
                     "unit": "short"
-                }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Height Skew (blocks)"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Repair Requests/min"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Buffered Events"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    }
+                ]
             },
             "gridPos": {
                 "h": 8,
@@ -879,9 +917,24 @@
                     "expr": "pending_diffs_cache_size",
                     "legendFormat": "Pending Diffs",
                     "refId": "B"
+                },
+                {
+                    "expr": "abs(order_diff_height - order_status_height)",
+                    "legendFormat": "Height Skew (blocks)",
+                    "refId": "C"
+                },
+                {
+                    "expr": "sum(increase(orderbook_repair_requests_total[1m]))",
+                    "legendFormat": "Repair Requests/min",
+                    "refId": "D"
+                },
+                {
+                    "expr": "order_stream_queue_depth",
+                    "legendFormat": "Buffered Events",
+                    "refId": "E"
                 }
             ],
-            "title": "\u23f3 HFT Cache Status",
+            "title": "\u23f3 HFT Pairing Health",
             "type": "timeseries"
         },
         {
@@ -940,11 +993,21 @@
             "targets": [
                 {
                     "expr": "rate(orderbook_height[1m]) * 60",
-                    "legendFormat": "Blocks/min",
+                    "legendFormat": "Book blocks/min",
                     "refId": "A"
+                },
+                {
+                    "expr": "rate(order_status_height[1m]) * 60",
+                    "legendFormat": "Status blocks/min",
+                    "refId": "B"
+                },
+                {
+                    "expr": "rate(order_diff_height[1m]) * 60",
+                    "legendFormat": "Diff blocks/min",
+                    "refId": "C"
                 }
             ],
-            "title": "\ud83d\udd22 Block Processing Rate",
+            "title": "\ud83d\udd22 Stream Processing Rate",
             "type": "timeseries"
         },
         {
