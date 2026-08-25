@@ -178,13 +178,7 @@ fn websocket_token_authorized(secret: Option<&str>, token: Option<&str>) -> bool
 }
 
 pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
-    // Broadcast channel buffer. Each buffered Snapshot now holds Arc'd inner maps
-    // shared across receivers, so deep cloning is no longer the cost - but a slow
-    // receiver still pins one Arc<InternalMessage> per buffered slot. 32 is well
-    // above the steady-state queue depth and keeps worst-case transient memory bounded.
-    // Slow receivers fall into the existing `RecvError::Lagged` shedding path
-    // (CHANNEL_DROPS_TOTAL is incremented).
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(32);
+    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
     let order_sync = config.features.ordersync().then(OrderSyncHub::spawn);
 
     // Market filter flags from config
