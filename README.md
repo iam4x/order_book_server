@@ -448,11 +448,14 @@ curl http://localhost:9090/metrics
 | | `messages_sent_total` | Total WebSocket messages sent |
 | | `bbo_changes_total{coin}` | BBO changes per coin |
 | **Health** | `orderbook_height` | Current block height |
+| | `order_status_height` | Latest processed order-status block height |
+| | `order_diff_height` | Latest processed order-diff block height |
 | | `orderbook_time_ms` | Orderbook timestamp |
 | | `orderbook_orders_total` | Total orders in the book |
 | | `orderbook_coins_count` | Number of coins tracked |
 | | `pending_orders_cache_size` | Pending order statuses in HFT cache |
 | | `pending_diffs_cache_size` | Pending book diffs in HFT cache |
+| | `order_stream_queue_depth` | File events waiting in the async order-stream queue |
 | | `uptime_seconds` | Server uptime in seconds |
 | | `server_start_time_seconds` | Server start timestamp (unix) |
 | **Latency** | `bbo_broadcast_latency_seconds` | BBO broadcast latency histogram |
@@ -461,6 +464,7 @@ curl http://localhost:9090/metrics
 | **File Watcher** | `file_events_total{source}` | File events received by source |
 | | `file_lines_parsed_total{source}` | Lines parsed from files by source |
 | **Errors** | `parse_errors_total{type}` | JSON parse errors by source |
+| | `orderbook_repair_requests_total{reason}` | Snapshot repair requests after pending-pair or stream data loss |
 | | `ws_send_errors_total` | WebSocket send errors |
 | | `channel_drops_total` | Messages dropped due to lag |
 | | `broadcast_channel_lag` | Broadcast channel lag (receivers behind) |
