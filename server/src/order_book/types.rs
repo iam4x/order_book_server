@@ -34,7 +34,7 @@ impl Sz {
     pub(super) const fn is_positive(self) -> bool {
         self.0 > 0
     }
-    pub(super) const fn is_zero(self) -> bool {
+    pub(crate) const fn is_zero(self) -> bool {
         self.0 == 0
     }
     pub(crate) const fn value(self) -> u64 {
@@ -57,6 +57,10 @@ impl Px {
 impl Oid {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.0
     }
 }
 

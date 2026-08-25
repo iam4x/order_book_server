@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
+    future::Future,
     io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
@@ -59,7 +60,10 @@ const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 10_000_000;
 const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 20_000_000;
 const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 8 * 1024 * 1024 * 1024;
-const SNAPSHOT_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(10);
+const SNAPSHOT_VISOR_CATCHUP_POLL: Duration = Duration::from_millis(100);
+const SNAPSHOT_VISOR_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SNAPSHOT_REPAIR_RETRY_BASE: Duration = Duration::from_secs(10);
+const SNAPSHOT_REPAIR_RETRY_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotTaskKind {
@@ -77,6 +81,31 @@ enum SnapshotInstallOutcome {
     Installed { replayed_lines: usize },
     SkippedReplayOverflow { cached_lines: usize, cached_bytes: usize },
     SkippedStaleSnapshot { snapshot_height: u64, replay_cutoff_height: u64, started_book_height: u64 },
+}
+
+#[derive(Debug, Default)]
+struct RepairRetryBackoff {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl RepairRetryBackoff {
+    const fn retry_at(&self) -> Option<Instant> {
+        self.retry_at
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        let exponent = self.consecutive_failures.min(31);
+        let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+        let delay = SNAPSHOT_REPAIR_RETRY_BASE.saturating_mul(multiplier).min(SNAPSHOT_REPAIR_RETRY_MAX);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_at = Some(now + delay);
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,8 +366,8 @@ fn next_snapshot_trigger(
     if !is_ready {
         return Some(SnapshotTaskKind::Initial);
     }
-    if repair_pending && repair_retry_at.is_none_or(|retry_at| now >= retry_at) {
-        return Some(SnapshotTaskKind::Refresh);
+    if repair_pending {
+        return repair_retry_at.is_none_or(|retry_at| now >= retry_at).then_some(SnapshotTaskKind::Refresh);
     }
     if next_refresh_at.is_some_and(|refresh_at| now >= refresh_at) {
         return Some(SnapshotTaskKind::Refresh);
@@ -366,6 +395,34 @@ fn snapshot_replay_cutoff_height(
     }
 }
 
+async fn wait_for_visor_floor<F, Fut>(floor: u64, timeout: Duration, mut read_height: F) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<u64>>,
+{
+    tokio::time::timeout(timeout, async move {
+        loop {
+            match read_height().await {
+                Ok(observed) if observed >= floor => return Ok(observed),
+                Ok(_) | Err(_) => sleep(SNAPSHOT_VISOR_CATCHUP_POLL).await,
+            }
+        }
+    })
+    .await
+    .map_err(|_| -> Error { format!("Visor did not reach replay floor {floor} within {timeout:?}").into() })?
+}
+
+async fn read_visor_height_at_replay_floor<F, Fut>(floor: u64, timeout: Duration, mut read_height: F) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<u64>>,
+{
+    match read_height().await {
+        Ok(observed) if observed >= floor => Ok(observed),
+        Ok(_) | Err(_) => wait_for_visor_floor(floor, timeout, read_height).await,
+    }
+}
+
 fn fetch_snapshot(
     kind: SnapshotTaskKind,
     snapshot_config: SnapshotConfig,
@@ -378,10 +435,17 @@ fn fetch_snapshot(
         let res: Result<SnapshotInstallOutcome> = async {
             // Start replay capture before generating the snapshot so the new state can
             // catch up to events written while hl-node is reading abci_state.rmp.
-            listener.lock().await.begin_snapshot_replay_for(kind)?;
+            let started_book_height = listener.lock().await.begin_snapshot_replay_for(kind)?;
 
             let visor_path = get_visor_path(&snapshot_config);
-            let visor_height_before = read_visor_height(&visor_path).await;
+            // Keep the error rather than returning early: embedded-height output
+            // remains safe and does not depend on visor availability.
+            let visor_height_before =
+                read_visor_height_at_replay_floor(started_book_height, SNAPSHOT_VISOR_CATCHUP_TIMEOUT, || {
+                    let visor_path = visor_path.clone();
+                    async move { read_visor_height(&visor_path).await }
+                })
+                .await;
             let output_fln = process_rmp_file(&snapshot_config).await?;
             let visor_height_after = read_visor_height(&visor_path).await;
             let fallback_height =
@@ -628,14 +692,15 @@ impl OrderBookListener {
 
     #[cfg(test)]
     fn begin_snapshot_replay(&mut self) {
-        self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh).expect("temporary replay journal should open");
+        let _unused =
+            self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh).expect("temporary replay journal should open");
     }
 
-    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<()> {
+    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<u64> {
         let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
         self.snapshot_replay_cache =
             Some(SnapshotReplayCache::new(started_book_height, kind, self.repair_requested_epoch)?);
-        Ok(())
+        Ok(started_book_height)
     }
 
     fn clear_snapshot_replay(&mut self) {
@@ -1555,7 +1620,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     compaction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_fetch_pending = false;
     let mut next_refresh_at: Option<Instant> = None;
-    let mut repair_retry_at: Option<Instant> = None;
+    let mut repair_backoff = RepairRetryBackoff::default();
     let mut ready_events = Vec::with_capacity(64);
 
     info!("Main event loop starting");
@@ -1595,7 +1660,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     config.features,
                     snapshot_fetch_pending,
                     next_refresh_at,
-                    repair_retry_at,
+                    repair_backoff.retry_at(),
                     Instant::now(),
                     &snapshot_config,
                     &snapshot_fetch_task_tx,
@@ -1624,14 +1689,14 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
                         warn!("Background snapshot refresh failed; keeping current order book: {err}");
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
-                        repair_retry_at = listener
-                            .lock()
-                            .await
-                            .repair_pending()
-                            .then(|| Instant::now() + SNAPSHOT_REPAIR_RETRY_DELAY);
+                        let now = Instant::now();
+                        if listener.lock().await.repair_pending() {
+                            repair_backoff.record_failure(now);
+                        } else {
+                            repair_backoff.reset();
+                        }
                     }
                     Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
-                        let installed = matches!(outcome, SnapshotInstallOutcome::Installed { .. });
                         match outcome {
                             SnapshotInstallOutcome::Installed { replayed_lines } => {
                                 info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
@@ -1655,9 +1720,13 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             }
                         }
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
-                        repair_retry_at = listener.lock().await.repair_pending().then(|| {
-                            if installed { Instant::now() } else { Instant::now() + SNAPSHOT_REPAIR_RETRY_DELAY }
-                        });
+                        let now = Instant::now();
+                        let repair_pending = listener.lock().await.repair_pending();
+                        if repair_pending {
+                            repair_backoff.record_failure(now);
+                        } else {
+                            repair_backoff.reset();
+                        }
                     }
                 }
             }
@@ -1707,7 +1776,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     config.features,
                     snapshot_fetch_pending,
                     next_refresh_at,
-                    repair_retry_at,
+                    repair_backoff.retry_at(),
                     now,
                     &snapshot_config,
                     &snapshot_fetch_task_tx,
@@ -1790,6 +1859,7 @@ mod tests {
                 {
                     "user": "0x0000000000000000000000000000000000000000",
                     "oid": 1u64,
+                    "side": "B",
                     "px": "100",
                     "coin": "BTC",
                     "raw_book_diff": { "new": { "sz": "1" } }
@@ -1797,6 +1867,7 @@ mod tests {
                 {
                     "user": "0x0000000000000000000000000000000000000000",
                     "oid": 2u64,
+                    "side": "B",
                     "px": "100",
                     "coin": "BTC",
                     "raw_book_diff": { "update": { "origSz": "1", "newSz": "2" } }
@@ -1804,6 +1875,7 @@ mod tests {
                 {
                     "user": "0x0000000000000000000000000000000000000000",
                     "oid": 3u64,
+                    "side": "B",
                     "px": "100",
                     "coin": "BTC",
                     "raw_book_diff": "remove"
@@ -1944,6 +2016,7 @@ mod tests {
             "events": [{
                 "user": "0x0000000000000000000000000000000000000000",
                 "oid": oid,
+                "side": "B",
                 "px": "100",
                 "coin": coin,
                 "raw_book_diff": {
@@ -1969,6 +2042,7 @@ mod tests {
             "events": [{
                 "user": "0x0000000000000000000000000000000000000000",
                 "oid": oid,
+                "side": "B",
                 "px": "100",
                 "coin": coin,
                 "raw_book_diff": { "new": { "sz": sz } }
@@ -2136,6 +2210,98 @@ mod tests {
             next_snapshot_trigger(features("bbo"), true, false, None, true, Some(now + Duration::from_secs(1)), now,),
             None
         );
+        assert_eq!(
+            next_snapshot_trigger(
+                features("bbo"),
+                true,
+                false,
+                Some(now),
+                true,
+                Some(now + Duration::from_secs(1)),
+                now,
+            ),
+            None,
+            "a periodic refresh must not bypass repair backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visor_waiter_polls_until_replay_floor() {
+        let observations = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([88, 99, 100])));
+        let observed = wait_for_visor_floor(100, Duration::from_secs(1), {
+            let observations = Arc::clone(&observations);
+            move || {
+                let next = observations.lock().unwrap().pop_front().unwrap_or(100);
+                std::future::ready(Ok(next))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed, 100);
+        assert!(observations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visor_waiter_retries_transient_read_errors() {
+        let observations = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Err("transient read".into()),
+            Ok(99),
+            Ok(100),
+        ])));
+        let observed = wait_for_visor_floor(100, Duration::from_secs(1), {
+            let observations = Arc::clone(&observations);
+            move || {
+                let next = observations.lock().unwrap().pop_front().unwrap_or(Ok(100));
+                std::future::ready(next)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed, 100);
+        assert!(observations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_visor_read_retries_an_initial_error() {
+        let observations =
+            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([Err("transient read".into()), Ok(100)])));
+        let observed = read_visor_height_at_replay_floor(100, Duration::from_secs(1), {
+            let observations = Arc::clone(&observations);
+            move || {
+                let next = observations.lock().unwrap().pop_front().unwrap_or(Ok(100));
+                std::future::ready(next)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(observed, 100);
+        assert!(observations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visor_waiter_times_out_below_replay_floor() {
+        let error =
+            wait_for_visor_floor(100, Duration::from_millis(250), || std::future::ready(Ok(99))).await.unwrap_err();
+
+        assert!(error.to_string().contains("Visor did not reach replay floor 100"));
+    }
+
+    #[test]
+    fn repair_retry_backoff_caps_and_resets_after_convergence() {
+        let now = Instant::now();
+        let mut backoff = RepairRetryBackoff::default();
+        for expected_seconds in [10, 20, 40, 80, 160, 300, 300] {
+            backoff.record_failure(now);
+            assert_eq!(backoff.retry_at().unwrap().duration_since(now), Duration::from_secs(expected_seconds));
+        }
+
+        backoff.reset();
+        assert_eq!(backoff.retry_at(), None);
+        backoff.record_failure(now);
+        assert_eq!(backoff.retry_at().unwrap().duration_since(now), Duration::from_secs(10));
     }
 
     #[test]

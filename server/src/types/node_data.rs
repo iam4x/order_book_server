@@ -5,14 +5,19 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::{Coin, Oid},
+    order_book::{Coin, Oid, types::Side},
     types::{Fill, L4Order, OrderDiff},
 };
+
+const ASSISTANCE_FUND_USER: Address = Address::repeat_byte(0xFE);
+const HIP2_USER: Address = Address::repeat_byte(0xFF);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderDiff {
     user: Address,
     oid: u64,
+    #[serde(default, skip_serializing)]
+    side: Option<Side>,
     px: String,
     coin: String,
     pub(crate) raw_book_diff: OrderDiff,
@@ -28,6 +33,22 @@ impl NodeDataOrderDiff {
 
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
+    }
+
+    pub(crate) const fn user(&self) -> Address {
+        self.user
+    }
+
+    pub(crate) const fn side(&self) -> Option<Side> {
+        self.side
+    }
+
+    pub(crate) fn px(&self) -> &str {
+        &self.px
+    }
+
+    pub(crate) const fn is_statusless_system_user(&self) -> bool {
+        matches!(self.user, ASSISTANCE_FUND_USER | HIP2_USER)
     }
 }
 
@@ -257,19 +278,20 @@ mod tests {
 
     #[test]
     fn test_node_data_order_diff_serde_new_with_insert_before() {
-        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":123,"px":"50000.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.5","insertBefore":456}}}"#;
+        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":123,"side":"B","px":"50000.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.5","insertBefore":456}}}"#;
         let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
         let serialized = serde_json::to_value(&diff).unwrap();
 
         assert!(
             matches!(diff.diff(), OrderDiff::New { sz, insert_before } if sz == "1.5" && insert_before == Some(456))
         );
+        assert!(serialized.get("side").is_none());
         assert_eq!(serialized["raw_book_diff"]["new"]["insertBefore"], serde_json::json!(456));
     }
 
     #[test]
     fn test_node_data_order_diff_serde_update() {
-        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":456,"px":"50000.0","coin":"ETH","raw_book_diff":{"update":{"origSz":"2.0","newSz":"1.0"}}}"#;
+        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":456,"side":"A","px":"50000.0","coin":"ETH","raw_book_diff":{"update":{"origSz":"2.0","newSz":"1.0"}}}"#;
         let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
         assert_eq!(diff.oid(), Oid::new(456));
         assert!(matches!(diff.diff(), OrderDiff::Update { orig_sz, new_sz } if orig_sz == "2.0" && new_sz == "1.0"));
@@ -277,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_node_data_order_diff_serde_remove() {
-        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":789,"px":"50000.0","coin":"SOL","raw_book_diff":"remove"}"#;
+        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":789,"side":"B","px":"50000.0","coin":"SOL","raw_book_diff":"remove"}"#;
         let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
         assert_eq!(diff.oid(), Oid::new(789));
         assert!(matches!(diff.diff(), OrderDiff::Remove));
@@ -292,7 +314,7 @@ mod tests {
             "block_time": "2024-01-15T10:30:45.000000000",
             "block_number": 12345,
             "events": [
-                {"user":"0x0000000000000000000000000000000000000001","oid":1,"px":"100.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.0"}}}
+                {"user":"0x0000000000000000000000000000000000000001","oid":1,"side":"B","px":"100.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.0"}}}
             ]
         }"#;
         let batch: Batch<NodeDataOrderDiff> = serde_json::from_str(json).unwrap();

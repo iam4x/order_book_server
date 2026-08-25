@@ -1,14 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots},
     order_book::{
-        Coin, InnerOrder, Oid, QueuePlacement, RawBbo, Sz,
+        Coin, InnerOrder, Oid, Px, QueuePlacement, RawBbo, Sz,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -25,6 +25,7 @@ pub(super) struct OrderBookState {
     ignore_spot: bool,
     pending_order_statuses: FxHashMap<Oid, Pending<NodeDataOrderStatus>>,
     pending_new_diffs: FxHashMap<Oid, Pending<PendingNewDiff>>,
+    resolved_order_tombstones: ResolvedOrderTombstones,
     order_status_height: u64,
     order_diff_height: u64,
     repair_reasons: HashSet<PendingRepairReason>,
@@ -33,10 +34,50 @@ pub(super) struct OrderBookState {
 const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_PENDING_ORDER_STATUSES: usize = 50_000;
 const MAX_PENDING_NEW_DIFFS: usize = 10_000;
+const TOMBSTONE_INSERT_CLEANUP_BUDGET: usize = 16;
+const TOMBSTONE_MAINTENANCE_CLEANUP_BUDGET: usize = 4_096;
 
 struct Pending<T> {
     payload: T,
     first_seen: Instant,
+}
+
+#[derive(Default)]
+struct ResolvedOrderTombstones {
+    oids: FxHashSet<Oid>,
+    expiry_order: VecDeque<(Instant, Oid)>,
+}
+
+impl ResolvedOrderTombstones {
+    fn contains(&self, oid: &Oid) -> bool {
+        self.oids.contains(oid)
+    }
+
+    fn insert(&mut self, oid: Oid, now: Instant) {
+        self.cleanup(now, TOMBSTONE_INSERT_CLEANUP_BUDGET);
+        if self.oids.insert(oid.clone()) {
+            self.expiry_order.push_back((now, oid));
+        }
+    }
+
+    fn cleanup(&mut self, now: Instant, budget: usize) {
+        for _ in 0..budget {
+            if !self
+                .expiry_order
+                .front()
+                .is_some_and(|(inserted_at, _)| now.saturating_duration_since(*inserted_at) > PENDING_MAX_AGE)
+            {
+                break;
+            }
+            self.remove_oldest();
+        }
+    }
+
+    fn remove_oldest(&mut self) {
+        if let Some((_, oid)) = self.expiry_order.pop_front() {
+            self.oids.remove(&oid);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -48,7 +89,6 @@ struct PendingNewDiff {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum PendingRepairReason {
-    ExpiredStatus,
     ExpiredDiff,
     StatusCapacity,
     DiffCapacity,
@@ -58,7 +98,6 @@ pub(super) enum PendingRepairReason {
 impl PendingRepairReason {
     pub(super) const fn metric_label(self) -> &'static str {
         match self {
-            Self::ExpiredStatus => "expired_status",
             Self::ExpiredDiff => "expired_diff",
             Self::StatusCapacity => "status_capacity",
             Self::DiffCapacity => "diff_capacity",
@@ -96,6 +135,7 @@ impl OrderBookState {
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: FxHashMap::default(),
             pending_new_diffs: FxHashMap::default(),
+            resolved_order_tombstones: ResolvedOrderTombstones::default(),
             order_status_height: height,
             order_diff_height: height,
             repair_reasons: HashSet::new(),
@@ -187,8 +227,7 @@ impl OrderBookState {
             .retain(|_, pending| now.saturating_duration_since(pending.first_seen) <= PENDING_MAX_AGE);
         let expired_statuses = old_statuses - self.pending_order_statuses.len();
         if expired_statuses > 0 {
-            log::warn!("Expired {expired_statuses} unmatched order statuses after 60 seconds");
-            self.repair_reasons.insert(PendingRepairReason::ExpiredStatus);
+            log::debug!("Expired {expired_statuses} unmatched order statuses after 60 seconds");
         }
 
         let old_diffs = self.pending_new_diffs.len();
@@ -199,6 +238,8 @@ impl OrderBookState {
             log::warn!("Expired {expired_diffs} unmatched new-order diffs after 60 seconds");
             self.repair_reasons.insert(PendingRepairReason::ExpiredDiff);
         }
+
+        self.resolved_order_tombstones.cleanup(now, TOMBSTONE_MAINTENANCE_CLEANUP_BUDGET);
     }
 
     pub(super) fn compact_order_book(&mut self) {
@@ -241,6 +282,19 @@ impl OrderBookState {
         self.pending_new_diffs.insert(oid, Pending { payload: diff, first_seen: Instant::now() });
     }
 
+    fn tombstone_resolved_order(&mut self, oid: Oid) {
+        self.resolved_order_tombstones.insert(oid, Instant::now());
+    }
+
+    fn add_resolved_order(&mut self, order: InnerL4Order, insert_before: Option<Oid>) {
+        let oid = order.oid();
+        let coin = order.coin();
+        record_insert_before_placement(self.order_book.add_order_before(order, insert_before));
+        if self.order_book.order_sz(&oid, &coin).is_none() {
+            self.tombstone_resolved_order(oid);
+        }
+    }
+
     /// Get BBO for specific coins only - even faster for selective broadcast
     /// Only computes BBO for coins that changed, avoiding iteration over all 150+ coins
     pub(super) fn get_bbos_for_coins(&self, coins: &HashSet<Coin>) -> (u64, HashMap<Coin, RawBbo>) {
@@ -276,14 +330,25 @@ impl OrderBookState {
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
             let order_coin = Coin::new(&order_status.order.coin);
-            if (order_coin.is_spot() && self.ignore_spot) || !order_status.is_inserted_into_book() {
+            if order_coin.is_spot() && self.ignore_spot {
+                continue;
+            }
+            if self.resolved_order_tombstones.contains(&oid) {
+                continue;
+            }
+            if self.order_book.order_sz(&oid, &order_coin).is_some() {
                 continue;
             }
 
-            if let Some(pending_diff) = self.pending_new_diffs.get(&oid) {
+            // A dormant trigger's open status is not a terminal lifecycle event.
+            // Leave an already-seen New diff available for the later triggered status.
+            if order_status.status == "open" && order_status.order.is_trigger {
+                continue;
+            }
+
+            if let Some(pending_diff) = self.pending_new_diffs.remove(&oid) {
                 if pending_diff.payload.coin != order_coin {
                     let diff_coin = pending_diff.payload.coin.clone();
-                    self.pending_new_diffs.remove(&oid);
                     self.repair_reasons.insert(PendingRepairReason::CoinMismatch);
                     log::warn!(
                         "Rejecting mismatched order halves for oid={oid:?}: status coin={order_coin:?}, diff coin={diff_coin:?}"
@@ -291,20 +356,25 @@ impl OrderBookState {
                     continue;
                 }
 
-                let pending_diff = pending_diff.payload.clone();
+                if !order_status.is_inserted_into_book() {
+                    self.tombstone_resolved_order(oid);
+                    continue;
+                }
+
+                let pending_diff = pending_diff.payload;
                 let time = order_status.time.and_utc().timestamp_millis();
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(pending_diff.sz);
                 inner_order.convert_trigger(u64::try_from(time).unwrap_or_default());
-                self.pending_new_diffs.remove(&oid);
-                record_insert_before_placement(
-                    self.order_book.add_order_before(inner_order, pending_diff.insert_before),
-                );
+                self.add_resolved_order(inner_order, pending_diff.insert_before);
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
-            } else {
+            } else if order_status.is_inserted_into_book() {
                 // Diff hasn't arrived yet - cache the OrderStatus
                 self.insert_pending_status(oid, order_status);
+            } else {
+                self.pending_order_statuses.remove(&oid);
+                self.tombstone_resolved_order(oid);
             }
         }
         Ok(changed_coins)
@@ -356,11 +426,45 @@ impl OrderBookState {
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz, insert_before } => {
+                    if self.resolved_order_tombstones.contains(&oid) {
+                        continue;
+                    }
+                    if self.order_book.order_sz(&oid, &coin).is_some() {
+                        log::debug!("Ignoring duplicate OrderDiff::New for live oid={oid:?} coin={coin:?}");
+                        continue;
+                    }
+
+                    if coin.is_spot() && diff.is_statusless_system_user() {
+                        self.pending_order_statuses.remove(&oid);
+                        let side = diff.side().ok_or_else(|| -> Error {
+                            format!("Missing side for statusless system order oid={oid:?} coin={coin:?}").into()
+                        })?;
+                        let inner_order = InnerL4Order {
+                            user: diff.user(),
+                            coin: coin.clone(),
+                            side,
+                            limit_px: Px::parse_from_str(diff.px())?,
+                            sz,
+                            oid: oid.value(),
+                            timestamp: time,
+                            trigger_condition: "N/A".to_string(),
+                            is_trigger: false,
+                            trigger_px: "0.0".to_string(),
+                            is_position_tpsl: false,
+                            reduce_only: false,
+                            order_type: "Limit".to_string(),
+                            tif: Some("Alo".to_string()),
+                            cloid: None,
+                        };
+                        self.add_resolved_order(inner_order, insert_before);
+                        changed_coins.insert(coin);
+                        continue;
+                    }
+
                     // Check if OrderStatus already arrived
-                    if let Some(pending_order) = self.pending_order_statuses.get(&oid) {
+                    if let Some(pending_order) = self.pending_order_statuses.remove(&oid) {
                         let order_coin = Coin::new(&pending_order.payload.order.coin);
                         if order_coin != coin {
-                            self.pending_order_statuses.remove(&oid);
                             self.repair_reasons.insert(PendingRepairReason::CoinMismatch);
                             log::warn!(
                                 "Rejecting mismatched order halves for oid={oid:?}: status coin={order_coin:?}, diff coin={coin:?}"
@@ -369,11 +473,10 @@ impl OrderBookState {
                         }
 
                         let time = pending_order.payload.time.and_utc().timestamp_millis();
-                        let mut inner_order: InnerL4Order = pending_order.payload.clone().try_into()?;
+                        let mut inner_order: InnerL4Order = pending_order.payload.try_into()?;
                         inner_order.modify_sz(sz);
                         inner_order.convert_trigger(u64::try_from(time).unwrap_or_default());
-                        self.pending_order_statuses.remove(&oid);
-                        record_insert_before_placement(self.order_book.add_order_before(inner_order, insert_before));
+                        self.add_resolved_order(inner_order, insert_before);
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
@@ -381,14 +484,49 @@ impl OrderBookState {
                     }
                 }
                 InnerOrderDiff::Update { orig_sz, new_sz } => {
+                    if let Some(pending_coin) =
+                        self.pending_new_diffs.get(&oid).map(|pending| pending.payload.coin.clone())
+                    {
+                        if pending_coin != coin {
+                            self.pending_new_diffs.remove(&oid);
+                            self.repair_reasons.insert(PendingRepairReason::CoinMismatch);
+                            log::warn!(
+                                "Rejecting mismatched pending update for oid={oid:?}: new coin={pending_coin:?}, update coin={coin:?}"
+                            );
+                            continue;
+                        }
+
+                        let pending = self.pending_new_diffs.get_mut(&oid).expect("pending diff was just observed");
+                        let apply_update = mode == OrderDiffApplyMode::Live || pending.payload.sz == orig_sz;
+                        if apply_update {
+                            pending.payload.sz = new_sz;
+                            if new_sz.is_zero() {
+                                self.pending_new_diffs.remove(&oid);
+                                self.tombstone_resolved_order(oid);
+                            }
+                        } else if pending.payload.sz != new_sz {
+                            log::debug!(
+                                "Skipping stale replayed pending OrderDiff::Update for oid={oid:?} coin={coin:?}"
+                            );
+                        }
+                        continue;
+                    }
+
                     if mode == OrderDiffApplyMode::Live {
-                        let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
-                        changed_coins.insert(coin);
+                        if self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                            changed_coins.insert(coin);
+                        }
+                        if new_sz.is_zero() {
+                            self.tombstone_resolved_order(oid);
+                        }
                     } else {
                         match self.order_book.order_sz(&oid, &coin) {
                             Some(current_sz) if current_sz == orig_sz => {
-                                if self.order_book.modify_sz(oid, coin.clone(), new_sz) {
+                                if self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
                                     changed_coins.insert(coin);
+                                    if new_sz.is_zero() {
+                                        self.tombstone_resolved_order(oid);
+                                    }
                                 }
                             }
                             Some(current_sz) if current_sz == new_sz => {
@@ -410,8 +548,12 @@ impl OrderBookState {
                     }
                 }
                 InnerOrderDiff::Remove => {
-                    let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
-                    changed_coins.insert(coin);
+                    self.pending_new_diffs.remove(&oid);
+                    self.pending_order_statuses.remove(&oid);
+                    self.tombstone_resolved_order(oid.clone());
+                    if self.order_book.cancel_order(oid, coin.clone()) {
+                        changed_coins.insert(coin);
+                    }
                 }
             }
         }
@@ -482,6 +624,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "user": "0x0000000000000000000000000000000000000000",
             "oid": oid,
+            "side": "B",
             "px": "100.0",
             "coin": coin,
             "raw_book_diff": diff
@@ -508,11 +651,22 @@ mod tests {
     }
 
     fn make_diff_batch_at(diffs: Vec<NodeDataOrderDiff>, block_number: u64) -> Batch<NodeDataOrderDiff> {
+        let events: Vec<_> = diffs
+            .into_iter()
+            .map(|diff| {
+                let side = diff.side();
+                let mut value = serde_json::to_value(diff).unwrap();
+                if let Some(side) = side {
+                    value["side"] = serde_json::to_value(side).unwrap();
+                }
+                value
+            })
+            .collect();
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": block_number,
-            "events": diffs
+            "events": events
         }))
         .unwrap()
     }
@@ -657,6 +811,23 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_status_before_new_suppresses_late_diff() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 99, "filled")])).unwrap();
+
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                99,
+                OrderDiff::New { sz: "2.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
     fn test_pairs_across_fourteen_block_source_skew_in_either_order() {
         let mut state = empty_state();
         let status_first = make_order_status("BTC", 100, "open");
@@ -742,6 +913,30 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_size_update_resolves_pending_new_and_suppresses_late_status() {
+        let mut state = empty_state();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "0".to_string() },
+            )]))
+            .unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
     fn test_replay_diff_update_with_mismatched_orig_size_is_ignored() {
         let mut state = empty_state();
         let status = make_order_status("BTC", 1, "open");
@@ -796,6 +991,51 @@ mod tests {
     }
 
     #[test]
+    fn test_resolved_tombstone_does_not_suppress_remove_for_live_order() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        state.resolved_order_tombstones.insert(Oid::new(1), Instant::now());
+
+        let changed =
+            state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 1, OrderDiff::Remove)])).unwrap();
+
+        assert!(changed.contains(&Coin::new("BTC")));
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_live_remove_suppresses_duplicate_new() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 1, OrderDiff::Remove)])).unwrap();
+
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
     fn test_system_spot_new_diffs_insert_without_statuses() {
         for address_byte in ["fe", "ff"] {
             let mut state = empty_state();
@@ -817,6 +1057,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_fully_matched_system_spot_new_suppresses_duplicate() {
+        let mut state = empty_state();
+        let resting_order: InnerL4Order =
+            (Address::ZERO, make_l4_order_at("@260", 1, crate::order_book::types::Side::Ask, "325.5"))
+                .try_into()
+                .unwrap();
+        state.order_book.add_order(resting_order);
+        let diff: NodeDataOrderDiff = serde_json::from_value(serde_json::json!({
+            "user": format!("0x{}", "fe".repeat(20)),
+            "oid": 7,
+            "side": "B",
+            "px": "325.5",
+            "coin": "@260",
+            "raw_book_diff": OrderDiff::New { sz: "1.0".to_string(), insert_before: None }
+        }))
+        .unwrap();
+
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff.clone()])).unwrap();
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert_eq!(state.order_count(), 0);
+        assert!(state.resolved_order_tombstones.contains(&Oid::new(7)));
+    }
+
+    #[test]
+    fn test_system_perp_new_diff_still_waits_for_status() {
+        let mut state = empty_state();
+        let diff: NodeDataOrderDiff = serde_json::from_value(serde_json::json!({
+            "user": format!("0x{}", "fe".repeat(20)),
+            "oid": 7,
+            "side": "B",
+            "px": "325.5",
+            "coin": "BTC",
+            "raw_book_diff": OrderDiff::New { sz: "3.0".to_string(), insert_before: None }
+        }))
+        .unwrap();
+
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 1);
+    }
+
     // ==================== Status Filtering ====================
 
     #[test]
@@ -835,6 +1120,50 @@ mod tests {
         status.order.tif = Some("Ioc".to_string());
         state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
         assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_open_status_for_live_order_is_not_cached() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "1.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
+    fn test_dormant_trigger_open_keeps_pending_new_for_triggered_status() {
+        let mut state = empty_state();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "2.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        let mut dormant = make_order_status("BTC", 1, "open");
+        dormant.order.is_trigger = true;
+
+        state.apply_order_statuses_hft(make_status_batch(vec![dormant])).unwrap();
+
+        assert_eq!(state.pending_new_diffs_count(), 1);
+        assert!(!state.resolved_order_tombstones.contains(&Oid::new(1)));
+
+        let mut triggered = make_order_status("BTC", 1, "triggered");
+        triggered.order.is_trigger = true;
+        state.apply_order_statuses_hft(make_status_batch(vec![triggered])).unwrap();
+
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_count(), 1);
     }
 
     // ==================== Spot Filtering ====================
@@ -1013,6 +1342,74 @@ mod tests {
 
         assert_eq!(state.pending_new_diffs_count(), 0);
         assert!(state.take_repair_reasons().contains(&PendingRepairReason::ExpiredDiff));
+    }
+
+    #[test]
+    fn resolved_order_tombstones_expire() {
+        let mut state = empty_state();
+        let now = Instant::now();
+        let expired_at = now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+        state.resolved_order_tombstones.insert(Oid::new(1), expired_at);
+
+        state.cleanup_stale_pending_at(now);
+
+        assert!(!state.resolved_order_tombstones.contains(&Oid::new(1)));
+    }
+
+    #[test]
+    fn resolved_order_tombstones_keep_the_full_ttl_during_spikes() {
+        let mut tombstones = ResolvedOrderTombstones::default();
+        let now = Instant::now();
+        for oid in 0..=250_000 {
+            tombstones.insert(Oid::new(oid), now);
+        }
+
+        assert!(tombstones.contains(&Oid::new(0)));
+    }
+
+    #[test]
+    fn inserting_a_tombstone_incrementally_expires_old_entries() {
+        let mut tombstones = ResolvedOrderTombstones::default();
+        let now = Instant::now();
+        let expired_at = now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+        tombstones.insert(Oid::new(1), expired_at);
+
+        tombstones.insert(Oid::new(2), now);
+
+        assert!(!tombstones.contains(&Oid::new(1)));
+        assert!(tombstones.contains(&Oid::new(2)));
+    }
+
+    #[test]
+    fn tombstone_cleanup_has_a_per_call_work_budget() {
+        let mut tombstones = ResolvedOrderTombstones::default();
+        let now = Instant::now();
+        let expired_at = now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+        for oid in 0..=TOMBSTONE_MAINTENANCE_CLEANUP_BUDGET as u64 {
+            tombstones.insert(Oid::new(oid), expired_at);
+        }
+
+        tombstones.cleanup(now, TOMBSTONE_MAINTENANCE_CLEANUP_BUDGET);
+
+        assert_eq!(tombstones.oids.len(), 1);
+        tombstones.cleanup(now, TOMBSTONE_MAINTENANCE_CLEANUP_BUDGET);
+        assert!(tombstones.oids.is_empty());
+    }
+
+    #[test]
+    fn tombstone_insert_cleanup_keeps_hot_path_work_small() {
+        let mut tombstones = ResolvedOrderTombstones::default();
+        let now = Instant::now();
+        let expired_at = now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+        for oid in 0..=TOMBSTONE_INSERT_CLEANUP_BUDGET as u64 {
+            tombstones.insert(Oid::new(oid), expired_at);
+        }
+
+        tombstones.insert(Oid::new(100), now);
+
+        assert_eq!(tombstones.oids.len(), 2);
+        assert!(tombstones.contains(&Oid::new(TOMBSTONE_INSERT_CLEANUP_BUDGET as u64)));
+        assert!(tombstones.contains(&Oid::new(100)));
     }
 
     #[test]
