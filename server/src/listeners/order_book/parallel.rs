@@ -462,7 +462,6 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
     })
 }
 
-/// Starts one watcher thread per enabled event source and returns their shared receiver.
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,

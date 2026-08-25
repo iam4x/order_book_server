@@ -168,13 +168,11 @@ lazy_static! {
         &["coin"]
     ).expect("metric can be created");
 
-    /// New orders placed before their requested same-level queue anchor
     pub static ref INSERT_BEFORE_HONORED_TOTAL: IntCounter = IntCounter::new(
         "insert_before_honored_total",
         "New orders placed before their requested same-level queue anchor"
     ).expect("metric can be created");
 
-    /// New orders appended because their requested same-level queue anchor was missing
     pub static ref INSERT_BEFORE_FALLBACK_TOTAL: IntCounter = IntCounter::new(
         "insert_before_fallback_total",
         "New orders appended because their requested same-level queue anchor was missing"
