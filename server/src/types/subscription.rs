@@ -573,19 +573,18 @@ mod test {
 
     #[test]
     fn test_server_response_allbbo_serialization() {
-        let allbbo = crate::types::AllBbo {
-            time: 1000,
-            bbos: vec![crate::types::AllBboEntry {
-                coin: "BTC".to_string(),
-                bid: Some(crate::types::Level::new("100".to_string(), "1.5".to_string(), 2)),
-                ask: None,
-            }],
-        };
-        let json = serde_json::to_string(&ServerResponse::AllBbo(allbbo)).unwrap();
-        assert!(json.contains("\"channel\":\"allbbo\""));
-        assert!(json.contains("\"time\":1000"));
-        assert!(json.contains("\"bbos\""));
-        assert!(json.contains("BTC"));
+        assert_eq!(
+            serde_json::to_string(&ServerResponse::AllBbo(crate::types::AllBbo {
+                time: 1000,
+                bbos: vec![crate::types::AllBboEntry {
+                    coin: "BTC".to_string(),
+                    bid: Some("100".to_string()),
+                    ask: None,
+                }],
+            }))
+            .unwrap(),
+            r#"{"channel":"allbbo","data":{"time":1000,"bbos":[{"coin":"BTC","bid":"100","ask":null}]}}"#,
+        );
     }
 
     #[test]

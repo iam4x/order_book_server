@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -70,9 +70,59 @@ struct BboDedupTuple {
 
 #[derive(Default)]
 struct AllBboCache {
-    tuples: HashMap<String, BboDedupTuple>,
-    last_sent: Option<Instant>,
-    payload: Option<AllBbo>,
+    entries_by_coin: HashMap<String, AllBboEntry>,
+    last_payload: Option<CachedAllBboPayload>,
+}
+
+struct CachedAllBboPayload {
+    sent_at: Instant,
+    payload: AllBbo,
+}
+
+impl AllBboCache {
+    fn prime_snapshot(&mut self, payload: &AllBbo, sent_at: Instant) {
+        self.entries_by_coin = payload.bbos.iter().cloned().map(|entry| (entry.coin.clone(), entry)).collect();
+        self.last_payload = Some(CachedAllBboPayload { sent_at, payload: payload.clone() });
+    }
+
+    fn delta<I>(&mut self, time: u64, entries: I, sent_at: Instant) -> Option<AllBbo>
+    where
+        I: IntoIterator<Item = AllBboEntry>,
+    {
+        let mut changed = Vec::new();
+        for entry in entries {
+            match self.entries_by_coin.entry(entry.coin.clone()) {
+                Entry::Occupied(cached) if cached.get() == &entry => {}
+                Entry::Occupied(mut cached) => {
+                    cached.insert(entry.clone());
+                    changed.push(entry);
+                }
+                Entry::Vacant(cached) => {
+                    cached.insert(entry.clone());
+                    changed.push(entry);
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return None;
+        }
+
+        let payload = AllBbo { time, bbos: changed };
+        self.last_payload = Some(CachedAllBboPayload { sent_at, payload: payload.clone() });
+        Some(payload)
+    }
+
+    fn heartbeat(&mut self, now: Instant, time: u64, interval: Duration) -> Option<AllBbo> {
+        let cached = self.last_payload.as_mut()?;
+        if now.duration_since(cached.sent_at) < interval {
+            return None;
+        }
+
+        cached.sent_at = now;
+        cached.payload.time = time;
+        Some(cached.payload.clone())
+    }
 }
 
 struct ConnectionL2Registrations {
@@ -604,15 +654,9 @@ async fn handle_socket(
                         }
                         Subscription::AllBbo => {
                             let Some(hb) = allbbo_hb else { continue };
-                            let Some(last_sent) = last_allbbo.last_sent else { continue };
-                            if now.duration_since(last_sent) >= hb {
-                                if let Some(payload) = last_allbbo.payload.as_mut() {
-                                    payload.time = now_ms;
-                                    last_allbbo.last_sent = Some(now);
-                                    BROADCASTS_TOTAL.with_label_values(&["allbbo_heartbeat"]).inc();
-                                    alive &= outbound.send_message(ServerResponse::AllBbo(payload.clone()));
-                                }
-                            }
+                            let Some(payload) = last_allbbo.heartbeat(now, now_ms, hb) else { continue };
+                            BROADCASTS_TOTAL.with_label_values(&["allbbo_heartbeat"]).inc();
+                            alive &= outbound.send_message(ServerResponse::AllBbo(payload));
                         }
                         _ => {}
                     }
@@ -790,7 +834,7 @@ async fn receive_client_message(
         }
         if let Some(snapshot_msg) = snapshot_msg {
             if let ServerResponse::AllBbo(payload) = &snapshot_msg {
-                prime_allbbo_cache(last_allbbo, payload);
+                last_allbbo.prime_snapshot(payload, Instant::now());
             }
             return outbound.send_message(snapshot_msg);
         }
@@ -833,28 +877,13 @@ fn send_ws_data_from_allbbo(
     market_filter: (bool, bool, bool),
     last_allbbo: &mut AllBboCache,
 ) -> bool {
-    let mut changed = Vec::with_capacity(bbos.len());
-    for (coin, raw_bbo) in bbos {
-        if !market_filter_allows_coin_ref(coin, market_filter) {
-            continue;
-        }
-        let entry = allbbo_entry_from_raw(coin, *raw_bbo);
-        let current = dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref());
-        if last_allbbo.tuples.get(&entry.coin) == Some(&current) {
-            continue;
-        }
-        last_allbbo.tuples.insert(entry.coin.clone(), current);
-        changed.push(entry);
-    }
-
-    if changed.is_empty() {
-        return true;
-    }
+    let entries = bbos
+        .iter()
+        .filter(|(coin, _)| market_filter_allows_coin_ref(coin, market_filter))
+        .map(|(coin, raw_bbo)| allbbo_entry_from_raw(coin, *raw_bbo));
+    let Some(payload) = last_allbbo.delta(time, entries, Instant::now()) else { return true };
 
     BROADCASTS_TOTAL.with_label_values(&["allbbo"]).inc();
-    let payload = AllBbo { time, bbos: changed };
-    last_allbbo.last_sent = Some(Instant::now());
-    last_allbbo.payload = Some(payload.clone());
     outbound.send_message(ServerResponse::AllBbo(payload))
 }
 
@@ -867,8 +896,11 @@ fn levels_from_raw_bbo(raw_bbo: RawBbo) -> (Option<Level>, Option<Level>) {
 }
 
 fn allbbo_entry_from_raw(coin: &Coin, raw_bbo: RawBbo) -> AllBboEntry {
-    let (bid, ask) = levels_from_raw_bbo(raw_bbo);
-    AllBboEntry { coin: coin.value(), bid, ask }
+    AllBboEntry {
+        coin: coin.value(),
+        bid: raw_bbo.0.map(|(px, _sz, _n)| px.to_str()),
+        ask: raw_bbo.1.map(|(px, _sz, _n)| px.to_str()),
+    }
 }
 
 fn dedup_tuple_from_levels(bid: Option<&Level>, ask: Option<&Level>) -> BboDedupTuple {
@@ -878,15 +910,6 @@ fn dedup_tuple_from_levels(bid: Option<&Level>, ask: Option<&Level>) -> BboDedup
         ask_px: ask.map(Level::px).unwrap_or_default().to_string(),
         ask_sz: ask.map(Level::sz).unwrap_or_default().to_string(),
     }
-}
-
-fn prime_allbbo_cache(cache: &mut AllBboCache, payload: &AllBbo) {
-    cache.tuples.clear();
-    for entry in &payload.bbos {
-        cache.tuples.insert(entry.coin.clone(), dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref()));
-    }
-    cache.last_sent = Some(Instant::now());
-    cache.payload = Some(payload.clone());
 }
 
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1178,6 +1201,23 @@ mod tests {
         }
     }
 
+    fn raw_bbo(bid: Option<(&str, &str, u32)>, ask: Option<(&str, &str, u32)>) -> RawBbo {
+        let parse = |(px, sz, n): (&str, &str, u32)| {
+            (
+                crate::order_book::Px::parse_from_str(px).expect("valid px"),
+                crate::order_book::Sz::parse_from_str(sz).expect("valid sz"),
+                n,
+            )
+        };
+        (bid.map(parse), ask.map(parse))
+    }
+
+    fn outbound_for_test() -> (Outbound, mpsc::Receiver<QueuedData>) {
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (pong_tx, _pong_rx) = mpsc::channel(1);
+        (Outbound::new(data_tx, pong_tx), data_rx)
+    }
+
     #[test]
     fn l2_registration_counts_distinct_levels_independently() {
         let registry = Arc::new(L2SubscriptionRegistry::default());
@@ -1295,39 +1335,109 @@ mod tests {
     }
 
     #[test]
-    fn allbbo_cache_suppresses_unchanged_entries() {
+    fn allbbo_send_path_compares_only_public_price_shape() {
         let mut cache = AllBboCache::default();
-        let first = AllBbo {
-            time: 1,
-            bbos: vec![AllBboEntry {
-                coin: "BTC".to_string(),
-                bid: Some(Level::new("100".to_string(), "1".to_string(), 1)),
-                ask: None,
-            }],
-        };
-        prime_allbbo_cache(&mut cache, &first);
+        cache.prime_snapshot(
+            &AllBbo {
+                time: 1,
+                bbos: vec![AllBboEntry { coin: "BTC".to_string(), bid: Some("100".to_string()), ask: None }],
+            },
+            Instant::now(),
+        );
+        let (outbound, mut data_rx) = outbound_for_test();
 
-        let raw = vec![(
-            Coin::new("BTC"),
-            (
-                Some((
-                    crate::order_book::Px::parse_from_str("100").expect("valid px"),
-                    crate::order_book::Sz::parse_from_str("1").expect("valid sz"),
-                    1,
-                )),
-                None,
+        assert!(send_ws_data_from_allbbo(
+            &outbound,
+            &[(Coin::new("BTC"), raw_bbo(Some(("100", "2", 9)), None))],
+            2,
+            (true, true, true),
+            &mut cache,
+        ));
+        assert!(matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        assert!(send_ws_data_from_allbbo(
+            &outbound,
+            &[(Coin::new("BTC"), raw_bbo(Some(("101", "2", 9)), None))],
+            3,
+            (true, true, true),
+            &mut cache,
+        ));
+        assert_eq!(
+            data_rx.try_recv().expect("price delta queued").payload,
+            bytes::Bytes::from_static(
+                br#"{"channel":"allbbo","data":{"time":3,"bbos":[{"coin":"BTC","bid":"101","ask":null}]}}"#
             ),
-        )];
-        let mut changed = Vec::new();
-        for (coin, raw_bbo) in &raw {
-            let entry = allbbo_entry_from_raw(coin, *raw_bbo);
-            let current = dedup_tuple_from_levels(entry.bid.as_ref(), entry.ask.as_ref());
-            if cache.tuples.get(&entry.coin) != Some(&current) {
-                changed.push(entry);
-            }
-        }
+        );
 
-        assert!(changed.is_empty());
+        assert!(send_ws_data_from_allbbo(
+            &outbound,
+            &[(Coin::new("BTC"), raw_bbo(Some(("101", "3", 10)), Some(("102", "1", 1))))],
+            4,
+            (true, true, true),
+            &mut cache,
+        ));
+        assert_eq!(
+            data_rx.try_recv().expect("side-presence delta queued").payload,
+            bytes::Bytes::from_static(
+                br#"{"channel":"allbbo","data":{"time":4,"bbos":[{"coin":"BTC","bid":"101","ask":"102"}]}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn allbbo_suppressed_update_does_not_replace_heartbeat_payload() {
+        let mut cache = AllBboCache::default();
+        cache.prime_snapshot(
+            &AllBbo {
+                time: 1,
+                bbos: vec![AllBboEntry { coin: "BTC".to_string(), bid: Some("100".to_string()), ask: None }],
+            },
+            Instant::now(),
+        );
+        let (outbound, mut data_rx) = outbound_for_test();
+
+        assert!(send_ws_data_from_allbbo(
+            &outbound,
+            &[(Coin::new("BTC"), raw_bbo(Some(("101", "1", 1)), None))],
+            2,
+            (true, true, true),
+            &mut cache,
+        ));
+        let _price_delta = data_rx.try_recv().expect("price delta queued");
+
+        assert!(send_ws_data_from_allbbo(
+            &outbound,
+            &[(Coin::new("BTC"), raw_bbo(Some(("101", "4", 7)), None))],
+            3,
+            (true, true, true),
+            &mut cache,
+        ));
+        assert!(matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+
+        let heartbeat = cache.heartbeat(Instant::now(), 4, Duration::ZERO).expect("heartbeat due");
+        assert_eq!(heartbeat.time, 4);
+        assert_eq!(
+            heartbeat.bbos,
+            vec![AllBboEntry { coin: "BTC".to_string(), bid: Some("101".to_string()), ask: None }],
+        );
+    }
+
+    #[test]
+    fn bbo_dedup_remains_size_sensitive() {
+        let mut cache = HashMap::new();
+        let mut bbos = HashMap::from([(Coin::new("BTC"), raw_bbo(Some(("100", "1", 1)), None))]);
+        let (outbound, mut data_rx) = outbound_for_test();
+
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 1, &mut cache));
+        let _first = data_rx.try_recv().expect("initial bbo queued");
+
+        bbos.insert(Coin::new("BTC"), raw_bbo(Some(("100", "2", 1)), None));
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 2, &mut cache));
+        let _size_delta = data_rx.try_recv().expect("size delta queued");
+
+        bbos.insert(Coin::new("BTC"), raw_bbo(Some(("100", "2", 9)), None));
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 3, &mut cache));
+        assert!(matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
 
     #[test]

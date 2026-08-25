@@ -261,9 +261,10 @@ Response:
 ```json
 { "method": "subscribe", "subscription": { "type": "allbbo" } }
 ```
-Initial response includes every current BBO matching `--markets`; later updates are throttled to 50 ms and include only changed coins.
+The initial response includes every current BBO that matches `--markets`. Later updates are throttled to 50 ms. They include a coin only when its best bid or ask price changes, or when either side appears or disappears.
+
 ```json
-{ "channel": "allbbo", "data": { "time": 1702530000000, "bbos": [{ "coin": "BTC", "bid": { "px": "100000.0", "sz": "0.5", "n": 1 }, "ask": null }] } }
+{ "channel": "allbbo", "data": { "time": 1702530000000, "bbos": [{ "coin": "BTC", "bid": "100000.0", "ask": null }] } }
 ```
 
 ### Subscribe to Trades
@@ -612,7 +613,7 @@ The original sends every update to every subscriber regardless of whether anythi
 
 This fork deduplicates at the WebSocket level:
 - **BBO**: only sends when bid/ask px/sz actually changes (~1us overhead)
-- **allbbo**: sends a full initial BBO snapshot, then 50 ms batches containing only changed coins
+- **allbbo**: sends a full initial BBO snapshot, then sends 50 ms batches only when a bid or ask price changes or a side appears or disappears
 - **L2Book**: only sends when the snapshot hash changes (~10us overhead)
 - Saves ~500us per unchanged update and significantly reduces client-side bandwidth
 

@@ -72,12 +72,11 @@ pub(crate) struct Bbo {
     pub ask: Option<Level>,
 }
 
-/// Best Bid/Offer entry used by the batched allbbo stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AllBboEntry {
     pub coin: String,
-    pub bid: Option<Level>,
-    pub ask: Option<Level>,
+    pub bid: Option<String>,
+    pub ask: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
