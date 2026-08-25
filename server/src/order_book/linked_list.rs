@@ -59,6 +59,32 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         }
     }
 
+    pub(crate) fn insert_before(&mut self, before: &K, key: K, value: T) -> bool {
+        if self.key_to_sid.contains_key(&key) {
+            return false;
+        }
+        let Some(&before_sid) = self.key_to_sid.get(before) else {
+            return false;
+        };
+
+        let prev = self.slab[before_sid].prev;
+        let mut node = Node::new(key.clone(), value);
+        node.prev = prev;
+        node.next = Some(before_sid);
+
+        let sid = self.slab.insert(node);
+        self.key_to_sid.insert(key, sid);
+        self.slab[before_sid].prev = Some(sid);
+
+        if let Some(prev_sid) = prev {
+            self.slab[prev_sid].next = Some(sid);
+        } else {
+            self.head = Some(sid);
+        }
+
+        true
+    }
+
     #[must_use]
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
@@ -284,6 +310,52 @@ mod tests {
         assert!(list.push_back(1, "a"));
         assert!(!list.push_back(1, "b")); // duplicate key
         assert_eq!(list.to_vec(), vec![&"a"]); // value unchanged
+    }
+
+    #[test]
+    fn test_insert_before_head() {
+        let mut list = LinkedList::new();
+        assert!(list.push_back(1, "a"));
+        assert!(list.push_back(2, "b"));
+
+        assert!(list.insert_before(&1, 3, "c"));
+
+        assert_eq!(list.to_vec(), vec![&"c", &"a", &"b"]);
+        assert_eq!(to_rev_vec(&list), vec![&"b", &"a", &"c"]);
+    }
+
+    #[test]
+    fn test_insert_before_middle() {
+        let mut list = LinkedList::new();
+        assert!(list.push_back(1, "a"));
+        assert!(list.push_back(2, "b"));
+        assert!(list.push_back(3, "c"));
+
+        assert!(list.insert_before(&3, 4, "d"));
+
+        assert_eq!(list.to_vec(), vec![&"a", &"b", &"d", &"c"]);
+        assert_eq!(to_rev_vec(&list), vec![&"c", &"d", &"b", &"a"]);
+    }
+
+    #[test]
+    fn test_insert_before_missing_anchor_returns_false() {
+        let mut list = LinkedList::new();
+        assert!(list.push_back(1, "a"));
+
+        assert!(!list.insert_before(&9, 2, "b"));
+
+        assert_eq!(list.to_vec(), vec![&"a"]);
+    }
+
+    #[test]
+    fn test_insert_before_duplicate_key_returns_false() {
+        let mut list = LinkedList::new();
+        assert!(list.push_back(1, "a"));
+        assert!(list.push_back(2, "b"));
+
+        assert!(!list.insert_before(&2, 1, "c"));
+
+        assert_eq!(list.to_vec(), vec![&"a", &"b"]);
     }
 
     #[test]
