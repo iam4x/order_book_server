@@ -1432,11 +1432,9 @@ impl PreparedL2Book {
 // Uses parallel file watchers and immediate OrderDiff processing
 // ============================================================================
 
-/// HFT-optimized listener using parallel file watchers
-/// Key differences from hl_listen:
-/// 1. 3 dedicated threads for file watching (parallel I/O)
-/// 2. Processes OrderDiffs immediately (doesn't wait for OrderStatuses)
-/// 3. Uses process time instead of block time for lowest latency
+/// HFT-optimized listener with one watcher thread per enabled event source.
+/// Order diffs are processed when they arrive instead of waiting for order statuses.
+/// Event timestamps use process time instead of block time.
 pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
     let dir = match config.data_dir.clone() {
         Some(d) => d,
@@ -1469,41 +1467,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let order_sync_recorder = listener.lock().await.order_sync_recorder();
 
     // Start only the file watchers needed by the enabled features.
-    let (crossbeam_rx, _handles, _last_os, _last_fills, _last_diffs) =
+    let (mut file_events, _handles, _last_os, _last_fills, _last_diffs) =
         parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder);
 
-    // Bridge crossbeam to tokio mpsc.
-    // BOUNDED channel: under processing stalls (mutex contention, slow L2 compute),
-    // an unbounded queue accumulates multi-KB JSON strings indefinitely - a primary
-    // OOM vector. A bounded channel applies backpressure into the bridge thread,
-    // which in turn lets the crossbeam buffer absorb the burst.
-    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<parallel::FileEvent>(10_000);
-
-    // Spawn a blocking task to bridge crossbeam -> tokio
-    tokio::task::spawn_blocking(move || {
-        info!("Bridge task started");
-        let mut event_count = 0u64;
-        loop {
-            match crossbeam_rx.recv() {
-                Ok(event) => {
-                    event_count += 1;
-                    if event_count % 100_000 == 0 {
-                        info!("Bridge: received {} events", event_count);
-                    }
-                    if tokio_tx.blocking_send(event).is_err() {
-                        error!("Bridge: tokio channel closed");
-                        break;
-                    }
-                }
-                Err(_) => {
-                    error!("Bridge: crossbeam channel closed");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Snapshot fetch channel
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<SnapshotTaskResult>();
     let refresh_interval = snapshot_refresh_interval(config.snapshot_refresh_hours);
     if let Some(interval) = refresh_interval {
@@ -1593,23 +1559,19 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
             }
 
-            // Process events from file watchers (via bridge)
-            Some(event) = tokio_rx.recv() => {
+            Some(event) = file_events.recv() => {
                 match event {
                     parallel::FileEvent::OrderDiff(line) => {
-                        // Process OrderDiff immediately - this is the BBO-critical path
                         if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderDiffs) {
                             error!("OrderDiff error: {err}");
                         }
                     }
                     parallel::FileEvent::OrderStatus(line) => {
-                        // OrderStatuses are less latency-critical
                         if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderStatuses) {
                             error!("OrderStatus error: {err}");
                         }
                     }
                     parallel::FileEvent::Fill(line) => {
-                        // Fills are for trade data, not BBO
                         if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::Fills) {
                             error!("Fill error: {err}");
                         }

@@ -13,9 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Sender, bounded};
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::{
     FeatureSet,
@@ -55,7 +55,7 @@ impl FileLineSink {
                     EventSource::OrderDiffs => FileEvent::OrderDiff(line),
                     EventSource::Fills => FileEvent::Fill(line),
                 };
-                tx.send(event).is_ok()
+                tx.blocking_send(event).is_ok()
             }
             Self::FillProgress { recorder, .. } => {
                 match recorder.observe_fill_line(&line) {
@@ -462,22 +462,18 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
     })
 }
 
-/// Start all 3 file watcher threads, returns receiver for events
+/// Starts one watcher thread per enabled event source and returns their shared receiver.
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     features: FeatureSet,
     order_sync_recorder: Option<OrderSyncRecorder>,
-) -> (crossbeam_channel::Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)
-{
-    // Bounded so a slow downstream actually back-pressures the file readers
-    // (their `tx.send` blocks until a slot frees up). The previous `unbounded()`
-    // would grow forever under sustained processing stalls - the events sit on
-    // disk, no need to also mirror them in memory.
-    let (tx, rx) = bounded(1024);
+) -> (Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    // The bound caps the in-memory backlog. When full, blocking_send parks the
+    // file readers and leaves unread events on disk.
+    let (tx, rx) = channel(10_000);
     let mut handles = Vec::new();
 
-    // Health monitoring
     let last_order_status = Arc::new(AtomicU64::new(0));
     let last_fills = Arc::new(AtomicU64::new(0));
     let last_order_diffs = Arc::new(AtomicU64::new(0));
@@ -547,19 +543,19 @@ mod tests {
 
     #[test]
     fn bbo_and_ordersync_fill_lines_bypass_the_shared_event_queue() {
-        let (tx, rx) = bounded(1);
+        let (tx, mut rx) = channel(1);
         let recorder = OrderSyncRecorder::default();
         let sink = file_line_sink(EventSource::Fills, features("bbo,ordersync"), tx, Some(recorder.clone()))
             .expect("ordersync recorder creates a fill sink");
 
         assert!(sink.submit(r#"{"events":[[null,{"time":300000}]]}"#.to_string()));
         assert_eq!(recorder.status_at(600_000).last_order_at, Some(300));
-        assert!(matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
     }
 
     #[test]
     fn trades_and_ordersync_keep_the_existing_full_fill_path() {
-        let (tx, rx) = bounded(1);
+        let (tx, mut rx) = channel(1);
         let sink =
             file_line_sink(EventSource::Fills, features("trades,ordersync"), tx, Some(OrderSyncRecorder::default()))
                 .expect("fill sink exists");
