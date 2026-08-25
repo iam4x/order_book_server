@@ -4049,6 +4049,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "dirs",

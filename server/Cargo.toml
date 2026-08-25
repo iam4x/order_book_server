@@ -14,6 +14,7 @@ itertools = "0.14.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3.31"
+bytes = "1"
 rayon = "1.10"
 rustc-hash = "2"
 alloy = { version = "1.0.22", default-features = false, features = ["std", "serde", "reqwest-rustls-tls", "full"] }
@@ -24,6 +25,9 @@ dirs = "6.0"
 prometheus = "0.14"
 lazy_static = "1.4"
 sonic-rs = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints]
 workspace = true
