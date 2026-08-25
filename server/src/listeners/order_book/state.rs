@@ -23,8 +23,6 @@ pub(super) struct OrderBookState {
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible)
     pending_order_statuses: FxHashMap<Oid, NodeDataOrderStatus>,
-    // Persistent cache of New diffs waiting for their OrderStatuses
-    // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
     pending_new_diffs: FxHashMap<Oid, PendingNewDiff>,
 }
 

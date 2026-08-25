@@ -1432,9 +1432,6 @@ impl PreparedL2Book {
 // Uses parallel file watchers and immediate OrderDiff processing
 // ============================================================================
 
-/// HFT-optimized listener with one watcher thread per enabled event source.
-/// Order diffs are processed when they arrive instead of waiting for order statuses.
-/// Event timestamps use process time instead of block time.
 pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
     let dir = match config.data_dir.clone() {
         Some(d) => d,
