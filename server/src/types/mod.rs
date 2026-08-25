@@ -181,6 +181,8 @@ pub(crate) enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {
         sz: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        insert_before: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
     Update {
@@ -220,4 +222,29 @@ pub(crate) struct Liquidation {
     pub liquidated_user: String,
     pub mark_px: String,
     pub method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_diff_insert_before_serde_test() {
+        let legacy = r#"{"new":{"sz":"1.5"}}"#;
+        let diff: OrderDiff = serde_json::from_str(legacy).unwrap();
+        let OrderDiff::New { sz, insert_before } = &diff else {
+            panic!("expected New, got {diff:?}");
+        };
+        assert_eq!(sz, "1.5");
+        assert_eq!(*insert_before, None);
+        assert_eq!(serde_json::to_string(&diff).unwrap(), legacy);
+
+        let anchored = r#"{"new":{"sz":"1.5","insertBefore":42}}"#;
+        let diff: OrderDiff = serde_json::from_str(anchored).unwrap();
+        let OrderDiff::New { insert_before, .. } = &diff else {
+            panic!("expected New, got {diff:?}");
+        };
+        assert_eq!(*insert_before, Some(42));
+        assert_eq!(serde_json::to_string(&diff).unwrap(), anchored);
+    }
 }

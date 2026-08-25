@@ -187,7 +187,7 @@ impl From<InnerLevel> for Level {
 
 #[derive(Debug, Clone)]
 pub(crate) enum InnerOrderDiff {
-    New { sz: Sz },
+    New { sz: Sz, insert_before: Option<Oid> },
     Update { orig_sz: Sz, new_sz: Sz },
     Remove,
 }
@@ -197,7 +197,9 @@ impl TryFrom<OrderDiff> for InnerOrderDiff {
 
     fn try_from(value: OrderDiff) -> Result<Self> {
         Ok(match value {
-            OrderDiff::New { sz } => Self::New { sz: Sz::parse_from_str(&sz)? },
+            OrderDiff::New { sz, insert_before } => {
+                Self::New { sz: Sz::parse_from_str(&sz)?, insert_before: insert_before.map(Oid::new) }
+            }
             OrderDiff::Update { orig_sz, new_sz } => {
                 Self::Update { orig_sz: Sz::parse_from_str(&orig_sz)?, new_sz: Sz::parse_from_str(&new_sz)? }
             }
@@ -340,9 +342,13 @@ mod tests {
 
     #[test]
     fn test_order_diff_new() {
-        let diff = OrderDiff::New { sz: "1.5".to_string() };
+        let diff = OrderDiff::New { sz: "1.5".to_string(), insert_before: Some(42) };
         let inner: InnerOrderDiff = diff.try_into().unwrap();
-        assert!(matches!(inner, InnerOrderDiff::New { sz } if sz == Sz::parse_from_str("1.5").unwrap()));
+        assert!(matches!(
+            inner,
+            InnerOrderDiff::New { sz, insert_before }
+                if sz == Sz::parse_from_str("1.5").unwrap() && insert_before == Some(Oid::new(42))
+        ));
     }
 
     #[test]
@@ -366,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_order_diff_invalid_sz() {
-        let diff = OrderDiff::New { sz: "invalid".to_string() };
+        let diff = OrderDiff::New { sz: "invalid".to_string(), insert_before: None };
         let result: Result<InnerOrderDiff> = diff.try_into();
         assert!(result.is_err());
     }
