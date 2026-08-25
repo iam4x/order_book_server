@@ -639,7 +639,7 @@ The original has no monitoring. This fork adds:
 
 ### WebSocket Compression
 
-Both use `yawc` with `permessage-deflate`. This fork increases the broadcast channel buffer from 100 to 256 to reduce "channel lagged" drops under load, and adds detailed documentation on compression level tradeoffs.
+Both use `yawc`. This fork enables `permessage-deflate` only for compression levels 1-9 and uses a 16,384-entry shared broadcast buffer. The larger buffer absorbs bursts, but sustained slow consumers can still lag because channel families are not isolated.
 
 ### Other Improvements
 
