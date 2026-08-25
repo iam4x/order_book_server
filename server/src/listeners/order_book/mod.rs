@@ -24,11 +24,13 @@ use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file};
 
 use crate::{
     FeatureSet,
-    listeners::order_book::state::OrderBookState,
+    listeners::order_book::state::{OrderBookState, PendingRepairReason},
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_FLUSH_PHASE_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT,
-        ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
+        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_FLUSH_PHASE_LATENCY, ORDER_DIFF_HEIGHT, ORDER_STATUS_HEIGHT,
+        ORDER_STREAM_QUEUE_DEPTH, ORDERBOOK_COINS_COUNT, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL,
+        ORDERBOOK_REPAIR_REQUESTS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE,
+        PENDING_ORDERS_CACHE,
     },
     order_book::{
         Coin, Px, RawBbo, Snapshot, Sz,
@@ -57,6 +59,7 @@ const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 10_000_000;
 const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 20_000_000;
 const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const SNAPSHOT_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotTaskKind {
@@ -110,11 +113,12 @@ struct SnapshotReplayCache {
     overflowed: bool,
     failure_reason: Option<String>,
     started_book_height: u64,
+    repair_epoch: u64,
     limits: SnapshotReplayLimits,
 }
 
 impl SnapshotReplayCache {
-    fn new(started_book_height: u64, kind: SnapshotTaskKind) -> std::io::Result<Self> {
+    fn new(started_book_height: u64, kind: SnapshotTaskKind, repair_epoch: u64) -> std::io::Result<Self> {
         let (file, journal_path) = create_replay_journal()?;
         Ok(Self {
             writer: Some(BufWriter::new(file)),
@@ -124,6 +128,7 @@ impl SnapshotReplayCache {
             overflowed: false,
             failure_reason: None,
             started_book_height,
+            repair_epoch,
             limits: SnapshotReplayLimits::for_kind(kind),
         })
     }
@@ -322,6 +327,8 @@ fn next_snapshot_trigger(
     is_ready: bool,
     snapshot_fetch_pending: bool,
     next_refresh_at: Option<Instant>,
+    repair_pending: bool,
+    repair_retry_at: Option<Instant>,
     now: Instant,
 ) -> Option<SnapshotTaskKind> {
     if !features.requires_book_state() || snapshot_fetch_pending {
@@ -329,6 +336,9 @@ fn next_snapshot_trigger(
     }
     if !is_ready {
         return Some(SnapshotTaskKind::Initial);
+    }
+    if repair_pending && repair_retry_at.is_none_or(|retry_at| now >= retry_at) {
+        return Some(SnapshotTaskKind::Refresh);
     }
     if next_refresh_at.is_some_and(|refresh_at| now >= refresh_at) {
         return Some(SnapshotTaskKind::Refresh);
@@ -418,14 +428,49 @@ fn fetch_snapshot(
     });
 }
 
+async fn start_snapshot_if_due(
+    listener: &Arc<Mutex<OrderBookListener>>,
+    features: FeatureSet,
+    snapshot_fetch_pending: bool,
+    next_refresh_at: Option<Instant>,
+    repair_retry_at: Option<Instant>,
+    now: Instant,
+    snapshot_config: &SnapshotConfig,
+    snapshot_fetch_task_tx: &UnboundedSender<SnapshotTaskResult>,
+    ignore_spot: bool,
+) -> bool {
+    let (is_ready, repair_pending) = {
+        let listener = listener.lock().await;
+        (listener.is_ready(), listener.repair_pending())
+    };
+    let Some(kind) = next_snapshot_trigger(
+        features,
+        is_ready,
+        snapshot_fetch_pending,
+        next_refresh_at,
+        repair_pending,
+        repair_retry_at,
+        now,
+    ) else {
+        return false;
+    };
+    fetch_snapshot(kind, snapshot_config.clone(), Arc::clone(listener), snapshot_fetch_task_tx.clone(), ignore_spot);
+    true
+}
+
+struct SnapshotReplayOutcome {
+    replayed_lines: usize,
+    clean: bool,
+}
+
 fn replay_snapshot_cache(
     state: &mut OrderBookState,
     snapshot_height: u64,
     mut replay_cache: SnapshotReplayCache,
-) -> Result<usize> {
+) -> Result<SnapshotReplayOutcome> {
     let Some(writer) = replay_cache.writer.take() else {
         if replay_cache.line_count == 0 {
-            return Ok(0);
+            return Ok(SnapshotReplayOutcome { replayed_lines: 0, clean: true });
         }
         return Err("Snapshot replay journal was unavailable".into());
     };
@@ -434,6 +479,7 @@ fn replay_snapshot_cache(
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut replayed_lines = 0;
+    let mut clean = true;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
@@ -451,11 +497,13 @@ fn replay_snapshot_cache(
                         warn!(
                             "Skipping cached order-status replay line above snapshot height {snapshot_height}: {err}"
                         );
+                        clean = false;
                     }
                     replayed_lines += 1;
                 }
                 Err(err) => {
                     warn!("Skipping unparsable cached order-status replay line: {err}");
+                    clean = false;
                 }
             },
             b'D' => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(json) {
@@ -465,17 +513,22 @@ fn replay_snapshot_cache(
                     }
                     if let Err(err) = state.replay_order_diffs_hft(batch) {
                         warn!("Skipping cached order-diff replay line above snapshot height {snapshot_height}: {err}");
+                        clean = false;
                     }
                     replayed_lines += 1;
                 }
                 Err(err) => {
                     warn!("Skipping unparsable cached order-diff replay line: {err}");
+                    clean = false;
                 }
             },
-            _ => warn!("Skipping replay journal line with unknown source tag {tag}"),
+            _ => {
+                warn!("Skipping replay journal line with unknown source tag {tag}");
+                clean = false;
+            }
         }
     }
-    Ok(replayed_lines)
+    Ok(SnapshotReplayOutcome { replayed_lines, clean })
 }
 
 pub(crate) struct OrderBookListener {
@@ -492,6 +545,8 @@ pub(crate) struct OrderBookListener {
     stream_replay_guard_through_height: u64,
     // Only Some while a snapshot task is running and needs live stream replay.
     snapshot_replay_cache: Option<SnapshotReplayCache>,
+    repair_requested_epoch: u64,
+    repair_completed_epoch: u64,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
@@ -528,6 +583,8 @@ impl OrderBookListener {
             stream_ignore_through_height: 0,
             stream_replay_guard_through_height: 0,
             snapshot_replay_cache: None,
+            repair_requested_epoch: 0,
+            repair_completed_epoch: 0,
             internal_message_tx,
             last_l2_broadcast: None,
             pending_l2_changed_coins: HashSet::new(),
@@ -576,7 +633,8 @@ impl OrderBookListener {
 
     fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<()> {
         let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
-        self.snapshot_replay_cache = Some(SnapshotReplayCache::new(started_book_height, kind)?);
+        self.snapshot_replay_cache =
+            Some(SnapshotReplayCache::new(started_book_height, kind, self.repair_requested_epoch)?);
         Ok(())
     }
 
@@ -589,12 +647,53 @@ impl OrderBookListener {
             return;
         }
 
-        let Some(cache) = &mut self.snapshot_replay_cache else { return };
-        if let Some(reason) = cache.push(event_source, line) {
+        let failure = self.snapshot_replay_cache.as_mut().and_then(|cache| {
+            cache.push(event_source, line).map(|reason| (cache.line_count, cache.total_bytes, reason))
+        });
+        if let Some((line_count, total_bytes, reason)) = failure {
             warn!(
                 "Snapshot replay journal failed at {} lines / {} bytes: {}; this snapshot will not be installed",
-                cache.line_count, cache.total_bytes, reason
+                line_count, total_bytes, reason
             );
+            self.request_repair("replay_journal");
+        }
+    }
+
+    fn request_repair(&mut self, reason: &'static str) {
+        self.repair_requested_epoch = self.repair_requested_epoch.saturating_add(1);
+        ORDERBOOK_REPAIR_REQUESTS_TOTAL.with_label_values(&[reason]).inc();
+    }
+
+    fn request_pending_repairs(&mut self, reasons: HashSet<PendingRepairReason>) {
+        for reason in reasons {
+            self.request_repair(reason.metric_label());
+        }
+    }
+
+    fn repair_pending(&self) -> bool {
+        self.repair_requested_epoch > self.repair_completed_epoch
+    }
+
+    fn maintain_state(&mut self) {
+        let Some(state) = &mut self.order_book_state else { return };
+        state.cleanup_stale_pending();
+
+        ORDERBOOK_HEIGHT.set(state.height() as i64);
+        ORDER_STATUS_HEIGHT.set(state.order_status_height() as i64);
+        ORDER_DIFF_HEIGHT.set(state.order_diff_height() as i64);
+        ORDERBOOK_TIME_MS.set(state.time() as i64);
+        PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
+        PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
+        ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
+        ORDERBOOK_COINS_COUNT.set(state.coin_count() as i64);
+
+        let reasons = state.take_repair_reasons();
+        self.request_pending_repairs(reasons);
+    }
+
+    fn compact_order_book(&mut self) {
+        if let Some(state) = &mut self.order_book_state {
+            state.compact_order_book();
         }
     }
 
@@ -648,6 +747,7 @@ impl OrderBookListener {
         kind: SnapshotTaskKind,
     ) -> Result<SnapshotInstallOutcome> {
         let replay_cache = self.snapshot_replay_cache.take().unwrap_or_default();
+        let captured_repair_epoch = replay_cache.repair_epoch;
         if replay_cache.overflowed {
             let cached_lines = replay_cache.line_count;
             let cached_bytes = replay_cache.total_bytes;
@@ -682,7 +782,9 @@ impl OrderBookListener {
         let current_time = (kind == SnapshotTaskKind::Refresh)
             .then(|| self.order_book_state.as_ref().map(OrderBookState::time))
             .flatten();
-        let replayed_lines = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache)?;
+        let replay_outcome = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache)?;
+        let replay_repair_reasons = new_order_book.take_repair_reasons();
+        let replay_clean = replay_outcome.clean && replay_repair_reasons.is_empty();
         if let Some(current_time) = current_time {
             if new_order_book.time() < current_time {
                 new_order_book.set_time(current_time);
@@ -691,13 +793,20 @@ impl OrderBookListener {
         let old_universe = self.last_universe.clone();
         let reset_l2_version = kind == SnapshotTaskKind::Initial;
         self.replace_order_book_state(new_order_book, replay_cutoff_height, snapshot_height, reset_l2_version);
+        if replay_clean {
+            self.repair_completed_epoch = self.repair_completed_epoch.max(captured_repair_epoch);
+        } else {
+            self.request_repair("replay_apply");
+            self.request_pending_repairs(replay_repair_reasons);
+        }
         self.broadcast_universe_after_snapshot(old_universe);
         self.force_snapshot_refresh_updates();
         info!(
             "Order book ready at height {snapshot_height}; replay cutoff {replay_cutoff_height}; replayed \
-             {replayed_lines} cached stream lines"
+             {} cached stream lines",
+            replay_outcome.replayed_lines
         );
-        Ok(SnapshotInstallOutcome::Installed { replayed_lines })
+        Ok(SnapshotInstallOutcome::Installed { replayed_lines: replay_outcome.replayed_lines })
     }
 
     fn should_ignore_stream_batch(&self, event_source: EventSource, height: u64) -> bool {
@@ -862,12 +971,6 @@ impl OrderBookListener {
             state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
         L2_FLUSH_PHASE_LATENCY.with_label_values(&["snapshot"]).observe(snapshot_start.elapsed().as_secs_f64());
 
-        static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if bc % 100 == 0 {
-            info!("L2 broadcast #{} at time {}", bc, time);
-        }
-
         Some(L2FlushJob {
             generation: self.l2_generation,
             time,
@@ -957,83 +1060,91 @@ impl OrderBookListener {
     }
 }
 
+struct ParsedHftEvent {
+    line: String,
+    event_source: EventSource,
+    height: u64,
+    event_batch: EventBatch,
+}
+
+const fn source_label(event_source: EventSource) -> &'static str {
+    match event_source {
+        EventSource::Fills => "fills",
+        EventSource::OrderStatuses => "orders",
+        EventSource::OrderDiffs => "diffs",
+    }
+}
+
+fn parse_hft_event(line: String, event_source: EventSource) -> Result<Option<ParsedHftEvent>> {
+    const MAX_EVENTS_PER_BATCH: usize = 100_000;
+    if line.is_empty() {
+        return Ok(None);
+    }
+
+    let event_batch = match event_source {
+        EventSource::Fills => EventBatch::Fills(sonic_rs::from_str::<Batch<NodeDataFill>>(&line)?),
+        EventSource::OrderStatuses => EventBatch::Orders(sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(&line)?),
+        EventSource::OrderDiffs => EventBatch::BookDiffs(sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(&line)?),
+    };
+    let (height, events_len) = match &event_batch {
+        EventBatch::Orders(batch) => (batch.block_number(), batch.events_len()),
+        EventBatch::BookDiffs(batch) => (batch.block_number(), batch.events_len()),
+        EventBatch::Fills(batch) => (batch.block_number(), batch.events_len()),
+    };
+    if events_len > MAX_EVENTS_PER_BATCH {
+        return Err(format!(
+            "oversize {} batch: {events_len} events (cap {MAX_EVENTS_PER_BATCH}), height={height}",
+            source_label(event_source)
+        )
+        .into());
+    }
+    Ok(Some(ParsedHftEvent { line, event_source, height, event_batch }))
+}
+
+fn record_hft_parse_error(event_source: EventSource, line_len: usize, err: &Error) {
+    static PARSE_ERR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PARSE_ERRORS_TOTAL.with_label_values(&[source_label(event_source)]).inc();
+    let err_count = PARSE_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if err_count.is_multiple_of(1_000) {
+        error!("parse error #{err_count}: {err}, source: {event_source}, line_len: {line_len}");
+    }
+}
+
 impl OrderBookListener {
-    /// HFT version of process_data - doesn't skip first line errors since we're processing complete JSON lines
-    pub(crate) fn process_data_hft(&mut self, line: String, event_source: EventSource) -> Result<()> {
-        /// Largest batch we'll process. Each event is a few hundred bytes; a 100k-event
-        /// batch would already block the listener for seconds and pin hundreds of MB.
-        /// In normal operation a single block's batch is tens to low thousands of events.
-        const MAX_EVENTS_PER_BATCH: usize = 100_000;
-        // Count events for debugging
-        static HFT_EVENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = HFT_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 1000 == 0 {
-            info!("process_data_hft event #{}, source: {}, line_len: {}", count, event_source, line.len());
-        }
-
-        if line.is_empty() {
-            return Ok(());
-        }
-
-        let source_enabled = match event_source {
+    #[cfg(test)]
+    const fn source_enabled(&self, event_source: EventSource) -> bool {
+        match event_source {
             EventSource::Fills => self.features.needs_fill_batches(),
             EventSource::OrderStatuses => self.features.watch_order_statuses(),
             EventSource::OrderDiffs => self.features.watch_order_diffs(),
-        };
-        if !source_enabled {
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_data_hft(&mut self, line: String, event_source: EventSource) -> Result<()> {
+        if !self.source_enabled(event_source) {
             return Ok(());
         }
-
-        // Parse the batch
-        let res = match event_source {
-            EventSource::Fills => sonic_rs::from_str::<Batch<NodeDataFill>>(&line).map(|batch| {
-                let height = batch.block_number();
-                (height, EventBatch::Fills(batch))
-            }),
-            EventSource::OrderStatuses => sonic_rs::from_str(&line)
-                .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-            EventSource::OrderDiffs => sonic_rs::from_str(&line)
-                .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
-        };
-
-        let (height, event_batch) = match res {
-            Ok(data) => data,
-            Err(err) => {
-                // Log ALL parse errors for debugging
-                let err_source_label = match event_source {
-                    EventSource::Fills => "fills",
-                    EventSource::OrderStatuses => "orders",
-                    EventSource::OrderDiffs => "diffs",
-                };
-                PARSE_ERRORS_TOTAL.with_label_values(&[err_source_label]).inc();
-                static PARSE_ERR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let err_count = PARSE_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if err_count % 1000 == 0 {
-                    error!("parse error #{}: {}, source: {}, line_len: {}", err_count, err, event_source, line.len());
-                }
-                return Ok(()); // Skip this line but don't fail
+        let line_len = line.len();
+        match parse_hft_event(line, event_source) {
+            Ok(Some(parsed)) => {
+                self.apply_parsed_hft(parsed);
+                Ok(())
             }
-        };
-
-        // Sanity cap on batch size. A malformed/malicious line could otherwise
-        // pin hundreds of MB and freeze the listener for seconds.
-        let events_len = match &event_batch {
-            EventBatch::Orders(b) => b.events_len(),
-            EventBatch::BookDiffs(b) => b.events_len(),
-            EventBatch::Fills(b) => b.events_len(),
-        };
-        if events_len > MAX_EVENTS_PER_BATCH {
-            let source_label = match event_source {
-                EventSource::Fills => "fills",
-                EventSource::OrderStatuses => "orders",
-                EventSource::OrderDiffs => "diffs",
-            };
-            PARSE_ERRORS_TOTAL.with_label_values(&[source_label]).inc();
-            error!(
-                "Dropping oversize batch from {source_label}: {events_len} events (cap {MAX_EVENTS_PER_BATCH}), height={height}"
-            );
-            return Ok(());
+            Ok(None) => Ok(()),
+            Err(err) => {
+                record_hft_parse_error(event_source, line_len, &err);
+                if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                    self.request_repair("parse_error");
+                }
+                Ok(())
+            }
         }
+    }
+
+    fn apply_parsed_hft(&mut self, parsed: ParsedHftEvent) {
+        let ParsedHftEvent { line, event_source, height, event_batch } = parsed;
+        let source_label = source_label(event_source);
         let ignore_for_book_state = self.should_ignore_stream_batch(event_source, height);
         let replay_guard_for_book_state =
             !ignore_for_book_state && self.should_replay_guard_stream_batch(event_source, height);
@@ -1047,27 +1158,9 @@ impl OrderBookListener {
             recorder.observe_batch(batch);
         }
 
-        // Log successful parses periodically
-        static PARSE_OK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let ok_count = PARSE_OK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // Record file watcher metrics
-        let source_label = match event_source {
-            EventSource::Fills => "fills",
-            EventSource::OrderStatuses => "orders",
-            EventSource::OrderDiffs => "diffs",
-        };
         FILE_EVENTS_TOTAL.with_label_values(&[source_label]).inc();
         FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
         let process_start = Instant::now();
-
-        if ok_count % 10_000 == 0 {
-            info!("parse OK #{}: height={}, source={}", ok_count, height, event_source);
-        }
-
-        if height % 100 == 0 {
-            info!("{event_source} block: {height}");
-        }
 
         // HFT mode: Process events DIRECTLY without block-level synchronization
         // This is arbor's key insight - process independently with order-level caching
@@ -1151,38 +1244,16 @@ impl OrderBookListener {
                     height,
                     source_label
                 );
+                if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                    self.request_repair("apply_error");
+                }
                 HashSet::new()
             }
         };
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
-
-        // Log HFT state progress periodically
-        static HFT_STATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sc = HFT_STATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if sc % 1000 == 0 {
-            if let Some(state) = &mut self.order_book_state {
-                // Record health metrics
-                ORDERBOOK_HEIGHT.set(state.height() as i64);
-                ORDERBOOK_TIME_MS.set(state.time() as i64);
-                PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
-                PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
-
-                // Record orderbook stats
-                ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
-                ORDERBOOK_COINS_COUNT.set(state.coin_count() as i64);
-
-                // Cleanup stale pending entries to prevent unbounded memory growth
-                state.cleanup_stale_pending();
-
-                info!(
-                    "State progress #{}: height={}, pending_statuses={}, pending_diffs={}",
-                    sc,
-                    state.height(),
-                    state.pending_order_statuses_count(),
-                    state.pending_new_diffs_count()
-                );
-            }
-        }
+        let pending_repair_reasons =
+            self.order_book_state.as_mut().map(OrderBookState::take_repair_reasons).unwrap_or_default();
+        self.request_pending_repairs(pending_repair_reasons);
 
         // Fast BBO broadcast - ONLY for coins that changed AND only when someone is
         // listening. Without the receiver-count gate we'd `get_bbos_for_coins` and
@@ -1205,12 +1276,6 @@ impl OrderBookListener {
                         if tx.receiver_count() > 0 {
                             let bbo_start = Instant::now();
                             let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                            static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 =
-                                std::sync::atomic::AtomicU64::new(0);
-                            let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if bc % 1000 == 0 {
-                                info!("Fast BBO broadcast #{} at time {} for {} coins", bc, time, changed_coins.len());
-                            }
                             // broadcast::Sender::send is non-blocking; the previous
                             // tokio::spawn wrapper added task overhead with no benefit.
                             let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
@@ -1221,8 +1286,6 @@ impl OrderBookListener {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -1484,8 +1547,16 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     l2_flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stats_ticker = tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut maintenance_ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
+    maintenance_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut compaction_ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(60), Duration::from_secs(60));
+    compaction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut snapshot_fetch_pending = false;
     let mut next_refresh_at: Option<Instant> = None;
+    let mut repair_retry_at: Option<Instant> = None;
+    let mut ready_events = Vec::with_capacity(64);
 
     info!("Main event loop starting");
 
@@ -1512,6 +1583,32 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 listener.lock().await.flush_stats_if_due();
             }
 
+            _ = maintenance_ticker.tick(), if config.features.requires_book_state() => {
+                ORDER_STREAM_QUEUE_DEPTH.set(i64::try_from(file_events.len()).unwrap_or(i64::MAX));
+                let repair_due = {
+                    let mut listener = listener.lock().await;
+                    listener.maintain_state();
+                    listener.is_ready() && listener.repair_pending()
+                };
+                if repair_due && start_snapshot_if_due(
+                    &listener,
+                    config.features,
+                    snapshot_fetch_pending,
+                    next_refresh_at,
+                    repair_retry_at,
+                    Instant::now(),
+                    &snapshot_config,
+                    &snapshot_fetch_task_tx,
+                    ignore_spot,
+                ).await {
+                    snapshot_fetch_pending = true;
+                }
+            }
+
+            _ = compaction_ticker.tick(), if config.features.requires_book_state() => {
+                listener.lock().await.compact_order_book();
+            }
+
             // Handle completed snapshots ahead of a continuously ready file-event
             // queue. In a biased select, placing this after file events can delay the
             // result until a large upstream backlog has been fully drained.
@@ -1527,8 +1624,14 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
                         warn!("Background snapshot refresh failed; keeping current order book: {err}");
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                        repair_retry_at = listener
+                            .lock()
+                            .await
+                            .repair_pending()
+                            .then(|| Instant::now() + SNAPSHOT_REPAIR_RETRY_DELAY);
                     }
                     Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
+                        let installed = matches!(outcome, SnapshotInstallOutcome::Installed { .. });
                         match outcome {
                             SnapshotInstallOutcome::Installed { replayed_lines } => {
                                 info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
@@ -1552,27 +1655,43 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             }
                         }
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
+                        repair_retry_at = listener.lock().await.repair_pending().then(|| {
+                            if installed { Instant::now() } else { Instant::now() + SNAPSHOT_REPAIR_RETRY_DELAY }
+                        });
                     }
                 }
             }
 
-            Some(event) = file_events.recv() => {
-                match event {
-                    parallel::FileEvent::OrderDiff(line) => {
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderDiffs) {
-                            error!("OrderDiff error: {err}");
+            ready_count = file_events.recv_many(&mut ready_events, 64) => {
+                if ready_count == 0 {
+                    return Err("File event channel closed".into());
+                }
+                let mut parsed_events = Vec::with_capacity(ready_count);
+                let mut parse_repair_count = 0usize;
+                for event in ready_events.drain(..) {
+                    let (line, event_source) = match event {
+                        parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
+                        parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
+                        parallel::FileEvent::Fill(line) => (line, EventSource::Fills),
+                    };
+                    let line_len = line.len();
+                    match parse_hft_event(line, event_source) {
+                        Ok(Some(parsed)) => parsed_events.push(parsed),
+                        Ok(None) => {}
+                        Err(err) => {
+                            record_hft_parse_error(event_source, line_len, &err);
+                            if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                                parse_repair_count += 1;
+                            }
                         }
                     }
-                    parallel::FileEvent::OrderStatus(line) => {
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::OrderStatuses) {
-                            error!("OrderStatus error: {err}");
-                        }
-                    }
-                    parallel::FileEvent::Fill(line) => {
-                        if let Err(err) = listener.lock().await.process_data_hft(line, EventSource::Fills) {
-                            error!("Fill error: {err}");
-                        }
-                    }
+                }
+                let mut listener = listener.lock().await;
+                for _ in 0..parse_repair_count {
+                    listener.request_repair("parse_error");
+                }
+                for parsed in parsed_events {
+                    listener.apply_parsed_hft(parsed);
                 }
             }
 
@@ -1583,23 +1702,18 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 if config.features.requires_book_state() && is_ready && next_refresh_at.is_none() {
                     next_refresh_at = refresh_interval.map(|interval| now + interval);
                 }
-                info!(
-                    "Ticker: is_ready={}, snapshot_fetch_pending={}, next_refresh_s={:?}",
-                    is_ready,
-                    snapshot_fetch_pending,
-                    next_refresh_at.map(|refresh_at| refresh_at.saturating_duration_since(now).as_secs())
-                );
-                if let Some(kind) = next_snapshot_trigger(
+                if start_snapshot_if_due(
+                    &listener,
                     config.features,
-                    is_ready,
                     snapshot_fetch_pending,
                     next_refresh_at,
+                    repair_retry_at,
                     now,
-                ) {
+                    &snapshot_config,
+                    &snapshot_fetch_task_tx,
+                    ignore_spot,
+                ).await {
                     snapshot_fetch_pending = true;
-                    let listener = listener.clone();
-                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                    fetch_snapshot(kind, snapshot_config.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
                 }
             }
         }
@@ -1843,11 +1957,35 @@ mod tests {
         .to_string()
     }
 
-    fn order_status_line(coin: &str, oid: u64, user: &str) -> String {
+    fn new_diff_line(coin: &str, oid: u64, sz: &str) -> String {
+        new_diff_line_at_block(coin, oid, sz, 1)
+    }
+
+    fn new_diff_line_at_block(coin: &str, oid: u64, sz: &str, block_number: u64) -> String {
         serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 1,
+            "block_number": block_number,
+            "events": [{
+                "user": "0x0000000000000000000000000000000000000000",
+                "oid": oid,
+                "px": "100",
+                "coin": coin,
+                "raw_book_diff": { "new": { "sz": sz } }
+            }]
+        })
+        .to_string()
+    }
+
+    fn order_status_line(coin: &str, oid: u64, user: &str) -> String {
+        order_status_line_at_block(coin, oid, user, 1)
+    }
+
+    fn order_status_line_at_block(coin: &str, oid: u64, user: &str, block_number: u64) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": block_number,
             "events": [{
                 "time": "2024-01-15T10:30:00",
                 "user": user,
@@ -1975,15 +2113,40 @@ mod tests {
     #[test]
     fn snapshot_scheduler_triggers_initial_and_refresh_only_when_due() {
         let now = Instant::now();
-        assert_eq!(next_snapshot_trigger(features("bbo"), false, false, None, now), Some(SnapshotTaskKind::Initial));
         assert_eq!(
-            next_snapshot_trigger(features("bbo"), true, false, Some(now), now),
+            next_snapshot_trigger(features("bbo"), false, false, None, false, None, now),
+            Some(SnapshotTaskKind::Initial)
+        );
+        assert_eq!(
+            next_snapshot_trigger(features("bbo"), true, false, Some(now), false, None, now),
             Some(SnapshotTaskKind::Refresh)
         );
-        assert_eq!(next_snapshot_trigger(features("bbo"), true, false, None, now), None);
-        assert_eq!(next_snapshot_trigger(features("bbo"), true, false, Some(now + Duration::from_secs(1)), now), None);
-        assert_eq!(next_snapshot_trigger(features("bbo"), false, true, None, now), None);
-        assert_eq!(next_snapshot_trigger(features("trades"), true, false, Some(now), now), None);
+        assert_eq!(next_snapshot_trigger(features("bbo"), true, false, None, false, None, now), None);
+        assert_eq!(
+            next_snapshot_trigger(features("bbo"), true, false, Some(now + Duration::from_secs(1)), false, None, now,),
+            None
+        );
+        assert_eq!(next_snapshot_trigger(features("bbo"), false, true, None, true, None, now), None);
+        assert_eq!(next_snapshot_trigger(features("trades"), true, false, Some(now), true, None, now), None);
+        assert_eq!(
+            next_snapshot_trigger(features("bbo"), true, false, None, true, None, now),
+            Some(SnapshotTaskKind::Refresh)
+        );
+        assert_eq!(
+            next_snapshot_trigger(features("bbo"), true, false, None, true, Some(now + Duration::from_secs(1)), now,),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_book_line_requests_snapshot_repair() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+
+        listener.process_data_hft("{".to_string(), EventSource::OrderDiffs).unwrap();
+
+        assert!(listener.repair_pending());
+        assert_eq!(listener.repair_requested_epoch, 1);
     }
 
     #[test]
@@ -2003,7 +2166,7 @@ mod tests {
 
     #[test]
     fn snapshot_replay_journal_enforces_its_disk_safety_limit() {
-        let mut cache = SnapshotReplayCache::new(0, SnapshotTaskKind::Initial).expect("replay journal should open");
+        let mut cache = SnapshotReplayCache::new(0, SnapshotTaskKind::Initial, 0).expect("replay journal should open");
         cache.limits = SnapshotReplayLimits { max_lines: 1, max_bytes: usize::MAX };
 
         assert_eq!(cache.push(EventSource::OrderDiffs, "{}"), None);
@@ -2013,6 +2176,72 @@ mod tests {
         assert_eq!(cache.line_count, 1);
         assert_eq!(cache.total_bytes, 2);
         assert!(failure.contains("exceeded its limits"));
+    }
+
+    #[test]
+    fn snapshot_repair_epoch_does_not_ack_loss_requested_during_fetch() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.request_repair("apply_error");
+        listener.begin_snapshot_replay();
+        assert_eq!(listener.snapshot_replay_cache.as_ref().unwrap().repair_epoch, 1);
+
+        listener.request_repair("coin_mismatch");
+        let outcome = listener
+            .install_snapshot_state(
+                order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 1),
+                1,
+                SnapshotTaskKind::Refresh,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(listener.repair_completed_epoch, 1);
+        assert_eq!(listener.repair_requested_epoch, 2);
+        assert!(listener.repair_pending());
+
+        listener.begin_snapshot_replay();
+        listener
+            .install_snapshot_state(
+                order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 2),
+                2,
+                SnapshotTaskKind::Refresh,
+            )
+            .unwrap();
+        assert!(!listener.repair_pending());
+    }
+
+    #[test]
+    fn skipped_snapshot_refreshes_leave_repair_pending() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.request_repair("apply_error");
+        listener.begin_snapshot_replay();
+        listener.snapshot_replay_cache.as_mut().unwrap().limits =
+            SnapshotReplayLimits { max_lines: 0, max_bytes: usize::MAX };
+        listener.record_snapshot_replay_line(EventSource::OrderDiffs, "{}");
+
+        let overflow = listener
+            .install_snapshot_state(
+                order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 1),
+                1,
+                SnapshotTaskKind::Refresh,
+            )
+            .unwrap();
+        assert!(matches!(overflow, SnapshotInstallOutcome::SkippedReplayOverflow { .. }));
+        assert!(listener.repair_pending());
+
+        listener.init_from_snapshot(snapshots_from_coin_bids(&[("BTC", &[(1, "100", "1")])]), 10);
+        listener.begin_snapshot_replay();
+        let stale = listener
+            .install_snapshot_state(
+                order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 0),
+                0,
+                SnapshotTaskKind::Refresh,
+            )
+            .unwrap();
+        assert!(matches!(stale, SnapshotInstallOutcome::SkippedStaleSnapshot { .. }));
+        assert!(listener.repair_pending());
     }
 
     #[test]
@@ -2714,6 +2943,97 @@ mod tests {
             _ => unreachable!("drain_latest_l2 only returns snapshots"),
         }
         assert!(listener.pending_l2_changed_coins.is_empty());
+    }
+
+    #[test]
+    fn new_pair_broadcasts_bbo_immediately_and_l2_on_schedule() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+        let user = "0x0000000000000000000000000000000000000001";
+        drop(drain_all(&mut rx));
+
+        let status = parse_hft_event(order_status_line("BTC", 2, user), EventSource::OrderStatuses).unwrap().unwrap();
+        listener.apply_parsed_hft(status);
+        assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+
+        let diff = parse_hft_event(new_diff_line("BTC", 2, "2"), EventSource::OrderDiffs).unwrap().unwrap();
+        listener.apply_parsed_hft(diff);
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+        assert!(drain_latest_l2(&mut rx).is_some());
+    }
+
+    #[test]
+    fn hft_ingest_throughput_checkpoint() {
+        const INITIAL_PENDING: u64 = 8_800;
+        const MATCHED_PAIRS: u64 = 36_200;
+        const STATUS_HEIGHT: u64 = 1_000;
+        const DIFF_HEIGHT: u64 = STATUS_HEIGHT + 14;
+        #[cfg(not(debug_assertions))]
+        const PRODUCTION_LINES_PER_SECOND: f64 = 81_300.0;
+        const FIRST_OID: u64 = 1_000_000;
+
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(32);
+        let mut listener = listener_with_btc_bid(tx);
+        listener.begin_snapshot_replay();
+        let user = "0x0000000000000000000000000000000000000001";
+        let total_lines = usize::try_from(INITIAL_PENDING + MATCHED_PAIRS * 2).unwrap();
+        let mut events = Vec::with_capacity(total_lines);
+
+        for offset in 0..INITIAL_PENDING {
+            let oid = FIRST_OID + offset;
+            events.push((order_status_line_at_block("BTC", oid, user, STATUS_HEIGHT), EventSource::OrderStatuses));
+        }
+        for offset in INITIAL_PENDING..INITIAL_PENDING + MATCHED_PAIRS {
+            let oid = FIRST_OID + offset;
+            events.push((order_status_line_at_block("BTC", oid, user, STATUS_HEIGHT), EventSource::OrderStatuses));
+            events.push((new_diff_line_at_block("BTC", oid, "1", DIFF_HEIGHT), EventSource::OrderDiffs));
+        }
+
+        let started = Instant::now();
+        let mut slowest_drain = Duration::ZERO;
+        let mut events = events.into_iter();
+        loop {
+            let ready: Vec<_> = events.by_ref().take(64).collect();
+            if ready.is_empty() {
+                break;
+            }
+            let drain_started = Instant::now();
+            let parsed: Vec<_> =
+                ready.into_iter().map(|(line, source)| parse_hft_event(line, source).unwrap().unwrap()).collect();
+            for event in parsed {
+                listener.apply_parsed_hft(event);
+            }
+            slowest_drain = slowest_drain.max(drain_started.elapsed());
+        }
+        let maintenance_started = Instant::now();
+        listener.maintain_state();
+        let maintenance_elapsed = maintenance_started.elapsed();
+        listener.clear_snapshot_replay();
+        let elapsed = started.elapsed();
+        let lines_per_second = total_lines as f64 / elapsed.as_secs_f64();
+        let compaction_started = Instant::now();
+        listener.compact_order_book();
+        let compaction_elapsed = compaction_started.elapsed();
+
+        let state = listener.order_book_state.as_ref().unwrap();
+        assert_eq!(state.order_count(), usize::try_from(MATCHED_PAIRS).unwrap() + 1);
+        assert_eq!(state.pending_order_statuses_count(), usize::try_from(INITIAL_PENDING).unwrap());
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_status_height(), STATUS_HEIGHT);
+        assert_eq!(state.order_diff_height(), DIFF_HEIGHT);
+        assert!(!listener.repair_pending());
+        eprintln!(
+            "[PERF] HFT ingest: {total_lines} lines in {elapsed:?} ({lines_per_second:.0} lines/s), slowest 64-line drain {slowest_drain:?}, maintenance {maintenance_elapsed:?}, compaction {compaction_elapsed:?}"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(
+            lines_per_second >= PRODUCTION_LINES_PER_SECOND,
+            "HFT ingest throughput {lines_per_second:.0} lines/s is below observed production rate {PRODUCTION_LINES_PER_SECOND:.0}"
+        );
     }
 
     #[test]

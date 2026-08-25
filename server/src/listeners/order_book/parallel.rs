@@ -194,9 +194,6 @@ impl FileReader {
 
     /// Process file modification - read new data and return lines
     fn on_modify(&mut self) -> Vec<String> {
-        static MODIFY_COUNT: AtomicU64 = AtomicU64::new(0);
-        let count = MODIFY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         let mut lines = Vec::new();
         if let Some(ref path) = self.current_path {
             // Open file, seek to last position, read new data
@@ -207,17 +204,6 @@ impl FileReader {
 
                     // Only read if there's new data
                     if file_size > self.file_position {
-                        // Log every read attempt
-                        if count % 10_000 == 0 {
-                            info!(
-                                "on_modify #{}: reading {} bytes (pos {} -> {})",
-                                count,
-                                file_size - self.file_position,
-                                self.file_position,
-                                file_size
-                            );
-                        }
-
                         if file.seek(SeekFrom::Start(self.file_position)).is_ok() {
                             let mut buf = String::new();
                             match file.read_to_string(&mut buf) {
@@ -228,16 +214,6 @@ impl FileReader {
 
                                         // Prepend any partial line from last read
                                         let full_buf = std::mem::take(&mut self.partial_line) + &buf;
-
-                                        // Debug logging
-                                        let line_count = full_buf.lines().count();
-                                        let ends_newline = buf.ends_with('\n');
-                                        if count % 10_000 == 0 {
-                                            info!(
-                                                "on_modify #{}: read {} bytes, {} lines, ends_newline={}",
-                                                count, bytes_read, line_count, ends_newline
-                                            );
-                                        }
 
                                         let mut line_iter = full_buf.lines().peekable();
 
@@ -281,11 +257,6 @@ impl FileReader {
                                                 self.partial_line.len()
                                             );
                                             self.partial_line.clear();
-                                        }
-
-                                        // Log result
-                                        if count % 10_000 == 0 {
-                                            info!("on_modify #{}: returning {} lines", count, lines.len());
                                         }
                                     }
                                 }
@@ -424,23 +395,6 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     error!("{} event channel closed, exiting", source_name);
                     return;
-                }
-            }
-
-            // Every 100000 polls, log status
-            if poll_count % 100_000 == 0 {
-                if let Some(ref path) = reader.current_path {
-                    if let Ok(file) = File::open(path) {
-                        if let Ok(metadata) = file.metadata() {
-                            info!(
-                                "{} poll {} - pos {} / size {}",
-                                source_name,
-                                poll_count,
-                                reader.file_position,
-                                metadata.len()
-                            );
-                        }
-                    }
                 }
             }
 
