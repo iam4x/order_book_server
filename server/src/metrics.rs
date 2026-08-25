@@ -90,6 +90,16 @@ lazy_static! {
         "Current orderbook block height"
     ).expect("metric can be created");
 
+    pub static ref ORDER_STATUS_HEIGHT: IntGauge = IntGauge::new(
+        "order_status_height",
+        "Latest processed order-status block height"
+    ).expect("metric can be created");
+
+    pub static ref ORDER_DIFF_HEIGHT: IntGauge = IntGauge::new(
+        "order_diff_height",
+        "Latest processed order-diff block height"
+    ).expect("metric can be created");
+
     /// Orderbook timestamp in milliseconds
     pub static ref ORDERBOOK_TIME_MS: IntGauge = IntGauge::new(
         "orderbook_time_ms",
@@ -106,6 +116,16 @@ lazy_static! {
     pub static ref PENDING_DIFFS_CACHE: IntGauge = IntGauge::new(
         "pending_diffs_cache_size",
         "Pending order diffs in HFT cache"
+    ).expect("metric can be created");
+
+    pub static ref ORDER_STREAM_QUEUE_DEPTH: IntGauge = IntGauge::new(
+        "order_stream_queue_depth",
+        "File events waiting in the async order-stream queue"
+    ).expect("metric can be created");
+
+    pub static ref ORDERBOOK_REPAIR_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orderbook_repair_requests_total", "Orderbook snapshot repair requests by reason"),
+        &["reason"]
     ).expect("metric can be created");
 
     /// Broadcast channel lag (receivers behind)
@@ -220,9 +240,13 @@ pub fn register_metrics() {
 
     // Health metrics
     REGISTRY.register(Box::new(ORDERBOOK_HEIGHT.clone())).ok();
+    REGISTRY.register(Box::new(ORDER_STATUS_HEIGHT.clone())).ok();
+    REGISTRY.register(Box::new(ORDER_DIFF_HEIGHT.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_TIME_MS.clone())).ok();
     REGISTRY.register(Box::new(PENDING_ORDERS_CACHE.clone())).ok();
     REGISTRY.register(Box::new(PENDING_DIFFS_CACHE.clone())).ok();
+    REGISTRY.register(Box::new(ORDER_STREAM_QUEUE_DEPTH.clone())).ok();
+    REGISTRY.register(Box::new(ORDERBOOK_REPAIR_REQUESTS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_LAG.clone())).ok();
 
     // Error metrics

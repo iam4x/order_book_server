@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use rustc_hash::FxHashMap;
 
@@ -20,22 +23,54 @@ pub(super) struct OrderBookState {
     height: u64,
     time: u64,
     ignore_spot: bool,
-    // Persistent cache of OrderStatuses waiting for their New diffs
-    // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible)
-    pending_order_statuses: FxHashMap<Oid, NodeDataOrderStatus>,
-    pending_new_diffs: FxHashMap<Oid, PendingNewDiff>,
+    pending_order_statuses: FxHashMap<Oid, Pending<NodeDataOrderStatus>>,
+    pending_new_diffs: FxHashMap<Oid, Pending<PendingNewDiff>>,
+    order_status_height: u64,
+    order_diff_height: u64,
+    repair_reasons: HashSet<PendingRepairReason>,
+}
+
+const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
+const MAX_PENDING_ORDER_STATUSES: usize = 50_000;
+const MAX_PENDING_NEW_DIFFS: usize = 10_000;
+
+struct Pending<T> {
+    payload: T,
+    first_seen: Instant,
+}
+
+#[derive(Clone)]
+struct PendingNewDiff {
+    coin: Coin,
+    sz: Sz,
+    insert_before: Option<Oid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum PendingRepairReason {
+    ExpiredStatus,
+    ExpiredDiff,
+    StatusCapacity,
+    DiffCapacity,
+    CoinMismatch,
+}
+
+impl PendingRepairReason {
+    pub(super) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::ExpiredStatus => "expired_status",
+            Self::ExpiredDiff => "expired_diff",
+            Self::StatusCapacity => "status_capacity",
+            Self::DiffCapacity => "diff_capacity",
+            Self::CoinMismatch => "coin_mismatch",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum OrderDiffApplyMode {
     Live,
     Replay,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingNewDiff {
-    sz: Sz,
-    insert_before: Option<Oid>,
 }
 
 fn record_insert_before_placement(placement: QueuePlacement) {
@@ -61,6 +96,9 @@ impl OrderBookState {
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: FxHashMap::default(),
             pending_new_diffs: FxHashMap::default(),
+            order_status_height: height,
+            order_diff_height: height,
+            repair_reasons: HashSet::new(),
         }
     }
 
@@ -70,6 +108,14 @@ impl OrderBookState {
 
     pub(super) const fn time(&self) -> u64 {
         self.time
+    }
+
+    pub(super) const fn order_status_height(&self) -> u64 {
+        self.order_status_height
+    }
+
+    pub(super) const fn order_diff_height(&self) -> u64 {
+        self.order_diff_height
     }
 
     pub(super) fn set_time(&mut self, time: u64) {
@@ -131,36 +177,68 @@ impl OrderBookState {
         self.order_book.as_ref().len()
     }
 
-    /// Cleanup stale pending entries to prevent unbounded memory growth
-    /// Orphaned entries occur when OrderStatuses have is_inserted_into_book() = true
-    /// but their matching BookDiff never arrives (network issues, bugs, etc.)
-    /// This is a simple size-based eviction. When a cache exceeds its limit,
-    /// replace it with a fresh map so its high-water-mark capacity is released.
-    /// Also opportunistically compacts the orderbook slab allocators on the same
-    /// cadence, since both are unbounded-growth vectors that the maintenance tick
-    /// is responsible for bounding.
     pub(super) fn cleanup_stale_pending(&mut self) {
-        const MAX_PENDING_ORDERS: usize = 10_000;
-        const MAX_PENDING_DIFFS: usize = 1_000;
+        self.cleanup_stale_pending_at(Instant::now());
+    }
 
-        if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
-            log::warn!(
-                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
-                self.pending_order_statuses.len()
-            );
-            self.pending_order_statuses = FxHashMap::default();
+    fn cleanup_stale_pending_at(&mut self, now: Instant) {
+        let old_statuses = self.pending_order_statuses.len();
+        self.pending_order_statuses
+            .retain(|_, pending| now.saturating_duration_since(pending.first_seen) <= PENDING_MAX_AGE);
+        let expired_statuses = old_statuses - self.pending_order_statuses.len();
+        if expired_statuses > 0 {
+            log::warn!("Expired {expired_statuses} unmatched order statuses after 60 seconds");
+            self.repair_reasons.insert(PendingRepairReason::ExpiredStatus);
         }
 
-        if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
-            self.pending_new_diffs = FxHashMap::default();
+        let old_diffs = self.pending_new_diffs.len();
+        self.pending_new_diffs
+            .retain(|_, pending| now.saturating_duration_since(pending.first_seen) <= PENDING_MAX_AGE);
+        let expired_diffs = old_diffs - self.pending_new_diffs.len();
+        if expired_diffs > 0 {
+            log::warn!("Expired {expired_diffs} unmatched new-order diffs after 60 seconds");
+            self.repair_reasons.insert(PendingRepairReason::ExpiredDiff);
         }
+    }
 
+    pub(super) fn compact_order_book(&mut self) {
         let compacted = self.order_book.compact_all();
         if compacted > 0 {
             let (live, cap) = self.order_book.slab_stats();
             log::info!("Compacted {compacted} price-level slabs (live={live}, capacity={cap})");
         }
+    }
+
+    pub(super) fn take_repair_reasons(&mut self) -> HashSet<PendingRepairReason> {
+        std::mem::take(&mut self.repair_reasons)
+    }
+
+    fn insert_pending_status(&mut self, oid: Oid, status: NodeDataOrderStatus) {
+        if let Some(pending) = self.pending_order_statuses.get_mut(&oid) {
+            pending.payload = status;
+            return;
+        }
+        if self.pending_order_statuses.len() >= MAX_PENDING_ORDER_STATUSES {
+            log::warn!(
+                "Pending order-status cache reached {MAX_PENDING_ORDER_STATUSES} entries; requesting snapshot repair"
+            );
+            self.pending_order_statuses = FxHashMap::default();
+            self.repair_reasons.insert(PendingRepairReason::StatusCapacity);
+        }
+        self.pending_order_statuses.insert(oid, Pending { payload: status, first_seen: Instant::now() });
+    }
+
+    fn insert_pending_diff(&mut self, oid: Oid, diff: PendingNewDiff) {
+        if let Some(pending) = self.pending_new_diffs.get_mut(&oid) {
+            pending.payload = diff;
+            return;
+        }
+        if self.pending_new_diffs.len() >= MAX_PENDING_NEW_DIFFS {
+            log::warn!("Pending new-diff cache reached {MAX_PENDING_NEW_DIFFS} entries; requesting snapshot repair");
+            self.pending_new_diffs = FxHashMap::default();
+            self.repair_reasons.insert(PendingRepairReason::DiffCapacity);
+        }
+        self.pending_new_diffs.insert(oid, Pending { payload: diff, first_seen: Instant::now() });
     }
 
     /// Get BBO for specific coins only - even faster for selective broadcast
@@ -187,6 +265,7 @@ impl OrderBookState {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
+        self.order_status_height = self.order_status_height.max(height);
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
@@ -196,21 +275,36 @@ impl OrderBookState {
 
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
+            let order_coin = Coin::new(&order_status.order.coin);
+            if (order_coin.is_spot() && self.ignore_spot) || !order_status.is_inserted_into_book() {
+                continue;
+            }
 
-            // Check if there's a pending New diff for this order
-            if let Some(PendingNewDiff { sz, insert_before }) = self.pending_new_diffs.remove(&oid) {
-                // Both arrived - add order immediately!
+            if let Some(pending_diff) = self.pending_new_diffs.get(&oid) {
+                if pending_diff.payload.coin != order_coin {
+                    let diff_coin = pending_diff.payload.coin.clone();
+                    self.pending_new_diffs.remove(&oid);
+                    self.repair_reasons.insert(PendingRepairReason::CoinMismatch);
+                    log::warn!(
+                        "Rejecting mismatched order halves for oid={oid:?}: status coin={order_coin:?}, diff coin={diff_coin:?}"
+                    );
+                    continue;
+                }
+
+                let pending_diff = pending_diff.payload.clone();
                 let time = order_status.time.and_utc().timestamp_millis();
-                let order_coin = Coin::new(&order_status.order.coin);
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
-                inner_order.modify_sz(sz);
-                inner_order.convert_trigger(time.max(0) as u64);
-                record_insert_before_placement(self.order_book.add_order_before(inner_order, insert_before));
+                inner_order.modify_sz(pending_diff.sz);
+                inner_order.convert_trigger(u64::try_from(time).unwrap_or_default());
+                self.pending_new_diffs.remove(&oid);
+                record_insert_before_placement(
+                    self.order_book.add_order_before(inner_order, pending_diff.insert_before),
+                );
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
-            } else if order_status.is_inserted_into_book() {
+            } else {
                 // Diff hasn't arrived yet - cache the OrderStatus
-                self.pending_order_statuses.insert(oid, order_status);
+                self.insert_pending_status(oid, order_status);
             }
         }
         Ok(changed_coins)
@@ -245,6 +339,7 @@ impl OrderBookState {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
+        self.order_diff_height = self.order_diff_height.max(height);
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
@@ -262,19 +357,27 @@ impl OrderBookState {
             match inner_diff {
                 InnerOrderDiff::New { sz, insert_before } => {
                     // Check if OrderStatus already arrived
-                    if let Some(order) = self.pending_order_statuses.remove(&oid) {
-                        // Both arrived - add order immediately!
-                        let time = order.time.and_utc().timestamp_millis();
-                        let order_coin = Coin::new(&order.order.coin);
-                        let mut inner_order: InnerL4Order = order.try_into()?;
+                    if let Some(pending_order) = self.pending_order_statuses.get(&oid) {
+                        let order_coin = Coin::new(&pending_order.payload.order.coin);
+                        if order_coin != coin {
+                            self.pending_order_statuses.remove(&oid);
+                            self.repair_reasons.insert(PendingRepairReason::CoinMismatch);
+                            log::warn!(
+                                "Rejecting mismatched order halves for oid={oid:?}: status coin={order_coin:?}, diff coin={coin:?}"
+                            );
+                            continue;
+                        }
+
+                        let time = pending_order.payload.time.and_utc().timestamp_millis();
+                        let mut inner_order: InnerL4Order = pending_order.payload.clone().try_into()?;
                         inner_order.modify_sz(sz);
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
+                        inner_order.convert_trigger(u64::try_from(time).unwrap_or_default());
+                        self.pending_order_statuses.remove(&oid);
                         record_insert_before_placement(self.order_book.add_order_before(inner_order, insert_before));
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
-                        self.pending_new_diffs.insert(oid.clone(), PendingNewDiff { sz, insert_before });
+                        self.insert_pending_diff(oid.clone(), PendingNewDiff { coin, sz, insert_before });
                     }
                 }
                 InnerOrderDiff::Update { orig_sz, new_sz } => {
@@ -387,20 +490,28 @@ mod tests {
     }
 
     fn make_status_batch(statuses: Vec<NodeDataOrderStatus>) -> Batch<NodeDataOrderStatus> {
+        make_status_batch_at(statuses, 100)
+    }
+
+    fn make_status_batch_at(statuses: Vec<NodeDataOrderStatus>, block_number: u64) -> Batch<NodeDataOrderStatus> {
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 100,
+            "block_number": block_number,
             "events": statuses
         }))
         .unwrap()
     }
 
     fn make_diff_batch(diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
+        make_diff_batch_at(diffs, 100)
+    }
+
+    fn make_diff_batch_at(diffs: Vec<NodeDataOrderDiff>, block_number: u64) -> Batch<NodeDataOrderDiff> {
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 100,
+            "block_number": block_number,
             "events": diffs
         }))
         .unwrap()
@@ -531,6 +642,40 @@ mod tests {
         assert_eq!(snapshot_oids(&state, "ETH", crate::order_book::types::Side::Bid), vec![1, 3, 2]);
     }
 
+    #[test]
+    fn test_non_insertable_status_does_not_consume_pending_diff() {
+        let mut state = empty_state();
+        let diff = make_order_diff("BTC", 99, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        let status = make_order_status("BTC", 99, "filled");
+        let changed = state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(state.order_count(), 0);
+        assert!(state.pending_new_diffs_has(&Oid::new(99)));
+    }
+
+    #[test]
+    fn test_pairs_across_fourteen_block_source_skew_in_either_order() {
+        let mut state = empty_state();
+        let status_first = make_order_status("BTC", 100, "open");
+        state.apply_order_statuses_hft(make_status_batch_at(vec![status_first], 1_000)).unwrap();
+        let matching_diff = make_order_diff("BTC", 100, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch_at(vec![matching_diff], 1_014)).unwrap();
+
+        let diff_first = make_order_diff("ETH", 101, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch_at(vec![diff_first], 2_014)).unwrap();
+        let matching_status = make_order_status("ETH", 101, "open");
+        state.apply_order_statuses_hft(make_status_batch_at(vec![matching_status], 2_000)).unwrap();
+
+        assert_eq!(state.order_count(), 2);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_status_height(), 2_000);
+        assert_eq!(state.order_diff_height(), 2_014);
+    }
+
     // ==================== OrderDiff Update/Remove ====================
 
     #[test]
@@ -638,6 +783,18 @@ mod tests {
     }
 
     #[test]
+    fn test_spot_status_filtered_when_ignore_spot() {
+        let snapshots = Snapshots::new(HashMap::new());
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true);
+        let status = make_order_status("@1", 1, "open");
+
+        let changed = state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
     fn test_spot_not_filtered_when_not_ignoring() {
         let mut state = empty_state(); // ignore_spot=false
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
@@ -689,29 +846,39 @@ mod tests {
     // ==================== Cleanup Tests ====================
 
     #[test]
-    fn test_cleanup_stale_pending_orders() {
+    fn test_source_skew_does_not_drop_pending_order_statuses() {
         let mut state = empty_state();
-        // Insert 10_001 pending statuses
-        for i in 0..10_001u64 {
-            let status = make_order_status("BTC", i, "open");
-            state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-        }
+        let statuses = (0..10_001u64).map(|oid| make_order_status("BTC", oid, "open")).collect();
+        state.apply_order_statuses_hft(make_status_batch(statuses)).unwrap();
         assert!(state.pending_order_statuses_count() > 10_000);
+
         state.cleanup_stale_pending();
+
+        let diffs = (0..10_001u64)
+            .map(|oid| make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None }))
+            .collect();
+        state.apply_order_diffs_hft(make_diff_batch(diffs)).unwrap();
+
         assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 10_001);
     }
 
     #[test]
-    fn test_cleanup_stale_pending_diffs() {
+    fn test_source_skew_does_not_drop_pending_new_diffs() {
         let mut state = empty_state();
-        // Insert 1_001 pending diffs
-        for i in 0..1_001u64 {
-            let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
-            state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
-        }
+        let diffs = (0..1_001u64)
+            .map(|oid| make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None }))
+            .collect();
+        state.apply_order_diffs_hft(make_diff_batch(diffs)).unwrap();
         assert!(state.pending_new_diffs_count() > 1_000);
+
         state.cleanup_stale_pending();
+
+        let statuses = (0..1_001u64).map(|oid| make_order_status("BTC", oid, "open")).collect();
+        state.apply_order_statuses_hft(make_status_batch(statuses)).unwrap();
+
         assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_count(), 1_001);
     }
 
     #[test]
@@ -723,6 +890,108 @@ mod tests {
         }
         state.cleanup_stale_pending();
         assert_eq!(state.pending_order_statuses_count(), 100); // not cleared
+    }
+
+    #[test]
+    fn expired_pending_halves_request_repair() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "ETH",
+                2,
+                OrderDiff::New { sz: "1.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        let now = Instant::now();
+        let expired_at = now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+        state.pending_order_statuses.get_mut(&Oid::new(1)).unwrap().first_seen = expired_at;
+        state.pending_new_diffs.get_mut(&Oid::new(2)).unwrap().first_seen = expired_at;
+
+        state.cleanup_stale_pending_at(now);
+
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(
+            state.take_repair_reasons(),
+            HashSet::from([PendingRepairReason::ExpiredStatus, PendingRepairReason::ExpiredDiff])
+        );
+    }
+
+    #[test]
+    fn duplicate_status_preserves_original_expiry_age() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        let now = Instant::now();
+        state.pending_order_statuses.get_mut(&Oid::new(1)).unwrap().first_seen =
+            now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+        state.cleanup_stale_pending_at(now);
+
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert!(state.take_repair_reasons().contains(&PendingRepairReason::ExpiredStatus));
+    }
+
+    #[test]
+    fn duplicate_diff_preserves_original_expiry_age() {
+        let mut state = empty_state();
+        let diff = make_order_diff("BTC", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        let now = Instant::now();
+        state.pending_new_diffs.get_mut(&Oid::new(1)).unwrap().first_seen =
+            now.checked_sub(PENDING_MAX_AGE + Duration::from_millis(1)).unwrap();
+
+        let duplicate = make_order_diff("BTC", 1, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![duplicate])).unwrap();
+        state.cleanup_stale_pending_at(now);
+
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert!(state.take_repair_reasons().contains(&PendingRepairReason::ExpiredDiff));
+    }
+
+    #[test]
+    fn pending_diff_capacity_is_hard_and_requests_repair() {
+        let mut state = empty_state();
+        let diffs = (0..=MAX_PENDING_NEW_DIFFS as u64)
+            .map(|oid| make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None }))
+            .collect();
+
+        state.apply_order_diffs_hft(make_diff_batch(diffs)).unwrap();
+
+        assert_eq!(state.pending_new_diffs_count(), 1);
+        assert!(state.take_repair_reasons().contains(&PendingRepairReason::DiffCapacity));
+    }
+
+    #[test]
+    fn pending_status_capacity_is_hard_and_requests_repair() {
+        let mut state = empty_state();
+        let statuses =
+            (0..=MAX_PENDING_ORDER_STATUSES as u64).map(|oid| make_order_status("BTC", oid, "open")).collect();
+
+        state.apply_order_statuses_hft(make_status_batch(statuses)).unwrap();
+
+        assert_eq!(state.pending_order_statuses_count(), 1);
+        assert!(state.take_repair_reasons().contains(&PendingRepairReason::StatusCapacity));
+    }
+
+    #[test]
+    fn mismatched_pair_coin_is_rejected_and_requests_repair() {
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+
+        let changed = state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "ETH",
+                1,
+                OrderDiff::New { sz: "1.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert!(state.take_repair_reasons().contains(&PendingRepairReason::CoinMismatch));
     }
 
     // ==================== Performance Tests ====================
@@ -737,7 +1006,7 @@ mod tests {
         }
 
         // Time matching diffs arrival
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for i in 0..1000u64 {
             let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
@@ -762,7 +1031,7 @@ mod tests {
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for i in 0..1000u64 {
             let status = make_order_status("BTC", i, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
