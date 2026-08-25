@@ -210,8 +210,11 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         });
     }
 
-    let websocket_opts =
-        yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
+    let websocket_opts = if compression_level == 0 {
+        yawc::Options::default()
+    } else {
+        yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level))
+    };
     let websocket_secret = config.secret.as_deref().map(Arc::<str>::from);
 
     let start_time = Instant::now();
