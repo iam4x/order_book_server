@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_insertable_status_does_not_consume_pending_diff() {
+    fn test_terminal_status_consumes_pending_diff_without_inserting() {
         let mut state = empty_state();
         let diff = make_order_diff("BTC", 99, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
@@ -653,7 +653,7 @@ mod tests {
 
         assert!(changed.is_empty());
         assert_eq!(state.order_count(), 0);
-        assert!(state.pending_new_diffs_has(&Oid::new(99)));
+        assert!(!state.pending_new_diffs_has(&Oid::new(99)));
     }
 
     #[test]
@@ -715,6 +715,33 @@ mod tests {
     }
 
     #[test]
+    fn test_update_changes_pending_new_size_before_status_arrives() {
+        let mut state = empty_state();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() },
+            )]))
+            .unwrap();
+
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+
+        let coins = HashSet::from([Coin::new("BTC")]);
+        let (_time, bbos) = state.get_bbos_for_coins(&coins);
+        let bid_sz = bbos.get(&Coin::new("BTC")).expect("BTC bbo").0.as_ref().expect("bid").1;
+        assert_eq!(bid_sz, Sz::parse_from_str("3.0").unwrap());
+        assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
     fn test_replay_diff_update_with_mismatched_orig_size_is_ignored() {
         let mut state = empty_state();
         let status = make_order_status("BTC", 1, "open");
@@ -747,6 +774,47 @@ mod tests {
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
         assert!(changed.contains(&Coin::new("BTC")));
         assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_consumes_pending_new_and_late_status_does_not_insert() {
+        let mut state = empty_state();
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff(
+                "BTC",
+                1,
+                OrderDiff::New { sz: "5.0".to_string(), insert_before: None },
+            )]))
+            .unwrap();
+
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("BTC", 1, OrderDiff::Remove)])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
+
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_system_spot_new_diffs_insert_without_statuses() {
+        for address_byte in ["fe", "ff"] {
+            let mut state = empty_state();
+            let diff: NodeDataOrderDiff = serde_json::from_value(serde_json::json!({
+                "user": format!("0x{}", address_byte.repeat(20)),
+                "oid": 7,
+                "side": "B",
+                "px": "325.5",
+                "coin": "@260",
+                "raw_book_diff": OrderDiff::New { sz: "3.0".to_string(), insert_before: None }
+            }))
+            .unwrap();
+
+            let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+            assert!(changed.contains(&Coin::new("@260")));
+            assert_eq!(state.order_count(), 1);
+            assert_eq!(state.pending_new_diffs_count(), 0);
+        }
     }
 
     // ==================== Status Filtering ====================
@@ -893,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_pending_halves_request_repair() {
+    fn only_expired_pending_diffs_request_repair() {
         let mut state = empty_state();
         state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 1, "open")])).unwrap();
         state
@@ -912,10 +980,7 @@ mod tests {
 
         assert_eq!(state.pending_order_statuses_count(), 0);
         assert_eq!(state.pending_new_diffs_count(), 0);
-        assert_eq!(
-            state.take_repair_reasons(),
-            HashSet::from([PendingRepairReason::ExpiredStatus, PendingRepairReason::ExpiredDiff])
-        );
+        assert_eq!(state.take_repair_reasons(), HashSet::from([PendingRepairReason::ExpiredDiff]));
     }
 
     #[test]
@@ -930,7 +995,7 @@ mod tests {
         state.cleanup_stale_pending_at(now);
 
         assert_eq!(state.pending_order_statuses_count(), 0);
-        assert!(state.take_repair_reasons().contains(&PendingRepairReason::ExpiredStatus));
+        assert!(state.take_repair_reasons().is_empty());
     }
 
     #[test]
