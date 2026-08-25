@@ -362,4 +362,31 @@ mod tests {
         assert_eq!(btc.len(), 1);
         assert!(btc.contains_key(&L2SnapshotParams::new(None, None)));
     }
+
+    #[test]
+    fn test_coarse_l2_variant_aggregates_full_depth_before_truncating() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        let mut oid = 0;
+
+        for i in 0..(crate::types::subscription::MAX_LEVELS + 20) {
+            books.add_order(order(oid, "BTC", Side::Bid, "1", &(64_931 + i).to_string()));
+            oid += 1;
+        }
+        for px in ["50000", "40000", "30000", "20000"] {
+            books.add_order(order(oid, "BTC", Side::Bid, "1", px));
+            oid += 1;
+        }
+        books.add_order(order(oid, "BTC", Side::Ask, "1", "65100"));
+
+        let requested_params = HashSet::from([L2SnapshotParams::new(Some(2), None)]);
+        let variants =
+            compute_l2_variants_for_coin(books.as_ref().get(&Coin::new("BTC")).expect("BTC book"), &requested_params);
+        let [bids, _asks] = variants.get(&L2SnapshotParams::new(Some(2), None)).expect("coarse variant").as_ref();
+
+        assert_eq!(bids.len(), 6);
+        let total_sz = bids.iter().map(|level| level.sz.value()).sum::<u64>();
+        let expected_sz =
+            Sz::parse_from_str(&(crate::types::subscription::MAX_LEVELS + 24).to_string()).unwrap().value();
+        assert_eq!(total_sz, expected_sz);
+    }
 }
