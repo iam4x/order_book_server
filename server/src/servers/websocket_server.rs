@@ -273,8 +273,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                     let height = ORDERBOOK_HEIGHT.get();
                     let connections = WS_CONNECTIONS_ACTIVE.get();
                     let body = format!(
-                        r#"{{"status":"{}","uptime_seconds":{},"height":{},"connections":{}}}"
-                    "#,
+                        r#"{{"status":"{}","uptime_seconds":{},"height":{},"connections":{}}}"#,
                         if is_ready { "ready" } else { "initializing" },
                         uptime_secs,
                         height,
