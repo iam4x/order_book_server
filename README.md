@@ -70,9 +70,11 @@ cargo build --release
 ```bash
 ./target/release/orderbook_server \
     --snapshot-mode direct \
-    --hlnode-binary /path/to/hl-node \
+    --hlnode-binary /usr/local/bin/ob-snapshotter \
     --data-dir /path/to/volumes/hl/data
 ```
+
+In direct mode, use a current copy of the node binary whose path does not contain the literal `hl-node`. The node's process guard can terminate processes whose command lines contain that token. Refresh the copy after node upgrades.
 
 ## Configuration
 
@@ -107,9 +109,9 @@ When `bbo`, `allbbo`, `l2book`, or `l4book` is enabled, the server needs a **ful
 
 The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
-**`docker` (default)** - Use when your Hyperliquid node runs inside a Docker container (the standard `docker compose` setup). The server runs `docker exec <container> hl-node --dump-abci-state ...` to execute the snapshot command inside the container, where `hl-node` and the state files are accessible.
+**`docker` (default)** - Use when your Hyperliquid node runs inside a Docker container (the standard `docker compose` setup). The server runs `docker exec <container> ./hl-node --chain Mainnet compute-l4-snapshots ...` inside the container, where the binary and state files are accessible.
 
-**`direct`** - Use when your node runs directly on the host via systemctl or bare metal. The server calls the `hl-node` binary directly on the host to generate the snapshot.
+**`direct`** - Use when your node runs directly on the host via systemctl or bare metal. The server calls the binary configured by `--hlnode-binary` on the host. Its path must not contain the literal `hl-node`; see the direct-mode example above.
 
 After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify. Events arriving while a snapshot is generated are captured in a bounded temporary disk journal and replayed before the new state is installed, keeping startup memory bounded even on busy nodes. By default the server also refreshes the in-memory order book from a fresh background snapshot every 4 hours to bound long-running drift without disconnecting clients. Snapshot output with an embedded height uses that height as the replay cutoff; current bare snapshot output is paired with `visor_abci_state.json`. If the visor height changes while generating a bare snapshot, the server uses the lower observed visor height as a conservative replay cutoff, replays stream batches above that height, and keeps queued batches above that height eligible after the swap. Set `--snapshot-refresh-hours 0` to disable recurring refreshes.
 
@@ -148,7 +150,7 @@ If a client subscribes to a disabled channel, the server returns an error and do
 |------|---------|-------------|
 | `--snapshot-mode` | `docker` | `docker` or `direct` |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
-| `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
+| `--hlnode-binary` | `hl-node` | Path to the node binary on the host. Direct-mode users must override this with a path that omits the literal `hl-node` |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
 | `--abci-state-path` | auto | Path to `abci_state.rmp`. In direct mode, this path defaults to `<data-dir>/../hyperliquid_data/abci_state.rmp`. This directory is a sibling of `--data-dir` and also contains `visor_abci_state.json`. Override this path if your node stores state elsewhere |
 | `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
@@ -618,9 +620,9 @@ The `--features` flag lets operators enable only the channels they need. For exa
 
 The original fetches snapshots via HTTP POST to `localhost:3001` (the node's local RPC).
 
-This fork calls `hl-node --dump-abci-state` directly, with two modes:
-- **Docker**: `docker exec <container> hl-node ...` for container-based setups
-- **Direct**: calls the binary on the host for systemctl / bare metal deployments
+This fork calls `hl-node --chain Mainnet compute-l4-snapshots` directly, with two modes:
+- **Docker**: runs the command through `docker exec` for container-based setups
+- **Direct**: calls the configured binary on the host for systemctl or bare-metal deployments
 
 All paths (`abci_state.rmp`, `snapshot.json`, `visor_abci_state.json`) are auto-detected with manual override options.
 
