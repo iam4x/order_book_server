@@ -105,9 +105,8 @@ struct Args {
     #[arg(long, default_value = "1")]
     compression_level: u32,
 
-    /// Base directory for hlnode data files.
-    /// For Docker: the directory containing .hyperliquid_rpc_hlnode_mainnet/
-    /// For Direct: the directory containing hl/hyperliquid_data/
+    /// Directory containing node_fills_streaming/, node_order_statuses_streaming/,
+    /// and node_raw_book_diffs_streaming/, such as .../volumes/hl/data.
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -139,8 +138,9 @@ struct Args {
     #[arg(long, default_value = "hl-node")]
     hlnode_binary: String,
 
-    /// Path to abci_state.rmp file (only used in direct mode).
-    /// Default: <data_dir>/hl/hyperliquid_data/abci_state.rmp
+    /// Path to abci_state.rmp. Direct mode only.
+    /// Default: <data_dir>/../hyperliquid_data/abci_state.rmp.
+    /// This directory is a sibling of --data-dir and also contains visor_abci_state.json.
     #[arg(long)]
     abci_state_path: Option<PathBuf>,
 
@@ -149,8 +149,8 @@ struct Args {
     #[arg(long)]
     snapshot_output_path: Option<PathBuf>,
 
-    /// Path to visor_abci_state.json (optional, for height info).
-    /// Default: <data_dir>/.hyperliquid_rpc_hlnode_mainnet/volumes/hl/hyperliquid_data/visor_abci_state.json
+    /// Path to visor_abci_state.json for height information.
+    /// Default: <data_dir>/../hyperliquid_data/visor_abci_state.json.
     #[arg(long)]
     visor_state_path: Option<PathBuf>,
 

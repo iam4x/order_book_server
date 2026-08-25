@@ -34,17 +34,13 @@ pub(super) struct SnapshotConfig {
 pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
     info!("Triggering L4 snapshot via hl-node CLI (mode: {:?})...", config.mode);
 
-    let (output_path, _visor_path) = match config.mode {
+    let output_path = match config.mode {
         SnapshotMode::Docker => {
             // Docker mode: run command inside container
             // data_dir should be the path containing node_*_by_block directories
             // Snapshot goes to parent of data_dir (sibling to "data" folder)
             let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
             let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
-            let visor_path = config
-                .visor_state_path
-                .clone()
-                .unwrap_or_else(|| parent_dir.join("hyperliquid_data/visor_abci_state.json"));
 
             let output = Command::new("docker")
                 .args(&[
@@ -75,20 +71,16 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 }
             }
 
-            (output_path, visor_path)
+            output_path
         }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
-            let abci_path = config
-                .abci_state_path
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/abci_state.rmp"));
+            let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {
+                let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
+                parent_dir.join("hyperliquid_data/abci_state.rmp")
+            });
             let output_path =
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
-            let visor_path = config
-                .visor_state_path
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/visor_abci_state.json"));
 
             info!(
                 "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
@@ -124,19 +116,15 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 }
             }
 
-            (output_path, visor_path)
+            output_path
         }
     };
 
-    // Verify file exists
     if output_path.exists() {
         info!("Snapshot file found at: {:?}", output_path);
-        // Return tuple (output_path, visor_path) - but for now just output_path
-        // The caller needs visor_path too, so we'll store it
         return Ok(output_path);
     }
 
-    // Debug: List directory contents if file not found
     if let Some(parent) = output_path.parent() {
         error!("File not found. Listing directory {:?}:", parent);
         if let Ok(entries) = fs::read_dir(parent) {
