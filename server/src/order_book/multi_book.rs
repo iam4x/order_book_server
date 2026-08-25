@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, RawBbo, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, QueuePlacement, RawBbo, Snapshot, Sz},
     prelude::*,
 };
 
@@ -61,9 +61,15 @@ impl<O: InnerOrder> OrderBooks<O> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn add_order(&mut self, order: O) {
         let coin = &order.coin();
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
+    }
+
+    pub(crate) fn add_order_before(&mut self, order: O, insert_before: Option<Oid>) -> QueuePlacement {
+        let coin = &order.coin();
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {

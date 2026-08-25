@@ -14,6 +14,13 @@ pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
 
 pub(crate) type RawBbo = (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueuePlacement {
+    NotApplicable,
+    Honored,
+    Fallback,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
     oid_to_side_px: rustc_hash::FxHashMap<Oid, (Side, Px)>,
@@ -127,7 +134,12 @@ impl<O: InnerOrder> OrderBook<O> {
         self.oid_to_side_px.len()
     }
 
-    pub(crate) fn add_order(&mut self, mut order: O) {
+    pub(crate) fn add_order(&mut self, order: O) {
+        let placement = self.add_order_before(order, None);
+        debug_assert_eq!(placement, QueuePlacement::NotApplicable);
+    }
+
+    pub(crate) fn add_order_before(&mut self, mut order: O, insert_before: Option<Oid>) -> QueuePlacement {
         // Duplicate oid would silently corrupt state: `oid_to_side_px` would point
         // at the new (side, px) while `LinkedList::push_back` silently rejects the
         // re-insert, leaving the original order data in place. Skip and warn.
@@ -136,7 +148,7 @@ impl<O: InnerOrder> OrderBook<O> {
         // orders that have arrived since.)
         if self.oid_to_side_px.contains_key(&order.oid()) {
             log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
-            return;
+            return QueuePlacement::NotApplicable;
         }
         let (maker_orders, maker_totals, resting_book, resting_totals) = match order.side() {
             Side::Ask => (&mut self.bids, &mut self.bid_totals, &mut self.asks, &mut self.ask_totals),
@@ -148,8 +160,9 @@ impl<O: InnerOrder> OrderBook<O> {
         }
         if order.sz().is_positive() {
             self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            add_order_to_book(resting_book, resting_totals, order);
+            return add_order_to_book(resting_book, resting_totals, order, insert_before);
         }
+        QueuePlacement::NotApplicable
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
@@ -274,13 +287,25 @@ fn add_order_to_book<O: InnerOrder>(
     map: &mut BTreeMap<Px, LinkedList<Oid, O>>,
     totals: &mut BTreeMap<Px, LevelTotal>,
     order: O,
-) {
+    insert_before: Option<Oid>,
+) -> QueuePlacement {
     let oid = order.oid();
     let limit_px = order.limit_px();
     let sz = order.sz();
-    if map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order) {
-        totals.entry(limit_px).and_modify(|total| total.add_order(sz)).or_insert_with(|| LevelTotal::new(sz));
-    }
+    let list = map.entry(limit_px).or_insert_with(LinkedList::new);
+    let requested_anchor = insert_before.is_some();
+    let anchor_exists = insert_before.as_ref().is_some_and(|before| list.contains_key(before));
+    let placement = if let (Some(before), true) = (insert_before, anchor_exists) {
+        let inserted = list.insert_before(&before, oid, order);
+        debug_assert!(inserted);
+        QueuePlacement::Honored
+    } else {
+        let inserted = list.push_back(oid, order);
+        debug_assert!(inserted);
+        if requested_anchor { QueuePlacement::Fallback } else { QueuePlacement::NotApplicable }
+    };
+    totals.entry(limit_px).and_modify(|total| total.add_order(sz)).or_insert_with(|| LevelTotal::new(sz));
+    placement
 }
 
 fn remove_order_from_totals(totals: &mut BTreeMap<Px, LevelTotal>, px: Px, sz: Sz) {
@@ -476,6 +501,90 @@ mod tests {
         let [b2, a2] = s2.0.map(BTreeSet::from_iter);
         assert_eq!(b1, b2);
         assert_eq!(a1, a2);
+    }
+
+    fn snapshot_oids(book: &OrderBook<MinimalOrder>, side: Side) -> Vec<u64> {
+        let snapshot = book.to_snapshot();
+        let index = match side {
+            Side::Bid => 0,
+            Side::Ask => 1,
+        };
+        snapshot.as_ref()[index].iter().map(|order| order.oid).collect()
+    }
+
+    #[test]
+    fn test_add_order_before_honors_same_level_anchor() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+        book.add_order(MinimalOrder::new(2, 10, 100, Side::Bid));
+
+        let placement = book.add_order_before(MinimalOrder::new(3, 10, 100, Side::Bid), Some(Oid::new(2)));
+
+        assert_eq!(placement, QueuePlacement::Honored);
+        assert_eq!(snapshot_oids(&book, Side::Bid), vec![1, 3, 2]);
+        assert_eq!(book.get_bbo().0, Some((Px::new(100), Sz::new(30), 3)));
+    }
+
+    #[test]
+    fn test_add_order_before_falls_back_when_anchor_is_missing() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+        book.add_order(MinimalOrder::new(2, 10, 100, Side::Bid));
+
+        let placement = book.add_order_before(MinimalOrder::new(3, 10, 100, Side::Bid), Some(Oid::new(9)));
+
+        assert_eq!(placement, QueuePlacement::Fallback);
+        assert_eq!(snapshot_oids(&book, Side::Bid), vec![1, 2, 3]);
+        assert_eq!(book.get_bbo().0, Some((Px::new(100), Sz::new(30), 3)));
+    }
+
+    #[test]
+    fn test_add_order_before_does_not_search_other_price_levels() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+
+        let placement = book.add_order_before(MinimalOrder::new(2, 10, 101, Side::Bid), Some(Oid::new(1)));
+
+        assert_eq!(placement, QueuePlacement::Fallback);
+        assert_eq!(snapshot_oids(&book, Side::Bid), vec![2, 1]);
+        assert_eq!(book.get_bbo().0, Some((Px::new(101), Sz::new(10), 1)));
+    }
+
+    #[test]
+    fn test_add_order_before_matches_then_places_remaining_order() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+        book.add_order(MinimalOrder::new(2, 5, 100, Side::Ask));
+
+        let placement = book.add_order_before(MinimalOrder::new(3, 10, 100, Side::Bid), Some(Oid::new(1)));
+
+        assert_eq!(placement, QueuePlacement::Honored);
+        assert_eq!(snapshot_oids(&book, Side::Bid), vec![3, 1]);
+        assert_eq!(book.get_bbo().0, Some((Px::new(100), Sz::new(15), 2)));
+        assert!(book.get_bbo().1.is_none());
+    }
+
+    #[test]
+    fn test_add_order_before_is_not_applicable_when_fully_matched() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Ask));
+
+        let placement = book.add_order_before(MinimalOrder::new(2, 10, 100, Side::Bid), Some(Oid::new(999)));
+
+        assert_eq!(placement, QueuePlacement::NotApplicable);
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_order_before_is_not_applicable_for_duplicate_oid() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 10, 100, Side::Bid));
+
+        let placement = book.add_order_before(MinimalOrder::new(1, 99, 101, Side::Bid), Some(Oid::new(999)));
+
+        assert_eq!(placement, QueuePlacement::NotApplicable);
+        assert_eq!(book.order_count(), 1);
+        assert_eq!(book.get_bbo().0, Some((Px::new(100), Sz::new(10), 1)));
     }
 
     // ==================== BBO Tests ====================
@@ -741,6 +850,65 @@ mod tests {
         assert_eq!(book.order_count(), 2);
         book.cancel_order(Oid::new(0));
         assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_insert_before_queue_anchors_and_fallbacks() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+
+        let first = factory.order(100, 50, Side::Bid);
+        let first_oid = first.oid();
+        let second = factory.order(100, 50, Side::Bid);
+        let second_oid = second.oid();
+        let third = factory.order(100, 50, Side::Bid);
+
+        book.add_order(first.clone());
+        book.add_order(second.clone());
+        book.add_order(third.clone());
+
+        let jumped_front = factory.order(100, 50, Side::Bid);
+        assert_eq!(book.add_order_before(jumped_front.clone(), Some(first_oid.clone())), QueuePlacement::Honored);
+
+        let jumped_middle = factory.order(100, 50, Side::Bid);
+        assert_eq!(book.add_order_before(jumped_middle.clone(), Some(second_oid.clone())), QueuePlacement::Honored);
+
+        let missing = factory.order(100, 50, Side::Bid);
+        assert_eq!(book.add_order_before(missing.clone(), Some(Oid::new(999))), QueuePlacement::Fallback);
+
+        assert_eq!(
+            book.to_snapshot().as_ref()[0],
+            vec![
+                jumped_front.clone(),
+                first.clone(),
+                jumped_middle.clone(),
+                second.clone(),
+                third.clone(),
+                missing.clone(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_before_priority_affects_matching() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+
+        let first = factory.order(100, 50, Side::Bid);
+        let first_oid = first.oid();
+        let second = factory.order(100, 50, Side::Bid);
+        book.add_order(first.clone());
+        book.add_order(second.clone());
+
+        let priority = factory.order(100, 50, Side::Bid);
+        assert_eq!(book.add_order_before(priority.clone(), Some(first_oid)), QueuePlacement::Honored);
+
+        book.add_order(factory.order(150, 50, Side::Ask));
+
+        assert_eq!(book.order_count(), 2);
+        assert!(book.order_sz(&priority.oid()).is_none());
+        assert_eq!(book.order_sz(&first.oid()), Some(Sz::new(50)));
+        assert_eq!(book.order_sz(&second.oid()), Some(Sz::new(100)));
     }
 
     // ==================== Performance / Stress Tests ====================

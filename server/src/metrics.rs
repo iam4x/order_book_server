@@ -168,6 +168,18 @@ lazy_static! {
         &["coin"]
     ).expect("metric can be created");
 
+    /// New orders placed before their requested same-level queue anchor
+    pub static ref INSERT_BEFORE_HONORED_TOTAL: IntCounter = IntCounter::new(
+        "insert_before_honored_total",
+        "New orders placed before their requested same-level queue anchor"
+    ).expect("metric can be created");
+
+    /// New orders appended because their requested same-level queue anchor was missing
+    pub static ref INSERT_BEFORE_FALLBACK_TOTAL: IntCounter = IntCounter::new(
+        "insert_before_fallback_total",
+        "New orders appended because their requested same-level queue anchor was missing"
+    ).expect("metric can be created");
+
     // ==================== UPTIME & SYSTEM ====================
 
     /// Server uptime in seconds
@@ -219,7 +231,6 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(PARSE_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(WS_SEND_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
-
     // File watcher metrics
     REGISTRY.register(Box::new(FILE_EVENTS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(FILE_LINES_PARSED_TOTAL.clone())).ok();
@@ -228,6 +239,8 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(ORDERBOOK_ORDERS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_COINS_COUNT.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
 
     // Uptime & system
     REGISTRY.register(Box::new(UPTIME_SECONDS.clone())).ok();

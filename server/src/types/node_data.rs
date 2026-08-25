@@ -252,7 +252,19 @@ mod tests {
         let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
         assert_eq!(diff.oid(), Oid::new(123));
         assert_eq!(diff.coin(), Coin::new("BTC"));
-        assert!(matches!(diff.diff(), OrderDiff::New { sz } if sz == "1.5"));
+        assert!(matches!(diff.diff(), OrderDiff::New { sz, insert_before } if sz == "1.5" && insert_before.is_none()));
+    }
+
+    #[test]
+    fn test_node_data_order_diff_serde_new_with_insert_before() {
+        let json = r#"{"user":"0x0000000000000000000000000000000000000001","oid":123,"px":"50000.0","coin":"BTC","raw_book_diff":{"new":{"sz":"1.5","insertBefore":456}}}"#;
+        let diff: NodeDataOrderDiff = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&diff).unwrap();
+
+        assert!(
+            matches!(diff.diff(), OrderDiff::New { sz, insert_before } if sz == "1.5" && insert_before == Some(456))
+        );
+        assert_eq!(serialized["raw_book_diff"]["new"]["insertBefore"], serde_json::json!(456));
     }
 
     #[test]

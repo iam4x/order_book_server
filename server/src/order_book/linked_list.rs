@@ -86,6 +86,11 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
     }
 
     #[must_use]
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.key_to_sid.contains_key(key)
+    }
+
+    #[must_use]
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
     }
