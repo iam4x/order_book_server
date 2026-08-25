@@ -2,6 +2,7 @@
 mod listeners;
 pub mod metrics;
 mod order_book;
+mod order_sync;
 mod prelude;
 mod servers;
 mod types;
@@ -33,6 +34,7 @@ pub struct FeatureSet {
     bookdiffs: bool,
     orderupdates: bool,
     stats: bool,
+    ordersync: bool,
 }
 
 impl FeatureSet {
@@ -46,6 +48,7 @@ impl FeatureSet {
             bookdiffs: true,
             orderupdates: true,
             stats: true,
+            ordersync: true,
         }
     }
 
@@ -59,6 +62,7 @@ impl FeatureSet {
             bookdiffs: false,
             orderupdates: false,
             stats: false,
+            ordersync: false,
         }
     }
 
@@ -94,6 +98,10 @@ impl FeatureSet {
         self.stats
     }
 
+    pub const fn ordersync(self) -> bool {
+        self.ordersync
+    }
+
     pub const fn requires_book_state(self) -> bool {
         self.bbo || self.allbbo || self.l2book || self.l4book
     }
@@ -106,8 +114,12 @@ impl FeatureSet {
         self.requires_book_state() || self.bookdiffs || self.stats
     }
 
-    pub const fn watch_fills(self) -> bool {
+    pub const fn needs_fill_batches(self) -> bool {
         self.trades || self.stats
+    }
+
+    pub const fn watch_fills(self) -> bool {
+        self.needs_fill_batches() || self.ordersync
     }
 }
 
@@ -124,7 +136,7 @@ impl FromStr for FeatureSet {
         let value = value.trim();
         if value.is_empty() {
             return Err(
-                "empty feature list; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
+                "empty feature list; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, ordersync, or all"
                     .to_string(),
             );
         }
@@ -138,7 +150,7 @@ impl FromStr for FeatureSet {
             let feature = feature.trim();
             if feature.is_empty() {
                 return Err(
-                    "empty feature entry; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
+                    "empty feature entry; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, ordersync, or all"
                         .to_string(),
                 );
             }
@@ -166,9 +178,11 @@ impl FromStr for FeatureSet {
                 "orderupdates" => return Err("duplicate feature `orderupdates`".to_string()),
                 "stats" if !features.stats => features.stats = true,
                 "stats" => return Err("duplicate feature `stats`".to_string()),
+                "ordersync" if !features.ordersync => features.ordersync = true,
+                "ordersync" => return Err("duplicate feature `ordersync`".to_string()),
                 unknown => {
                     return Err(format!(
-                        "unknown feature `{unknown}`; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, or all"
+                        "unknown feature `{unknown}`; expected comma-separated values: bbo, allbbo, l2book, l4book, trades, bookdiffs, orderupdates, stats, ordersync, or all"
                     ));
                 }
             }
@@ -190,6 +204,7 @@ impl fmt::Display for FeatureSet {
             (self.bookdiffs, "bookdiffs"),
             (self.orderupdates, "orderupdates"),
             (self.stats, "stats"),
+            (self.ordersync, "ordersync"),
         ] {
             if enabled {
                 if !first {

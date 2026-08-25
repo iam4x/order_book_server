@@ -14,6 +14,7 @@ use tokio::{
     sync::{
         Mutex,
         broadcast::{Sender, channel},
+        watch,
     },
 };
 use yawc::{FrameView, OpCode, WebSocket};
@@ -29,6 +30,7 @@ use crate::{
         MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
     order_book::{Coin, RawBbo},
+    order_sync::{OrderSyncHub, OrderSyncStatus},
     prelude::*,
     types::{
         AllBbo, AllBboEntry, Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Level, Stats, Trade,
@@ -183,6 +185,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // Slow receivers fall into the existing `RecvError::Lagged` shedding path
     // (CHANNEL_DROPS_TOTAL is incremented).
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(32);
+    let order_sync = config.features.ordersync().then(OrderSyncHub::spawn);
 
     // Market filter flags from config
     let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
@@ -193,7 +196,11 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // Central task: listen to messages and forward them for distribution
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot, config.features)
+        let mut listener = OrderBookListener::new(Some(internal_message_tx), ignore_spot, config.features);
+        if let Some(order_sync) = &order_sync {
+            listener.set_order_sync_recorder(order_sync.recorder());
+        }
+        listener
     };
     let listener = Arc::new(Mutex::new(listener));
     {
@@ -231,8 +238,10 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
                 let allbbo_subscription_registry = Arc::clone(&allbbo_subscription_registry);
                 let websocket_secret = websocket_secret.clone();
+                let order_sync = order_sync.clone();
                 move |Query(query): Query<WsAuthQuery>, ws_upgrade| {
                     let websocket_secret = websocket_secret.clone();
+                    let order_sync = order_sync.clone();
                     async move {
                         if !websocket_token_authorized(websocket_secret.as_deref(), query.token.as_deref()) {
                             return (axum::http::StatusCode::UNAUTHORIZED, "unauthorized websocket connection")
@@ -250,6 +259,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                             l2book_heartbeat_ms,
                             bbo_heartbeat_ms,
                             allbbo_heartbeat_ms,
+                            order_sync,
                             websocket_opts,
                         )
                     }
@@ -301,6 +311,7 @@ fn ws_handler(
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
     allbbo_heartbeat_ms: u64,
+    order_sync: Option<Arc<OrderSyncHub>>,
     websocket_opts: yawc::Options,
 ) -> axum::response::Response {
     // Reject malformed WS handshakes cleanly. The previous `.unwrap()` would panic
@@ -332,6 +343,7 @@ fn ws_handler(
             l2book_heartbeat_ms,
             bbo_heartbeat_ms,
             allbbo_heartbeat_ms,
+            order_sync,
         )
         .await
     });
@@ -381,6 +393,7 @@ async fn handle_socket(
     l2book_heartbeat_ms: u64,
     bbo_heartbeat_ms: u64,
     allbbo_heartbeat_ms: u64,
+    order_sync: Option<Arc<OrderSyncHub>>,
 ) {
     // Track connection metrics
     WS_CONNECTIONS_ACTIVE.inc();
@@ -409,6 +422,7 @@ async fn handle_socket(
     let mut last_allbbo = AllBboCache::default();
     let mut l2_registrations = ConnectionL2Registrations::new(l2_subscription_registry);
     let mut allbbo_registration = ConnectionAllBboRegistration::new(allbbo_subscription_registry);
+    let mut order_sync_rx: Option<watch::Receiver<OrderSyncStatus>> = None;
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
         let _ = send_socket_message(&mut socket, msg).await;
@@ -613,6 +627,11 @@ async fn handle_socket(
                 }
             }
 
+            status = receive_order_sync(&mut order_sync_rx) => {
+                BROADCASTS_TOTAL.with_label_values(&["orderSync"]).inc();
+                alive &= send_socket_message(&mut socket, ServerResponse::OrderSync(status)).await;
+            }
+
             msg = socket.next() => {
                 if let Some(frame) = msg {
                     match frame.opcode {
@@ -647,6 +666,8 @@ async fn handle_socket(
                                             &mut last_allbbo,
                                             &mut l2_registrations,
                                             &mut allbbo_registration,
+                                            order_sync.as_deref(),
+                                            &mut order_sync_rx,
                                         ).await;
                                     }
                                 }
@@ -686,6 +707,8 @@ async fn receive_client_message(
     last_allbbo: &mut AllBboCache,
     l2_registrations: &mut ConnectionL2Registrations,
     allbbo_registration: &mut ConnectionAllBboRegistration,
+    order_sync: Option<&OrderSyncHub>,
+    order_sync_rx: &mut Option<watch::Receiver<OrderSyncStatus>>,
 ) -> bool {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -739,6 +762,15 @@ async fn receive_client_message(
         ClientMessage::Ping => unreachable!(),
     };
     if success {
+        match &client_message {
+            ClientMessage::Subscribe { subscription: Subscription::OrderSync } => {
+                *order_sync_rx = order_sync.map(OrderSyncHub::subscribe);
+            }
+            ClientMessage::Unsubscribe { subscription: Subscription::OrderSync } => {
+                *order_sync_rx = None;
+            }
+            _ => {}
+        }
         if let ClientMessage::Subscribe { subscription } = &client_message {
             l2_registrations.register(subscription);
             allbbo_registration.register(subscription);
@@ -930,6 +962,7 @@ fn subscription_feature_enabled(subscription: &Subscription, features: FeatureSe
         Subscription::OrderUpdates { .. } => features.orderupdates(),
         Subscription::BookDiffs { .. } => features.bookdiffs(),
         Subscription::Stats => features.stats(),
+        Subscription::OrderSync => features.ordersync(),
     }
 }
 
@@ -956,13 +989,24 @@ fn validate_subscription_for_features(
     }
 
     match subscription {
-        Subscription::Stats => true,
-        Subscription::AllBbo => true,
+        Subscription::Stats | Subscription::OrderSync | Subscription::AllBbo => true,
         Subscription::Trades { coin } | Subscription::BookDiffs { coin } => {
             market_filter_allows_coin(coin, market_filter)
         }
         Subscription::OrderUpdates { .. } => subscription.validate(universe),
         Subscription::Bbo { .. } | Subscription::L2Book { .. } | Subscription::L4Book { .. } => false,
+    }
+}
+
+async fn receive_order_sync(receiver: &mut Option<watch::Receiver<OrderSyncStatus>>) -> OrderSyncStatus {
+    let Some(receiver) = receiver else {
+        return std::future::pending().await;
+    };
+    loop {
+        if receiver.changed().await.is_ok() {
+            return receiver.borrow_and_update().clone();
+        }
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1050,7 +1094,9 @@ mod tests {
             features
         ));
         assert!(!subscription_feature_enabled(&Subscription::Stats, features));
+        assert!(!subscription_feature_enabled(&Subscription::OrderSync, features));
         assert!(subscription_feature_enabled(&Subscription::Stats, "stats".parse().expect("valid features")));
+        assert!(subscription_feature_enabled(&Subscription::OrderSync, "ordersync".parse().expect("valid features")));
     }
 
     #[test]
@@ -1070,6 +1116,12 @@ mod tests {
             &universe,
             bookdiffs,
             (false, false, true),
+        ));
+        assert!(validate_subscription_for_features(
+            &Subscription::OrderSync,
+            &universe,
+            "ordersync".parse().expect("valid features"),
+            (false, false, false),
         ));
         assert!(!validate_subscription_for_features(
             &Subscription::Trades { coin: "@1".to_string() },

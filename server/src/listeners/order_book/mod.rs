@@ -34,6 +34,7 @@ use crate::{
         Coin, Px, RawBbo, Snapshot, Sz,
         multi_book::{SnapshotHeightSource, Snapshots, load_snapshots_from_cli_json_at_height, read_visor_height},
     },
+    order_sync::OrderSyncRecorder,
     prelude::*,
     types::{
         L2Book, L4Order, Stats,
@@ -511,6 +512,7 @@ pub(crate) struct OrderBookListener {
     allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     last_universe: HashSet<Coin>,
     stats: StatsAccumulator,
+    order_sync_recorder: Option<OrderSyncRecorder>,
 }
 
 impl OrderBookListener {
@@ -539,7 +541,16 @@ impl OrderBookListener {
             allbbo_subscription_registry: Arc::new(AllBboSubscriptionRegistry::default()),
             last_universe: HashSet::new(),
             stats: StatsAccumulator::default(),
+            order_sync_recorder: None,
         }
+    }
+
+    pub(crate) fn set_order_sync_recorder(&mut self, recorder: OrderSyncRecorder) {
+        self.order_sync_recorder = Some(recorder);
+    }
+
+    fn order_sync_recorder(&self) -> Option<OrderSyncRecorder> {
+        self.order_sync_recorder.clone()
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -965,7 +976,7 @@ impl OrderBookListener {
         }
 
         let source_enabled = match event_source {
-            EventSource::Fills => self.features.watch_fills(),
+            EventSource::Fills => self.features.needs_fill_batches(),
             EventSource::OrderStatuses => self.features.watch_order_statuses(),
             EventSource::OrderDiffs => self.features.watch_order_diffs(),
         };
@@ -1031,6 +1042,9 @@ impl OrderBookListener {
         }
         if self.features.stats() {
             self.stats.record(&event_batch, height);
+        }
+        if let (Some(recorder), EventBatch::Fills(batch)) = (&self.order_sync_recorder, &event_batch) {
+            recorder.observe_batch(batch);
         }
 
         // Log successful parses periodically
@@ -1452,9 +1466,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         listener.ignore_spot
     };
 
+    let order_sync_recorder = listener.lock().await.order_sync_recorder();
+
     // Start only the file watchers needed by the enabled features.
     let (crossbeam_rx, _handles, _last_os, _last_fills, _last_diffs) =
-        parallel::start_parallel_file_watchers(dir, config.features);
+        parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder);
 
     // Bridge crossbeam to tokio mpsc.
     // BOUNDED channel: under processing stalls (mutex contention, slow L2 compute),
@@ -2652,6 +2668,18 @@ mod tests {
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. })));
+    }
+
+    #[test]
+    fn trades_and_ordersync_record_from_the_existing_fill_parse() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let recorder = OrderSyncRecorder::default();
+        let mut listener = listener_without_snapshot(tx, features("trades,ordersync"));
+        listener.set_order_sync_recorder(recorder.clone());
+
+        listener.process_data_hft(fill_line("BTC"), EventSource::Fills).expect("fill parses once");
+
+        assert_eq!(recorder.status_at(1_700_000_300_000).last_order_at, Some(300));
     }
 
     #[test]

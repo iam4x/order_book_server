@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     metrics::WS_SUBSCRIPTIONS_ACTIVE,
+    order_sync::OrderSyncStatus,
     types::{
         AllBbo, Bbo, L2Book, L4Book, Stats, Trade,
         node_data::{NodeDataOrderDiff, NodeDataOrderStatus},
@@ -64,6 +65,7 @@ pub(crate) enum Subscription {
         coin: String,
     },
     Stats,
+    OrderSync,
 }
 
 impl Subscription {
@@ -126,8 +128,8 @@ impl Subscription {
                 info!("Valid orderUpdates subscription for user: {}", user);
                 true
             }
-            Self::Stats => {
-                info!("Valid stats subscription");
+            Self::Stats | Self::OrderSync => {
+                info!("Valid {} subscription", self.type_label());
                 true
             }
         }
@@ -145,6 +147,7 @@ impl Subscription {
             Self::OrderUpdates { .. } => "orderUpdates",
             Self::BookDiffs { .. } => "bookDiffs",
             Self::Stats => "stats",
+            Self::OrderSync => "orderSync",
         }
     }
 }
@@ -179,6 +182,7 @@ pub(crate) enum ServerResponse {
     BookDiffs(Vec<NodeDataOrderDiff>),
     OrderUpdates(Vec<OrderUpdate>),
     Stats(Stats),
+    OrderSync(OrderSyncStatus),
     Pong,
     Error(String),
 }
@@ -228,7 +232,7 @@ impl Drop for SubscriptionManager {
 #[cfg(test)]
 mod test {
     use super::{ClientMessage, ServerResponse};
-    use crate::types::subscription::Subscription;
+    use crate::{order_sync::OrderSyncStatus, types::subscription::Subscription};
 
     #[test]
     fn test_message_deserialization_subscription_response() {
@@ -304,6 +308,13 @@ mod test {
         assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::Stats }));
     }
 
+    #[test]
+    fn test_order_sync_subscription_deserialization() {
+        let message = r#"{"method":"subscribe","subscription":{"type":"orderSync"}}"#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, ClientMessage::Subscribe { subscription: Subscription::OrderSync }));
+    }
+
     // ==================== Subscription Validation Tests ====================
 
     fn universe() -> std::collections::HashSet<String> {
@@ -338,6 +349,7 @@ mod test {
     #[test]
     fn test_validate_stats_valid_without_universe() {
         assert!(Subscription::Stats.validate(&std::collections::HashSet::new()));
+        assert!(Subscription::OrderSync.validate(&std::collections::HashSet::new()));
     }
 
     #[test]
@@ -474,6 +486,7 @@ mod test {
         assert_eq!(Subscription::OrderUpdates { user: "".to_string() }.type_label(), "orderUpdates");
         assert_eq!(Subscription::BookDiffs { coin: "".to_string() }.type_label(), "bookDiffs");
         assert_eq!(Subscription::Stats.type_label(), "stats");
+        assert_eq!(Subscription::OrderSync.type_label(), "orderSync");
     }
 
     // ==================== SubscriptionManager Tests ====================
@@ -585,6 +598,16 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_server_response_order_sync_serialization() {
+        let json =
+            serde_json::to_string(&ServerResponse::OrderSync(OrderSyncStatus { last_order_at: Some(300) })).unwrap();
+        assert_eq!(json, r#"{"channel":"orderSync","data":{"last_order_at":300}}"#);
+
+        let json = serde_json::to_string(&ServerResponse::OrderSync(OrderSyncStatus { last_order_at: None })).unwrap();
+        assert_eq!(json, r#"{"channel":"orderSync","data":{"last_order_at":null}}"#);
+    }
+
     // ==================== ClientMessage Serde Tests ====================
 
     #[test]
@@ -597,6 +620,7 @@ mod test {
             (r#"{"method":"subscribe","subscription":{"type":"bookDiffs","coin":"BTC"}}"#, "bookDiffs"),
             (r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#, "l2Book"),
             (r#"{"method":"subscribe","subscription":{"type":"stats"}}"#, "stats"),
+            (r#"{"method":"subscribe","subscription":{"type":"orderSync"}}"#, "orderSync"),
             (
                 r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#,
                 "orderUpdates",
