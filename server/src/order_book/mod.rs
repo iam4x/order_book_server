@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use itertools::Itertools;
 use linked_list::LinkedList;
@@ -16,7 +16,7 @@ pub(crate) type RawBbo = (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>);
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
-    oid_to_side_px: HashMap<Oid, (Side, Px)>,
+    oid_to_side_px: rustc_hash::FxHashMap<Oid, (Side, Px)>,
     bids: BTreeMap<Px, LinkedList<Oid, O>>,
     asks: BTreeMap<Px, LinkedList<Oid, O>>,
     bid_totals: BTreeMap<Px, LevelTotal>,
@@ -114,7 +114,7 @@ impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            oid_to_side_px: HashMap::new(),
+            oid_to_side_px: rustc_hash::FxHashMap::default(),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             bid_totals: BTreeMap::new(),

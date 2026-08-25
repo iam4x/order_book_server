@@ -1,5 +1,6 @@
-use std::{collections::HashMap, hash::Hash, marker::PhantomData};
+use std::{hash::Hash, marker::PhantomData};
 
+use rustc_hash::FxHashMap;
 use slab::Slab;
 
 use crate::prelude::*;
@@ -21,7 +22,7 @@ impl<K, T> Node<K, T> {
 #[derive(Clone)]
 // Implicit assumption is that when we remove a node, it is never used again
 pub(crate) struct LinkedList<K, T> {
-    key_to_sid: HashMap<K, usize>,
+    key_to_sid: FxHashMap<K, usize>,
     slab: Slab<Node<K, T>>,
     head: Option<usize>,
     tail: Option<usize>,
@@ -31,7 +32,7 @@ pub(crate) struct LinkedList<K, T> {
 impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { key_to_sid: HashMap::new(), slab: Slab::new(), head: None, tail: None, phantom_data: PhantomData }
+        Self { key_to_sid: FxHashMap::default(), slab: Slab::new(), head: None, tail: None, phantom_data: PhantomData }
     }
 
     pub(crate) fn push_back(&mut self, key: K, value: T) -> bool {
@@ -189,7 +190,7 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
             cur = node.next;
         }
         self.slab = Slab::with_capacity(live);
-        self.key_to_sid = HashMap::with_capacity(live);
+        self.key_to_sid = FxHashMap::with_capacity_and_hasher(live, rustc_hash::FxBuildHasher);
         self.head = None;
         self.tail = None;
         for (key, value) in items {

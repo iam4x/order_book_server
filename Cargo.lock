@@ -4069,6 +4069,7 @@ dependencies = [
  "notify",
  "prometheus",
  "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "slab",

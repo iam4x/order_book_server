@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use rustc_hash::FxHashMap;
+
 use crate::{
     listeners::order_book::{L2Snapshots, TimedSnapshots},
     order_book::{
@@ -20,10 +22,10 @@ pub(super) struct OrderBookState {
     ignore_spot: bool,
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible)
-    pending_order_statuses: HashMap<Oid, NodeDataOrderStatus>,
+    pending_order_statuses: FxHashMap<Oid, NodeDataOrderStatus>,
     // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
     // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
-    pending_new_diffs: HashMap<Oid, crate::order_book::types::Sz>,
+    pending_new_diffs: FxHashMap<Oid, crate::order_book::types::Sz>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -45,8 +47,8 @@ impl OrderBookState {
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
-            pending_order_statuses: HashMap::new(),
-            pending_new_diffs: HashMap::new(),
+            pending_order_statuses: FxHashMap::default(),
+            pending_new_diffs: FxHashMap::default(),
         }
     }
 
@@ -120,9 +122,8 @@ impl OrderBookState {
     /// Cleanup stale pending entries to prevent unbounded memory growth
     /// Orphaned entries occur when OrderStatuses have is_inserted_into_book() = true
     /// but their matching BookDiff never arrives (network issues, bugs, etc.)
-    /// This is a simple size-based eviction - when cache exceeds limit, replace
-    /// with a fresh `HashMap::new()` so the high-water-mark bucket capacity is
-    /// actually released (plain `.clear()` keeps the buckets allocated forever).
+    /// This is a simple size-based eviction. When a cache exceeds its limit,
+    /// replace it with a fresh map so its high-water-mark capacity is released.
     /// Also opportunistically compacts the orderbook slab allocators on the same
     /// cadence, since both are unbounded-growth vectors that the maintenance tick
     /// is responsible for bounding.
@@ -135,12 +136,12 @@ impl OrderBookState {
                 "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
                 self.pending_order_statuses.len()
             );
-            self.pending_order_statuses = HashMap::new();
+            self.pending_order_statuses = FxHashMap::default();
         }
 
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
             log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
-            self.pending_new_diffs = HashMap::new();
+            self.pending_new_diffs = FxHashMap::default();
         }
 
         let compacted = self.order_book.compact_all();
