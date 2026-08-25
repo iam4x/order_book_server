@@ -1126,7 +1126,7 @@ mod tests {
         }
 
         fn start_send(self: Pin<&mut Self>, item: FrameView) -> std::result::Result<(), Self::Error> {
-            self.0.lock().unwrap().push(item.payload.clone());
+            self.0.lock().unwrap().push(item.payload);
             Ok(())
         }
 
