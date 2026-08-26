@@ -545,6 +545,18 @@ mod tests {
     }
 
     #[test]
+    fn continuity_loss_precedes_recovered_lines_on_the_shared_channel() {
+        let (tx, mut rx) = channel(2);
+        let sink = file_line_sink(EventSource::OrderDiffs, features("bbo"), tx, None).expect("diff sink exists");
+
+        assert!(sink.submit_continuity_loss());
+        assert!(sink.submit("recovered line".to_string()));
+
+        assert!(matches!(rx.try_recv(), Ok(FileEvent::ContinuityLost(EventSource::OrderDiffs))));
+        assert!(matches!(rx.try_recv(), Ok(FileEvent::OrderDiff(line)) if line == "recovered line"));
+    }
+
+    #[test]
     fn create_event_for_a_day_directory_does_not_replace_the_tracked_file() {
         let base_dir = stream_test_dir("ignore-day-directory");
         let day_dir = base_dir.join("hourly/20260826");
@@ -658,6 +670,74 @@ mod tests {
         assert!(reader.on_modify().is_empty());
         append_to_file(&hour_file, "{\"sequence\":2}\n");
         assert_eq!(reader.on_modify(), vec![r#"{"sequence":2}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn missing_file_recovery_reports_loss_before_replacement_lines() {
+        let base_dir = stream_test_dir("missing-file-continuity");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        std::fs::remove_file(&old_file).expect("old hour file should be removed");
+        let replacement_file = day_dir.join("6");
+        std::fs::write(&replacement_file, "{\"sequence\":1}\n").expect("replacement hour file should exist");
+
+        let recovered_file = reader.check_for_newer_file().expect("polling should find the replacement file");
+        let FileRead { lines: old_lines, continuity: switch_continuity } = reader.on_create(&recovered_file);
+        let FileRead { lines: replacement_lines, continuity: read_continuity } = reader.on_modify();
+
+        assert!(matches!(switch_continuity, FileContinuity::Lost));
+        assert!(old_lines.is_empty());
+        assert!(matches!(read_continuity, FileContinuity::Preserved));
+        assert_eq!(replacement_lines, vec![r#"{"sequence":1}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn same_path_shrink_reports_continuity_loss() {
+        let base_dir = stream_test_dir("shrink-continuity");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{\"sequence\":123456789}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        std::fs::write(&hour_file, "{}\n").expect("hour file should shrink");
+
+        let FileRead { lines, continuity } = reader.on_modify();
+
+        assert!(matches!(continuity, FileContinuity::Lost));
+        assert_eq!(lines, vec!["{}"]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn ordinary_rotation_preserves_continuity() {
+        let base_dir = stream_test_dir("rotation-continuity");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        append_to_file(&old_file, "{\"sequence\":1}\n");
+        let new_file = day_dir.join("6");
+        std::fs::write(&new_file, "{\"sequence\":2}\n").expect("new hour file should exist");
+
+        let FileRead { lines: old_lines, continuity: switch_continuity } = reader.on_create(&new_file);
+        let FileRead { lines: new_lines, continuity: read_continuity } = reader.on_modify();
+
+        assert!(matches!(switch_continuity, FileContinuity::Preserved));
+        assert_eq!(old_lines, vec![r#"{"sequence":1}"#]);
+        assert!(matches!(read_continuity, FileContinuity::Preserved));
+        assert_eq!(new_lines, vec![r#"{"sequence":2}"#]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 }

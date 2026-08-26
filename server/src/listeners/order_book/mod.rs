@@ -2225,6 +2225,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_and_diff_continuity_loss_request_refresh_without_a_periodic_deadline() {
+        for source in [EventSource::OrderStatuses, EventSource::OrderDiffs] {
+            let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+            let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+
+            listener.report_stream_gap(source);
+
+            assert!(listener.repair_pending());
+            assert_eq!(listener.repair_requested_epoch, 1);
+            let now = Instant::now();
+            assert_eq!(
+                next_snapshot_trigger(
+                    features("bbo"),
+                    listener.is_ready(),
+                    false,
+                    None,
+                    listener.repair_pending(),
+                    None,
+                    now,
+                ),
+                Some(SnapshotTaskKind::Refresh)
+            );
+        }
+    }
+
+    #[test]
+    fn fill_continuity_loss_does_not_request_book_repair() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+
+        listener.report_stream_gap(EventSource::Fills);
+
+        assert!(!listener.repair_pending());
+        assert_eq!(listener.repair_requested_epoch, 0);
+        let now = Instant::now();
+        assert_eq!(
+            next_snapshot_trigger(
+                features("bbo"),
+                listener.is_ready(),
+                false,
+                None,
+                listener.repair_pending(),
+                None,
+                now,
+            ),
+            None
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn visor_waiter_polls_until_replay_floor() {
         let observations = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([88, 99, 100])));
