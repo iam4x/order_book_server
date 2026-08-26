@@ -32,11 +32,12 @@ pub(crate) enum FileEvent {
     OrderStatus(String),
     OrderDiff(String),
     Fill(String),
+    ContinuityLost(EventSource),
 }
 
 enum FileLineSink {
     Events { source: EventSource, tx: Sender<FileEvent> },
-    FillProgress { recorder: OrderSyncRecorder, _event_tx: Sender<FileEvent> },
+    FillProgress { recorder: OrderSyncRecorder, event_tx: Sender<FileEvent> },
 }
 
 impl FileLineSink {
@@ -76,6 +77,15 @@ impl FileLineSink {
             }
         }
     }
+
+    fn submit_continuity_loss(&self) -> bool {
+        match self {
+            Self::Events { source, tx } => tx.blocking_send(FileEvent::ContinuityLost(*source)).is_ok(),
+            Self::FillProgress { event_tx, .. } => {
+                event_tx.blocking_send(FileEvent::ContinuityLost(EventSource::Fills)).is_ok()
+            }
+        }
+    }
 }
 
 fn file_line_sink(
@@ -85,7 +95,7 @@ fn file_line_sink(
     order_sync_recorder: Option<OrderSyncRecorder>,
 ) -> Option<FileLineSink> {
     if source == EventSource::Fills && !features.needs_fill_batches() {
-        return order_sync_recorder.map(|recorder| FileLineSink::FillProgress { recorder, _event_tx: tx });
+        return order_sync_recorder.map(|recorder| FileLineSink::FillProgress { recorder, event_tx: tx });
     }
     Some(FileLineSink::Events { source, tx })
 }
@@ -109,6 +119,18 @@ pub(super) fn enabled_event_sources(features: FeatureSet) -> Vec<EventSource> {
 /// flush from the node that would otherwise let `partial_line` grow without
 /// limit and OOM the host.
 const MAX_PARTIAL_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileContinuity {
+    Preserved,
+    Lost,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileRead {
+    lines: Vec<String>,
+    continuity: FileContinuity,
+}
 
 /// File reader state for a single source
 struct FileReader {
@@ -179,8 +201,13 @@ impl FileReader {
             return None;
         }
 
-        let Ok(current_metadata) = current.metadata() else {
-            return Some(latest);
+        let current_metadata = match current.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(latest),
+            Err(err) => {
+                error!("Failed to inspect tracked file {:?}: {}; retrying", current, err);
+                return None;
+            }
         };
         if !current_metadata.is_file() {
             return Some(latest);
@@ -196,8 +223,9 @@ impl FileReader {
     }
 
     /// Process file modification - read new data and return lines
-    fn on_modify(&mut self) -> Vec<String> {
+    fn on_modify(&mut self) -> FileRead {
         let mut lines = Vec::new();
+        let mut continuity = FileContinuity::Preserved;
         if let Some(ref path) = self.current_path {
             // Open file, seek to last position, read new data
             if let Ok(mut file) = File::open(path) {
@@ -208,6 +236,7 @@ impl FileReader {
                     if file_size < self.file_position {
                         self.file_position = 0;
                         self.partial_line.clear();
+                        continuity = FileContinuity::Lost;
                     }
 
                     // Only read if there's new data
@@ -277,24 +306,52 @@ impl FileReader {
                 }
             }
         }
-        lines
+        FileRead { lines, continuity }
     }
 
     /// Switch to a new file (on create event)
-    fn on_create(&mut self, path: &PathBuf) -> Vec<String> {
-        if !path.is_file() || self.current_path.as_ref() == Some(path) {
-            return Vec::new();
+    fn on_create(&mut self, path: &PathBuf) -> FileRead {
+        let candidate_metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
+            }
+            Err(err) => {
+                error!("Failed to inspect created path {:?}: {}; retrying", path, err);
+                return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
+            }
+        };
+        if !candidate_metadata.is_file() || self.current_path.as_ref() == Some(path) {
+            return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
         }
 
-        // First, read remaining data from old file
-        let old_lines = self.on_modify();
+        let current_continuity = match self.current_path.as_ref() {
+            None => FileContinuity::Preserved,
+            Some(current) => match current.metadata() {
+                Ok(metadata) if metadata.is_file() => FileContinuity::Preserved,
+                Ok(_) => FileContinuity::Lost,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => FileContinuity::Lost,
+                Err(err) => {
+                    error!("Failed to inspect tracked file {:?} before switching: {}; retrying", current, err);
+                    return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
+                }
+            },
+        };
+
+        let mut old_read = match current_continuity {
+            FileContinuity::Preserved => self.on_modify(),
+            FileContinuity::Lost => FileRead { lines: Vec::new(), continuity: FileContinuity::Lost },
+        };
 
         // Start tracking new file from beginning
         self.current_path = Some(path.clone());
         self.file_position = 0;
         self.partial_line.clear();
 
-        old_lines
+        if current_continuity == FileContinuity::Lost {
+            old_read.continuity = FileContinuity::Lost;
+        }
+        old_read
     }
 
     /// Track an existing file (first event we see for it)
@@ -311,6 +368,21 @@ impl FileReader {
         self.current_path = Some(path.clone());
         self.partial_line.clear();
     }
+}
+
+fn submit_file_read(sink: &FileLineSink, read: FileRead, last_event: Option<&AtomicU64>) -> bool {
+    if read.continuity == FileContinuity::Lost && !sink.submit_continuity_loss() {
+        return false;
+    }
+    for line in read.lines {
+        if !sink.submit(line) {
+            return false;
+        }
+        if let Some(last_event) = last_event {
+            last_event.store(Instant::now().elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
+        }
+    }
+    true
 }
 
 /// Spawn a file watcher thread for a single event source
@@ -365,12 +437,9 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
 
                         if event.kind.is_create() {
                             info!("{} new file: {:?}", source_name, path.file_name());
-                            let old_lines = reader.on_create(path);
-                            for line in old_lines {
-                                if !sink.submit(line) {
-                                    error!("{} channel closed, exiting", source_name);
-                                    return;
-                                }
+                            if !submit_file_read(&sink, reader.on_create(path), None) {
+                                error!("{} channel closed, exiting", source_name);
+                                return;
                             }
                         } else if reader.current_path.is_none() {
                             // First time seeing this file
@@ -379,15 +448,9 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                         }
 
                         // EVENT-DRIVEN: Read data when inotify fires modify event
-                        let lines = reader.on_modify();
-                        for line in lines {
-                            if !sink.submit(line) {
-                                error!("{} channel closed, exiting", source_name);
-                                return;
-                            }
-
-                            // Update health timestamp
-                            last_event.store(Instant::now().elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
+                        if !submit_file_read(&sink, reader.on_modify(), Some(last_event.as_ref())) {
+                            error!("{} channel closed, exiting", source_name);
+                            return;
                         }
                     }
                 }
@@ -397,14 +460,9 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Fallback polling - safety net for missed events
                     // This runs every 500ms instead of every 10ms
-                    let lines = reader.on_modify();
-                    for line in lines {
-                        if !sink.submit(line) {
-                            error!("{} channel closed, exiting", source_name);
-                            return;
-                        }
-
-                        last_event.store(Instant::now().elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
+                    if !submit_file_read(&sink, reader.on_modify(), Some(last_event.as_ref())) {
+                        error!("{} channel closed, exiting", source_name);
+                        return;
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -418,12 +476,9 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                 if let Some(newer_file) = reader.check_for_newer_file() {
                     info!("{} detected newer file (day rotation?): {:?}", source_name, newer_file.file_name());
                     // Switch to the new file
-                    let old_lines = reader.on_create(&newer_file);
-                    for line in old_lines {
-                        if !sink.submit(line) {
-                            error!("{} channel closed, exiting", source_name);
-                            return;
-                        }
+                    if !submit_file_read(&sink, reader.on_create(&newer_file), None) {
+                        error!("{} channel closed, exiting", source_name);
+                        return;
                     }
                 }
             }
@@ -588,8 +643,8 @@ mod tests {
 
         let recovered_file = reader.check_for_newer_file().expect("polling should recover the current hour file");
         assert_eq!(recovered_file, current_file);
-        assert!(reader.on_create(&recovered_file).is_empty());
-        assert_eq!(reader.on_modify(), vec!["{}"]);
+        assert!(reader.on_create(&recovered_file).lines.is_empty());
+        assert_eq!(reader.on_modify().lines, vec!["{}"]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -625,12 +680,12 @@ mod tests {
         reader.start_tracking(&hour_file);
         let file_position = reader.file_position;
 
-        assert!(reader.on_create(&hour_file).is_empty());
-        assert!(reader.on_create(&hour_file).is_empty());
+        assert!(reader.on_create(&hour_file).lines.is_empty());
+        assert!(reader.on_create(&hour_file).lines.is_empty());
         assert_eq!(reader.file_position, file_position);
 
         append_to_file(&hour_file, "{\"sequence\":2}\n");
-        assert_eq!(reader.on_modify(), vec![r#"{"sequence":2}"#]);
+        assert_eq!(reader.on_modify().lines, vec![r#"{"sequence":2}"#]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -645,14 +700,14 @@ mod tests {
         let mut reader = FileReader::new(base_dir.clone());
         reader.start_tracking(&hour_file);
         append_to_file(&hour_file, "{\"stale\":");
-        assert!(reader.on_modify().is_empty());
+        assert!(reader.on_modify().lines.is_empty());
         assert_eq!(reader.partial_line, "{\"stale\":");
         let file_position = reader.file_position;
         std::fs::write(&hour_file, "{}\n").expect("hour file should be recreated");
 
-        assert!(reader.on_create(&hour_file).is_empty());
+        assert!(reader.on_create(&hour_file).lines.is_empty());
         assert_eq!(reader.file_position, file_position);
-        assert_eq!(reader.on_modify(), vec!["{}"]);
+        assert_eq!(reader.on_modify().lines, vec!["{}"]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -667,9 +722,9 @@ mod tests {
         let mut reader = FileReader::new(base_dir.clone());
         reader.start_tracking(&hour_file);
 
-        assert!(reader.on_modify().is_empty());
+        assert!(reader.on_modify().lines.is_empty());
         append_to_file(&hour_file, "{\"sequence\":2}\n");
-        assert_eq!(reader.on_modify(), vec![r#"{"sequence":2}"#]);
+        assert_eq!(reader.on_modify().lines, vec![r#"{"sequence":2}"#]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 

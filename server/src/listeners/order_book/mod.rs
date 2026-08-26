@@ -729,6 +729,13 @@ impl OrderBookListener {
         ORDERBOOK_REPAIR_REQUESTS_TOTAL.with_label_values(&[reason]).inc();
     }
 
+    fn report_stream_gap(&mut self, source: EventSource) {
+        if self.features.requires_book_state() && matches!(source, EventSource::OrderStatuses | EventSource::OrderDiffs)
+        {
+            self.request_repair("stream_gap");
+        }
+    }
+
     fn request_pending_repairs(&mut self, reasons: HashSet<PendingRepairReason>) {
         for reason in reasons {
             self.request_repair(reason.metric_label());
@@ -1737,11 +1744,16 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
                 let mut parsed_events = Vec::with_capacity(ready_count);
                 let mut parse_repair_count = 0usize;
+                let mut stream_gaps = Vec::new();
                 for event in ready_events.drain(..) {
                     let (line, event_source) = match event {
                         parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
                         parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
                         parallel::FileEvent::Fill(line) => (line, EventSource::Fills),
+                        parallel::FileEvent::ContinuityLost(source) => {
+                            stream_gaps.push(source);
+                            continue;
+                        }
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
@@ -1756,6 +1768,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     }
                 }
                 let mut listener = listener.lock().await;
+                for source in stream_gaps {
+                    listener.report_stream_gap(source);
+                }
                 for _ in 0..parse_repair_count {
                     listener.request_repair("parse_error");
                 }
