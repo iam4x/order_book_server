@@ -454,6 +454,13 @@ pub(crate) fn start_parallel_file_watchers(
 mod tests {
     use super::*;
 
+    fn stream_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("orderbook-server-{name}-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&path));
+        std::fs::create_dir_all(&path).expect("test stream directory should exist");
+        path
+    }
+
     fn features(value: &str) -> FeatureSet {
         value.parse().expect("valid features")
     }
@@ -515,5 +522,39 @@ mod tests {
 
         assert!(sink.submit("fill line".to_string()));
         assert!(matches!(rx.try_recv(), Ok(FileEvent::Fill(line)) if line == "fill line"));
+    }
+
+    #[test]
+    fn create_event_for_a_day_directory_does_not_replace_the_tracked_file() {
+        let base_dir = stream_test_dir("ignore-day-directory");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        reader.on_create(&day_dir);
+
+        assert_eq!(reader.current_path.as_deref(), Some(hour_file.as_path()));
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn polling_recovers_when_the_tracked_file_disappears() {
+        let base_dir = stream_test_dir("recover-missing-file");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        std::fs::remove_file(&old_file).expect("old hour file should be removed");
+        let current_file = day_dir.join("6");
+        std::fs::write(&current_file, "{}\n").expect("current hour file should exist");
+
+        assert_eq!(reader.check_for_newer_file().as_deref(), Some(current_file.as_path()));
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 }
