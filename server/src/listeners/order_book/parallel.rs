@@ -171,25 +171,28 @@ impl FileReader {
 
     /// Check if there's a newer file than what we're currently tracking
     fn check_for_newer_file(&mut self) -> Option<PathBuf> {
-        if let Some(latest) = self.find_latest_file() {
-            if let Some(ref current) = self.current_path {
-                if latest != *current {
-                    // Check if the new file has data (modification time is newer)
-                    if let (Ok(latest_meta), Ok(current_meta)) = (latest.metadata(), current.metadata()) {
-                        if let (Ok(latest_mtime), Ok(current_mtime)) = (latest_meta.modified(), current_meta.modified())
-                        {
-                            if latest_mtime > current_mtime {
-                                return Some(latest);
-                            }
-                        }
-                    }
-                }
-            } else {
-                // No current file, use the latest
-                return Some(latest);
-            }
+        let latest = self.find_latest_file()?;
+        let Some(current) = self.current_path.as_ref() else {
+            return Some(latest);
+        };
+        if latest == *current {
+            return None;
         }
-        None
+
+        let Ok(current_metadata) = current.metadata() else {
+            return Some(latest);
+        };
+        if !current_metadata.is_file() {
+            return Some(latest);
+        }
+
+        let latest_metadata = latest.metadata().ok()?;
+        if !latest_metadata.is_file() {
+            return None;
+        }
+        let latest_mtime = latest_metadata.modified().ok()?;
+        let current_mtime = current_metadata.modified().ok()?;
+        (latest_mtime > current_mtime).then_some(latest)
     }
 
     /// Process file modification - read new data and return lines
@@ -201,6 +204,11 @@ impl FileReader {
                 // Get fresh file size from opened handle
                 if let Ok(metadata) = file.metadata() {
                     let file_size = metadata.len();
+
+                    if file_size < self.file_position {
+                        self.file_position = 0;
+                        self.partial_line.clear();
+                    }
 
                     // Only read if there's new data
                     if file_size > self.file_position {
@@ -274,6 +282,10 @@ impl FileReader {
 
     /// Switch to a new file (on create event)
     fn on_create(&mut self, path: &PathBuf) -> Vec<String> {
+        if !path.is_file() || self.current_path.as_ref() == Some(path) {
+            return Vec::new();
+        }
+
         // First, read remaining data from old file
         let old_lines = self.on_modify();
 
@@ -288,11 +300,14 @@ impl FileReader {
     /// Track an existing file (first event we see for it)
     fn start_tracking(&mut self, path: &PathBuf) {
         // Get current file size to start from end
-        if let Ok(metadata) = std::fs::metadata(path) {
-            self.file_position = metadata.len();
-        } else {
-            self.file_position = 0;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return;
+        };
+        if !metadata.is_file() {
+            return;
         }
+
+        self.file_position = metadata.len();
         self.current_path = Some(path.clone());
         self.partial_line.clear();
     }
@@ -461,6 +476,11 @@ mod tests {
         path
     }
 
+    fn append_to_file(path: &PathBuf, contents: &str) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).expect("test stream file should open");
+        std::io::Write::write_all(&mut file, contents.as_bytes()).expect("test stream file should append");
+    }
+
     fn features(value: &str) -> FeatureSet {
         value.parse().expect("valid features")
     }
@@ -554,7 +574,90 @@ mod tests {
         let current_file = day_dir.join("6");
         std::fs::write(&current_file, "{}\n").expect("current hour file should exist");
 
-        assert_eq!(reader.check_for_newer_file().as_deref(), Some(current_file.as_path()));
+        let recovered_file = reader.check_for_newer_file().expect("polling should recover the current hour file");
+        assert_eq!(recovered_file, current_file);
+        assert!(reader.on_create(&recovered_file).is_empty());
+        assert_eq!(reader.on_modify(), vec!["{}"]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn start_tracking_ignores_missing_and_non_file_candidates() {
+        let base_dir = stream_test_dir("ignore-invalid-start");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{\"sequence\":1}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        let file_position = reader.file_position;
+
+        reader.start_tracking(&day_dir);
+        reader.start_tracking(&day_dir.join("missing"));
+
+        assert_eq!(reader.current_path.as_deref(), Some(hour_file.as_path()));
+        assert_eq!(reader.file_position, file_position);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn duplicate_create_for_the_current_file_preserves_the_offset_without_replay() {
+        let base_dir = stream_test_dir("duplicate-create");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{\"sequence\":1}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        let file_position = reader.file_position;
+
+        assert!(reader.on_create(&hour_file).is_empty());
+        assert!(reader.on_create(&hour_file).is_empty());
+        assert_eq!(reader.file_position, file_position);
+
+        append_to_file(&hour_file, "{\"sequence\":2}\n");
+        assert_eq!(reader.on_modify(), vec![r#"{"sequence":2}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn same_path_shorter_recreation_rewinds_to_byte_zero() {
+        let base_dir = stream_test_dir("same-path-shorter");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{\"sequence\":123456789}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        append_to_file(&hour_file, "{\"stale\":");
+        assert!(reader.on_modify().is_empty());
+        assert_eq!(reader.partial_line, "{\"stale\":");
+        let file_position = reader.file_position;
+        std::fs::write(&hour_file, "{}\n").expect("hour file should be recreated");
+
+        assert!(reader.on_create(&hour_file).is_empty());
+        assert_eq!(reader.file_position, file_position);
+        assert_eq!(reader.on_modify(), vec!["{}"]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn first_modify_attaches_at_eof_without_replaying_existing_lines() {
+        let base_dir = stream_test_dir("first-modify-eof");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{\"sequence\":1}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+
+        assert!(reader.on_modify().is_empty());
+        append_to_file(&hour_file, "{\"sequence\":2}\n");
+        assert_eq!(reader.on_modify(), vec![r#"{"sequence":2}"#]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 }
