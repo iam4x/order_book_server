@@ -773,6 +773,170 @@ mod tests {
     }
 
     #[test]
+    fn equal_size_same_path_replacement_reports_loss_and_restarts_at_byte_zero() {
+        let base_dir = stream_test_dir("same-path-equal-size-replacement");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        let original = "{\"old\":1}\n";
+        let replacement = "{\"new\":2}\n";
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&hour_file, original).expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        let replacement_file = day_dir.join("replacement");
+        std::fs::write(&replacement_file, replacement).expect("replacement should exist");
+        std::fs::rename(&replacement_file, &hour_file).expect("replacement should install atomically");
+
+        let switched = reader.on_create(&hour_file);
+        let read = reader.on_modify();
+
+        assert_eq!(
+            (switched.continuity, switched.lines, read.continuity, read.lines),
+            (FileContinuity::Lost, Vec::<String>::new(), FileContinuity::Preserved, vec![r#"{"new":2}"#.to_string()],)
+        );
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn larger_same_path_replacement_reports_loss_and_restarts_at_byte_zero() {
+        let base_dir = stream_test_dir("same-path-larger-replacement");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "{}\n").expect("hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&hour_file);
+        let replacement_file = day_dir.join("replacement");
+        std::fs::write(&replacement_file, "{\"replacement\":true}\n").expect("replacement should exist");
+        std::fs::rename(&replacement_file, &hour_file).expect("replacement should install atomically");
+
+        let switched = reader.on_create(&hour_file);
+        let read = reader.on_modify();
+
+        assert_eq!(
+            (switched.continuity, switched.lines, read.continuity, read.lines),
+            (
+                FileContinuity::Lost,
+                Vec::<String>::new(),
+                FileContinuity::Preserved,
+                vec![r#"{"replacement":true}"#.to_string()],
+            )
+        );
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn skipped_hour_rotation_reports_continuity_loss() {
+        let base_dir = stream_test_dir("skipped-hour");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        let new_file = day_dir.join("7");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+        std::fs::write(&new_file, "{\"sequence\":7}\n").expect("new hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        let switched = reader.on_create(&new_file);
+        let read = reader.on_modify();
+
+        assert_eq!(switched.continuity, FileContinuity::Lost);
+        assert_eq!(read.lines, vec![r#"{"sequence":7}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn rotation_with_a_trailing_partial_record_reports_continuity_loss() {
+        let base_dir = stream_test_dir("partial-record-rotation");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        let new_file = day_dir.join("6");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        append_to_file(&old_file, "{\"sequence\":");
+        std::fs::write(&new_file, "{\"sequence\":6}\n").expect("new hour file should exist");
+
+        let switched = reader.on_create(&new_file);
+        let read = reader.on_modify();
+
+        assert_eq!(switched.continuity, FileContinuity::Lost);
+        assert_eq!(read.lines, vec![r#"{"sequence":6}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn unlinked_predecessor_is_drained_before_immediate_rotation() {
+        let base_dir = stream_test_dir("unlinked-predecessor");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let old_file = day_dir.join("5");
+        let new_file = day_dir.join("6");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        append_to_file(&old_file, "{\"sequence\":5}\n");
+        std::fs::remove_file(&old_file).expect("old path should be unlinked");
+        std::fs::write(&new_file, "{\"sequence\":6}\n").expect("new hour file should exist");
+
+        let switched = reader.on_create(&new_file);
+        let read = reader.on_modify();
+
+        assert_eq!(switched.continuity, FileContinuity::Preserved);
+        assert_eq!(switched.lines, vec![r#"{"sequence":5}"#]);
+        assert_eq!(read.lines, vec![r#"{"sequence":6}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn day_rollover_from_hour_23_to_hour_0_preserves_continuity() {
+        let base_dir = stream_test_dir("day-rollover");
+        let old_day = base_dir.join("hourly/20260826");
+        let new_day = base_dir.join("hourly/20260827");
+        std::fs::create_dir_all(&old_day).expect("old day directory should exist");
+        std::fs::create_dir_all(&new_day).expect("new day directory should exist");
+        let old_file = old_day.join("23");
+        let new_file = new_day.join("0");
+        std::fs::write(&old_file, "").expect("old hour file should exist");
+        std::fs::write(&new_file, "{\"sequence\":0}\n").expect("new hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&old_file);
+        let switched = reader.on_create(&new_file);
+        let read = reader.on_modify();
+
+        assert_eq!(switched.continuity, FileContinuity::Preserved);
+        assert_eq!(read.lines, vec![r#"{"sequence":0}"#]);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
+    fn delayed_create_for_an_older_hour_is_ignored() {
+        let base_dir = stream_test_dir("delayed-older-create");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let older_file = day_dir.join("5");
+        let current_file = day_dir.join("6");
+        std::fs::write(&older_file, "{\"sequence\":5}\n").expect("older hour file should exist");
+        std::fs::write(&current_file, "{\"sequence\":6}\n").expect("current hour file should exist");
+
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&current_file);
+        let delayed = reader.on_create(&older_file);
+
+        assert_eq!(delayed.continuity, FileContinuity::Preserved);
+        assert!(delayed.lines.is_empty());
+        assert_eq!(reader.current_path.as_deref(), Some(current_file.as_path()));
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
     fn ordinary_rotation_preserves_continuity() {
         let base_dir = stream_test_dir("rotation-continuity");
         let day_dir = base_dir.join("hourly/20260826");
