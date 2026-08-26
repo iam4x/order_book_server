@@ -732,6 +732,7 @@ impl OrderBookListener {
     fn report_stream_gap(&mut self, source: EventSource) {
         if self.features.requires_book_state() && matches!(source, EventSource::OrderStatuses | EventSource::OrderDiffs)
         {
+            warn!("{source} stream continuity lost; requesting order-book snapshot repair");
             self.request_repair("stream_gap");
         }
     }

@@ -4,7 +4,8 @@
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -13,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::NaiveDate;
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -132,241 +134,354 @@ struct FileRead {
     continuity: FileContinuity,
 }
 
-/// File reader state for a single source
-struct FileReader {
-    current_path: Option<PathBuf>,
-    file_position: u64,
+impl FileRead {
+    const fn preserved() -> Self {
+        Self { lines: Vec::new(), continuity: FileContinuity::Preserved }
+    }
+
+    fn include(&mut self, other: Self) {
+        self.lines.extend(other.lines);
+        if other.continuity == FileContinuity::Lost {
+            self.continuity = FileContinuity::Lost;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamKey {
+    day: NaiveDate,
+    hour: u8,
+}
+
+impl StreamKey {
+    fn from_path(path: &Path) -> Option<Self> {
+        let hour = path.file_name()?.to_str()?.parse::<u8>().ok()?;
+        if hour > 23 {
+            return None;
+        }
+        let day = NaiveDate::parse_from_str(path.parent()?.file_name()?.to_str()?, "%Y%m%d").ok()?;
+        Some(Self { day, hour })
+    }
+
+    fn is_immediate_successor_of(self, previous: Self) -> bool {
+        if previous.hour < 23 {
+            self.day == previous.day && self.hour == previous.hour + 1
+        } else {
+            self.hour == 0 && previous.day.succ_opt() == Some(self.day)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self { device: metadata.dev(), inode: metadata.ino() }
+    }
+}
+
+struct OpenedStream {
+    path: PathBuf,
+    key: StreamKey,
+    file: File,
+    identity: FileIdentity,
+}
+
+impl OpenedStream {
+    fn open(path: &Path) -> std::io::Result<Option<Self>> {
+        let Some(key) = StreamKey::from_path(path) else { return Ok(None) };
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self { path: path.to_path_buf(), key, file, identity: FileIdentity::from_metadata(&metadata) }))
+    }
+}
+
+struct TrackedStream {
+    opened: OpenedStream,
+    offset: u64,
     partial_line: String,
-    base_dir: PathBuf, // Base streaming directory to scan for new files
+    path_missing: bool,
+    read_unhealthy: bool,
+    read_failure_reported: bool,
+}
+
+impl TrackedStream {
+    const fn new(opened: OpenedStream, offset: u64) -> Self {
+        Self {
+            opened,
+            offset,
+            partial_line: String::new(),
+            path_missing: false,
+            read_unhealthy: false,
+            read_failure_reported: false,
+        }
+    }
+
+    const fn report_read_failure(&mut self) -> FileRead {
+        self.read_unhealthy = true;
+        let continuity = if self.read_failure_reported {
+            FileContinuity::Preserved
+        } else {
+            self.read_failure_reported = true;
+            FileContinuity::Lost
+        };
+        FileRead { lines: Vec::new(), continuity }
+    }
+
+    const fn mark_read_healthy(&mut self) {
+        self.read_unhealthy = false;
+        self.read_failure_reported = false;
+    }
+}
+
+struct FileReader {
+    tracked: Option<TrackedStream>,
+    base_dir: PathBuf,
 }
 
 impl FileReader {
-    fn new(base_dir: PathBuf) -> Self {
-        Self { current_path: None, file_position: 0, partial_line: String::new(), base_dir }
+    const fn new(base_dir: PathBuf) -> Self {
+        Self { tracked: None, base_dir }
     }
 
-    /// Find the latest file in the streaming directory tree
-    /// Scans hourly/YYYYMMDD/HH structure and returns the most recently modified file
     fn find_latest_file(&self) -> Option<PathBuf> {
         let hourly_dir = self.base_dir.join("hourly");
-        if !hourly_dir.exists() {
-            return None;
-        }
-
-        // Find the latest day directory
-        let mut latest_day: Option<PathBuf> = None;
-        if let Ok(entries) = std::fs::read_dir(&hourly_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if latest_day.is_none() || path > latest_day.clone().unwrap() {
-                        latest_day = Some(path);
-                    }
+        let (_, latest_day) = std::fs::read_dir(hourly_dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    return None;
                 }
+                let path = entry.path();
+                let day = NaiveDate::parse_from_str(path.file_name()?.to_str()?, "%Y%m%d").ok()?;
+                Some((day, path))
+            })
+            .max_by_key(|(day, _)| *day)?;
+        let mut latest: Option<(StreamKey, PathBuf)> = None;
+        for hour_entry in std::fs::read_dir(latest_day).ok()?.flatten() {
+            if !hour_entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = hour_entry.path();
+            let Some(key) = StreamKey::from_path(&path) else { continue };
+            if latest.as_ref().is_none_or(|(latest_key, _)| key > *latest_key) {
+                latest = Some((key, path));
             }
         }
-
-        let day_dir = latest_day?;
-
-        // Find the latest hour file in this day
-        let mut latest_file: Option<PathBuf> = None;
-        let mut latest_mtime: Option<std::time::SystemTime> = None;
-
-        if let Ok(entries) = std::fs::read_dir(&day_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Ok(metadata) = path.metadata() {
-                        if let Ok(mtime) = metadata.modified() {
-                            if latest_mtime.is_none() || mtime > latest_mtime.unwrap() {
-                                latest_mtime = Some(mtime);
-                                latest_file = Some(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        latest_file
+        latest.map(|(_, path)| path)
     }
 
-    /// Check if there's a newer file than what we're currently tracking
     fn check_for_newer_file(&mut self) -> Option<PathBuf> {
         let latest = self.find_latest_file()?;
-        let Some(current) = self.current_path.as_ref() else {
+        let latest_opened = Self::open_candidate(&latest)?;
+        let Some(tracked) = self.tracked.as_mut() else {
             return Some(latest);
         };
-        if latest == *current {
-            return None;
-        }
 
-        let current_metadata = match current.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(latest),
+        match OpenedStream::open(&tracked.opened.path) {
+            Ok(Some(current)) if current.identity != tracked.opened.identity => {
+                return Some(current.path);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => tracked.path_missing = true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => tracked.path_missing = true,
             Err(err) => {
-                error!("Failed to inspect tracked file {:?}: {}; retrying", current, err);
+                error!("Failed to open tracked path {}: {err}; retrying", tracked.opened.path.display());
                 return None;
             }
-        };
-        if !current_metadata.is_file() {
-            return Some(latest);
         }
 
-        let latest_metadata = latest.metadata().ok()?;
-        if !latest_metadata.is_file() {
-            return None;
+        if latest_opened.key > tracked.opened.key
+            || latest_opened.key == tracked.opened.key && latest_opened.identity != tracked.opened.identity
+        {
+            Some(latest)
+        } else {
+            None
         }
-        let latest_mtime = latest_metadata.modified().ok()?;
-        let current_mtime = current_metadata.modified().ok()?;
-        (latest_mtime > current_mtime).then_some(latest)
     }
 
-    /// Process file modification - read new data and return lines
     fn on_modify(&mut self) -> FileRead {
-        let mut lines = Vec::new();
-        let mut continuity = FileContinuity::Preserved;
-        if let Some(ref path) = self.current_path {
-            // Open file, seek to last position, read new data
-            if let Ok(mut file) = File::open(path) {
-                // Get fresh file size from opened handle
-                if let Ok(metadata) = file.metadata() {
-                    let file_size = metadata.len();
-
-                    if file_size < self.file_position {
-                        self.file_position = 0;
-                        self.partial_line.clear();
-                        continuity = FileContinuity::Lost;
-                    }
-
-                    // Only read if there's new data
-                    if file_size > self.file_position {
-                        if file.seek(SeekFrom::Start(self.file_position)).is_ok() {
-                            let mut buf = String::new();
-                            match file.read_to_string(&mut buf) {
-                                Ok(bytes_read) => {
-                                    if bytes_read > 0 {
-                                        // Update position
-                                        self.file_position += bytes_read as u64;
-
-                                        // Prepend any partial line from last read
-                                        let full_buf = std::mem::take(&mut self.partial_line) + &buf;
-
-                                        let mut line_iter = full_buf.lines().peekable();
-
-                                        while let Some(line) = line_iter.next() {
-                                            if line_iter.peek().is_some() {
-                                                // Not the last line
-                                                if !line.is_empty() {
-                                                    // Validate JSON structure - must start with { and end with }
-                                                    if line.starts_with('{') && line.ends_with('}') {
-                                                        lines.push(line.to_string());
-                                                    } else {
-                                                        // Incomplete JSON - store for next read
-                                                        self.partial_line = line.to_string();
-                                                    }
-                                                }
-                                            } else {
-                                                // Last line - might be partial
-                                                if buf.ends_with('\n') && !line.is_empty() {
-                                                    // Validate JSON structure
-                                                    if line.starts_with('{') && line.ends_with('}') {
-                                                        lines.push(line.to_string());
-                                                    } else {
-                                                        // Incomplete JSON - store for next read
-                                                        self.partial_line = line.to_string();
-                                                    }
-                                                } else if !line.is_empty() {
-                                                    // Partial line without newline
-                                                    self.partial_line = line.to_string();
-                                                }
-                                            }
-                                        }
-
-                                        // Bound the partial-line buffer. If the upstream goes wedged
-                                        // mid-JSON (corrupt flush, mmap weirdness, multi-MB single line),
-                                        // we'd otherwise grow `partial_line` until we OOM. Drop and resync
-                                        // on the next newline.
-                                        if self.partial_line.len() > MAX_PARTIAL_LINE_BYTES {
-                                            error!(
-                                                "partial_line exceeded {} bytes ({} bytes buffered); discarding and resyncing",
-                                                MAX_PARTIAL_LINE_BYTES,
-                                                self.partial_line.len()
-                                            );
-                                            self.partial_line.clear();
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    error!("Read error: {}", err);
-                                }
-                            }
-                        }
-                    }
-                }
+        let Some(path) = self.tracked.as_ref().map(|tracked| tracked.opened.path.clone()) else {
+            return FileRead::preserved();
+        };
+        match OpenedStream::open(&path) {
+            Ok(Some(candidate))
+                if self.tracked.as_ref().is_some_and(|tracked| candidate.identity != tracked.opened.identity) =>
+            {
+                let mut read = self.switch_to(candidate);
+                read.include(self.read_tracked());
+                read
             }
-        }
-        FileRead { lines, continuity }
-    }
-
-    /// Switch to a new file (on create event)
-    fn on_create(&mut self, path: &PathBuf) -> FileRead {
-        let candidate_metadata = match path.metadata() {
-            Ok(metadata) => metadata,
+            Ok(Some(_) | None) => self.read_tracked(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
+                if let Some(tracked) = self.tracked.as_mut() {
+                    tracked.path_missing = true;
+                }
+                self.read_tracked()
             }
             Err(err) => {
-                error!("Failed to inspect created path {:?}: {}; retrying", path, err);
-                return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
+                error!("Failed to open tracked path {}: {err}; reading the held file", path.display());
+                self.read_tracked()
             }
-        };
-        if !candidate_metadata.is_file() || self.current_path.as_ref() == Some(path) {
-            return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
         }
-
-        let current_continuity = match self.current_path.as_ref() {
-            None => FileContinuity::Preserved,
-            Some(current) => match current.metadata() {
-                Ok(metadata) if metadata.is_file() => FileContinuity::Preserved,
-                Ok(_) => FileContinuity::Lost,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => FileContinuity::Lost,
-                Err(err) => {
-                    error!("Failed to inspect tracked file {:?} before switching: {}; retrying", current, err);
-                    return FileRead { lines: Vec::new(), continuity: FileContinuity::Preserved };
-                }
-            },
-        };
-
-        let mut old_read = match current_continuity {
-            FileContinuity::Preserved => self.on_modify(),
-            FileContinuity::Lost => FileRead { lines: Vec::new(), continuity: FileContinuity::Lost },
-        };
-
-        // Start tracking new file from beginning
-        self.current_path = Some(path.clone());
-        self.file_position = 0;
-        self.partial_line.clear();
-
-        if current_continuity == FileContinuity::Lost {
-            old_read.continuity = FileContinuity::Lost;
-        }
-        old_read
     }
 
-    /// Track an existing file (first event we see for it)
-    fn start_tracking(&mut self, path: &PathBuf) {
-        // Get current file size to start from end
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return;
+    fn on_create(&mut self, path: &Path) -> FileRead {
+        let Some(candidate) = Self::open_candidate(path) else { return FileRead::preserved() };
+        self.switch_to(candidate)
+    }
+
+    fn start_tracking(&mut self, path: &Path) {
+        let Some(opened) = Self::open_candidate(path) else { return };
+        let Ok(metadata) = opened.file.metadata() else { return };
+        self.tracked = Some(TrackedStream::new(opened, metadata.len()));
+    }
+
+    fn open_candidate(path: &Path) -> Option<OpenedStream> {
+        match OpenedStream::open(path) {
+            Ok(candidate) => candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                error!("Failed to open stream file {}: {err}; retrying", path.display());
+                None
+            }
+        }
+    }
+
+    fn switch_to(&mut self, candidate: OpenedStream) -> FileRead {
+        let Some(mut current) = self.tracked.take() else {
+            self.tracked = Some(TrackedStream::new(candidate, 0));
+            return FileRead::preserved();
         };
-        if !metadata.is_file() {
-            return;
+
+        if candidate.identity == current.opened.identity || candidate.key < current.opened.key {
+            self.tracked = Some(current);
+            return FileRead::preserved();
         }
 
-        self.file_position = metadata.len();
-        self.current_path = Some(path.clone());
-        self.partial_line.clear();
+        current.path_missing |= match OpenedStream::open(&current.opened.path) {
+            Ok(Some(opened)) => opened.identity != current.opened.identity,
+            Ok(None) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                error!("Failed to verify tracked path {}: {err}", current.opened.path.display());
+                true
+            }
+        };
+        let same_key = candidate.key == current.opened.key;
+        let immediate_successor = candidate.key.is_immediate_successor_of(current.opened.key);
+        let mut read = Self::read_stream(&mut current);
+        if same_key
+            || !immediate_successor
+            || current.path_missing
+            || current.read_unhealthy
+            || !current.partial_line.is_empty()
+            || read.continuity == FileContinuity::Lost
+        {
+            read.continuity = FileContinuity::Lost;
+        }
+        self.tracked = Some(TrackedStream::new(candidate, 0));
+        read
+    }
+
+    fn read_tracked(&mut self) -> FileRead {
+        self.tracked.as_mut().map_or_else(FileRead::preserved, Self::read_stream)
+    }
+
+    fn read_stream(tracked: &mut TrackedStream) -> FileRead {
+        let mut read = FileRead::preserved();
+        let metadata = match tracked.opened.file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Failed to inspect open stream file {}: {err}", tracked.opened.path.display());
+                return tracked.report_read_failure();
+            }
+        };
+        if metadata.len() < tracked.offset {
+            tracked.offset = 0;
+            tracked.partial_line.clear();
+            read.continuity = FileContinuity::Lost;
+        }
+        if metadata.len() <= tracked.offset {
+            tracked.mark_read_healthy();
+            return read;
+        }
+        if let Err(err) = tracked.opened.file.seek(SeekFrom::Start(tracked.offset)) {
+            error!("Failed to seek stream file {}: {err}", tracked.opened.path.display());
+            return tracked.report_read_failure();
+        }
+
+        let unread_len = metadata.len() - tracked.offset;
+        let mut buf = String::new();
+        let bytes_read = match tracked.opened.file.read_to_string(&mut buf) {
+            Ok(bytes_read) => bytes_read,
+            Err(err) => {
+                error!("Failed to read stream file {}: {err}", tracked.opened.path.display());
+                tracked.offset = metadata.len();
+                tracked.partial_line.clear();
+                return tracked.report_read_failure();
+            }
+        };
+        if (bytes_read as u64) < unread_len {
+            tracked.offset = 0;
+            tracked.partial_line.clear();
+            return tracked.report_read_failure();
+        }
+        tracked.mark_read_healthy();
+        tracked.offset += bytes_read as u64;
+        if bytes_read == 0 {
+            return read;
+        }
+
+        let full_buf = std::mem::take(&mut tracked.partial_line) + &buf;
+        let mut line_iter = full_buf.lines().peekable();
+        while let Some(line) = line_iter.next() {
+            if line_iter.peek().is_some() || buf.ends_with('\n') {
+                if !line.is_empty() {
+                    if line.starts_with('{') && line.ends_with('}') {
+                        read.lines.push(line.to_string());
+                    } else {
+                        tracked.partial_line = line.to_string();
+                    }
+                }
+            } else if !line.is_empty() {
+                tracked.partial_line = line.to_string();
+            }
+        }
+
+        if tracked.partial_line.len() > MAX_PARTIAL_LINE_BYTES {
+            error!(
+                "partial_line exceeded {} bytes ({} bytes buffered); discarding and resyncing",
+                MAX_PARTIAL_LINE_BYTES,
+                tracked.partial_line.len()
+            );
+            tracked.partial_line.clear();
+            read.continuity = FileContinuity::Lost;
+        }
+        read
+    }
+
+    #[cfg(test)]
+    fn current_path(&self) -> Option<&Path> {
+        self.tracked.as_ref().map(|tracked| tracked.opened.path.as_path())
+    }
+
+    #[cfg(test)]
+    fn file_position(&self) -> u64 {
+        self.tracked.as_ref().map_or(0, |tracked| tracked.offset)
+    }
+
+    #[cfg(test)]
+    fn partial_line(&self) -> &str {
+        self.tracked.as_ref().map_or("", |tracked| tracked.partial_line.as_str())
     }
 }
 
@@ -441,7 +556,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                                 error!("{} channel closed, exiting", source_name);
                                 return;
                             }
-                        } else if reader.current_path.is_none() {
+                        } else if reader.tracked.is_none() {
                             // First time seeing this file
                             info!("{} tracking: {:?}", source_name, path.file_name());
                             reader.start_tracking(path);
@@ -612,6 +727,23 @@ mod tests {
     }
 
     #[test]
+    fn repeated_read_failure_reports_one_loss_until_the_file_is_healthy() {
+        let base_dir = stream_test_dir("read-failure-latch");
+        let day_dir = base_dir.join("hourly/20260826");
+        std::fs::create_dir_all(&day_dir).expect("day directory should exist");
+        let hour_file = day_dir.join("6");
+        std::fs::write(&hour_file, "").expect("hour file should exist");
+        let opened = FileReader::open_candidate(&hour_file).expect("stream file should open");
+        let mut tracked = TrackedStream::new(opened, 0);
+
+        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
+        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Preserved);
+        tracked.mark_read_healthy();
+        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
+        std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
+    }
+
+    #[test]
     fn create_event_for_a_day_directory_does_not_replace_the_tracked_file() {
         let base_dir = stream_test_dir("ignore-day-directory");
         let day_dir = base_dir.join("hourly/20260826");
@@ -623,7 +755,7 @@ mod tests {
         reader.start_tracking(&hour_file);
         reader.on_create(&day_dir);
 
-        assert_eq!(reader.current_path.as_deref(), Some(hour_file.as_path()));
+        assert_eq!(reader.current_path(), Some(hour_file.as_path()));
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -658,13 +790,13 @@ mod tests {
 
         let mut reader = FileReader::new(base_dir.clone());
         reader.start_tracking(&hour_file);
-        let file_position = reader.file_position;
+        let file_position = reader.file_position();
 
         reader.start_tracking(&day_dir);
         reader.start_tracking(&day_dir.join("missing"));
 
-        assert_eq!(reader.current_path.as_deref(), Some(hour_file.as_path()));
-        assert_eq!(reader.file_position, file_position);
+        assert_eq!(reader.current_path(), Some(hour_file.as_path()));
+        assert_eq!(reader.file_position(), file_position);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -678,11 +810,11 @@ mod tests {
 
         let mut reader = FileReader::new(base_dir.clone());
         reader.start_tracking(&hour_file);
-        let file_position = reader.file_position;
+        let file_position = reader.file_position();
 
         assert!(reader.on_create(&hour_file).lines.is_empty());
         assert!(reader.on_create(&hour_file).lines.is_empty());
-        assert_eq!(reader.file_position, file_position);
+        assert_eq!(reader.file_position(), file_position);
 
         append_to_file(&hour_file, "{\"sequence\":2}\n");
         assert_eq!(reader.on_modify().lines, vec![r#"{"sequence":2}"#]);
@@ -701,12 +833,12 @@ mod tests {
         reader.start_tracking(&hour_file);
         append_to_file(&hour_file, "{\"stale\":");
         assert!(reader.on_modify().lines.is_empty());
-        assert_eq!(reader.partial_line, "{\"stale\":");
-        let file_position = reader.file_position;
+        assert_eq!(reader.partial_line(), "{\"stale\":");
+        let file_position = reader.file_position();
         std::fs::write(&hour_file, "{}\n").expect("hour file should be recreated");
 
         assert!(reader.on_create(&hour_file).lines.is_empty());
-        assert_eq!(reader.file_position, file_position);
+        assert_eq!(reader.file_position(), file_position);
         assert_eq!(reader.on_modify().lines, vec!["{}"]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
@@ -789,7 +921,9 @@ mod tests {
         std::fs::write(&replacement_file, replacement).expect("replacement should exist");
         std::fs::rename(&replacement_file, &hour_file).expect("replacement should install atomically");
 
-        let switched = reader.on_create(&hour_file);
+        let detected = reader.check_for_newer_file().expect("polling should detect the replacement identity");
+        assert_eq!(detected, hour_file);
+        let switched = reader.on_create(&detected);
         let read = reader.on_modify();
 
         assert_eq!(
@@ -813,18 +947,9 @@ mod tests {
         std::fs::write(&replacement_file, "{\"replacement\":true}\n").expect("replacement should exist");
         std::fs::rename(&replacement_file, &hour_file).expect("replacement should install atomically");
 
-        let switched = reader.on_create(&hour_file);
         let read = reader.on_modify();
 
-        assert_eq!(
-            (switched.continuity, switched.lines, read.continuity, read.lines),
-            (
-                FileContinuity::Lost,
-                Vec::<String>::new(),
-                FileContinuity::Preserved,
-                vec![r#"{"replacement":true}"#.to_string()],
-            )
-        );
+        assert_eq!((read.continuity, read.lines), (FileContinuity::Lost, vec![r#"{"replacement":true}"#.to_string()]));
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
@@ -871,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn unlinked_predecessor_is_drained_before_immediate_rotation() {
+    fn unlinked_predecessor_reports_loss_after_draining_before_rotation() {
         let base_dir = stream_test_dir("unlinked-predecessor");
         let day_dir = base_dir.join("hourly/20260826");
         std::fs::create_dir_all(&day_dir).expect("day directory should exist");
@@ -885,10 +1010,12 @@ mod tests {
         std::fs::remove_file(&old_file).expect("old path should be unlinked");
         std::fs::write(&new_file, "{\"sequence\":6}\n").expect("new hour file should exist");
 
-        let switched = reader.on_create(&new_file);
+        let detected = reader.check_for_newer_file().expect("polling should detect the immediate successor");
+        assert_eq!(detected, new_file);
+        let switched = reader.on_create(&detected);
         let read = reader.on_modify();
 
-        assert_eq!(switched.continuity, FileContinuity::Preserved);
+        assert_eq!(switched.continuity, FileContinuity::Lost);
         assert_eq!(switched.lines, vec![r#"{"sequence":5}"#]);
         assert_eq!(read.lines, vec![r#"{"sequence":6}"#]);
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
@@ -932,7 +1059,7 @@ mod tests {
 
         assert_eq!(delayed.continuity, FileContinuity::Preserved);
         assert!(delayed.lines.is_empty());
-        assert_eq!(reader.current_path.as_deref(), Some(current_file.as_path()));
+        assert_eq!(reader.current_path(), Some(current_file.as_path()));
         std::fs::remove_dir_all(base_dir).expect("test stream directory should be removed");
     }
 
