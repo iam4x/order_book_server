@@ -1,4 +1,4 @@
-use std::{hash::Hash, marker::PhantomData};
+use std::hash::Hash;
 
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -20,19 +20,17 @@ impl<K, T> Node<K, T> {
 }
 
 #[derive(Clone)]
-// Implicit assumption is that when we remove a node, it is never used again
 pub(crate) struct LinkedList<K, T> {
     key_to_sid: FxHashMap<K, usize>,
     slab: Slab<Node<K, T>>,
     head: Option<usize>,
     tail: Option<usize>,
-    phantom_data: PhantomData<T>,
 }
 
 impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { key_to_sid: FxHashMap::default(), slab: Slab::new(), head: None, tail: None, phantom_data: PhantomData }
+        Self { key_to_sid: FxHashMap::default(), slab: Slab::new(), head: None, tail: None }
     }
 
     pub(crate) fn push_back(&mut self, key: K, value: T) -> bool {
@@ -167,20 +165,6 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         res
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn fold<F, Acc>(&self, mut init: Acc, f: F) -> Acc
-    where
-        F: Fn(&mut Acc, &T),
-    {
-        let mut cur = self.head;
-        while let Some(c) = cur {
-            let node = &self.slab[c];
-            f(&mut init, &node.value);
-            cur = node.next;
-        }
-        init
-    }
-
     /// Number of live nodes in the slab.
     pub(crate) fn slab_len(&self) -> usize {
         self.slab.len()
@@ -192,17 +176,6 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
     /// concurrent orders. Compaction is the only way to reclaim it.
     pub(crate) fn slab_capacity(&self) -> usize {
         self.slab.capacity()
-    }
-
-    /// Fraction of slab capacity that is currently unused. Returns 0.0 when
-    /// capacity is 0 to avoid division by zero.
-    #[allow(dead_code)]
-    pub(crate) fn fragmentation_ratio(&self) -> f64 {
-        let cap = self.slab.capacity();
-        if cap == 0 {
-            return 0.0;
-        }
-        1.0 - (self.slab.len() as f64 / cap as f64)
     }
 
     /// Rebuild the slab from scratch when it is heavily over-allocated, releasing
@@ -441,23 +414,6 @@ mod tests {
         assert!(list.head_value_ref_mut_unsafe().is_none());
         list.push_back(1, 42);
         assert_eq!(list.head_value_ref_mut_unsafe(), Some(&mut 42));
-    }
-
-    #[test]
-    fn test_fold() {
-        let mut list = LinkedList::new();
-        list.push_back(1, 10);
-        list.push_back(2, 20);
-        list.push_back(3, 30);
-        let sum = list.fold(0, |acc, val| *acc += val);
-        assert_eq!(sum, 60);
-    }
-
-    #[test]
-    fn test_fold_empty() {
-        let list: LinkedList<i32, i32> = LinkedList::new();
-        let sum = list.fold(0, |acc, val| *acc += val);
-        assert_eq!(sum, 0);
     }
 
     #[test]

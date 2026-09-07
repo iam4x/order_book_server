@@ -226,12 +226,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs::create_dir_all, path::PathBuf};
+    use std::{collections::HashMap, fs::create_dir_all, path::Path};
 
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use serde::{Deserialize, Serialize};
-    use tokio::fs::read_to_string;
 
     use crate::{
         order_book::{
@@ -245,37 +243,6 @@ mod tests {
             inner::{InnerL4Order, InnerLevel},
         },
     };
-
-    fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
-    where
-        O: TryFrom<R, Error = crate::prelude::Error>,
-        R: Serialize + for<'a> Deserialize<'a>,
-    {
-        #[allow(clippy::type_complexity)]
-        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
-        Ok((
-            height,
-            Snapshots::new(
-                snapshot
-                    .into_iter()
-                    .map(|(coin, [bids, asks])| {
-                        let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                        let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                        Ok((Coin::new(&coin), Snapshot([bids, asks])))
-                    })
-                    .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
-            ),
-        ))
-    }
-
-    async fn load_snapshots_from_json<O, R>(path: &PathBuf) -> Result<(u64, Snapshots<O>)>
-    where
-        O: TryFrom<R, Error = crate::prelude::Error>,
-        R: Serialize + for<'a> Deserialize<'a>,
-    {
-        let file_contents = read_to_string(path).await?;
-        load_snapshots_from_str(&file_contents)
-    }
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(
@@ -435,16 +402,13 @@ mod tests {
     async fn test_deserialization_from_json() -> Result<()> {
         create_dir_all("tmp/deserialization_test")?;
         fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
-        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&PathBuf::from(
-            "tmp/deserialization_test/out.json",
-        ))
+        let loaded = super::load_snapshots_from_cli_json_at_height::<InnerL4Order, (Address, L4Order)>(
+            Path::new("tmp/deserialization_test/out.json"),
+            999,
+        )
         .await?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_deserialization() -> Result<()> {
-        load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON)?;
+        assert_eq!(loaded.height, 100);
+        assert_eq!(loaded.snapshots.0[&Coin::new("@1")].as_ref()[0].len(), 2);
         Ok(())
     }
 
@@ -554,15 +518,11 @@ mod tests {
     #[test]
     fn test_compact_all_evicts_empty_books() {
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
-        // Seed two coins, then drain one without triggering per-event eviction
-        // (we cancel via OrderBook directly so the MultiBook path doesn't run).
+        // Cancel directly so compact_all must evict the empty book.
         books.add_order(make_order(1, "BTC", Side::Bid, "1", "50000"));
         books.add_order(make_order(2, "ETH", Side::Bid, "1", "3000"));
-        // Sanity
+        books.order_books.get_mut(&Coin::new("BTC")).unwrap().cancel_order(Oid::new(1));
         assert_eq!(books.as_ref().len(), 2);
-        // Cancel order 1 via MultiBook to trigger eviction of the BTC book.
-        books.cancel_order(Oid::new(1), Coin::new("BTC"));
-        // ETH still has an order; compact_all should leave it alone.
         books.compact_all();
         assert!(books.as_ref().contains_key(&Coin::new("ETH")));
         assert!(!books.as_ref().contains_key(&Coin::new("BTC")));
