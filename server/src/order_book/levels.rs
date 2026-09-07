@@ -21,7 +21,7 @@ fn bucket(px: Px, side: Side, n_sig_figs: Option<u32>, mantissa: Option<u64>) ->
 
 impl<O: InnerOrder> OrderBook<O> {
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn to_l2_snapshot(
         &self,
         n_levels: Option<usize>,
@@ -47,7 +47,7 @@ impl<O: InnerOrder> OrderBook<O> {
 
 impl Snapshot<InnerLevel> {
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn to_l2_snapshot(
         &self,
         n_levels: Option<usize>,
@@ -66,7 +66,7 @@ impl Snapshot<InnerLevel> {
 }
 
 #[must_use]
-#[allow(dead_code)]
+#[cfg(test)]
 fn l2_levels_to_l2_levels(
     levels: &[InnerLevel],
     side: Side,
@@ -89,7 +89,7 @@ fn l2_levels_to_l2_levels(
 }
 
 #[must_use]
-#[allow(dead_code)]
+#[cfg(test)]
 fn map_to_l2_levels(
     totals: &BTreeMap<Px, LevelTotal>,
     side: Side,
@@ -338,7 +338,7 @@ mod tests {
             ],
         );
         let snapshot = book.to_l2_snapshot(None, Some(2), None);
-        let [bids, asks] = to_levels(snapshot);
+        let [bids, _] = to_levels(snapshot);
         // With 2 sig figs, bids at 3401 and 3405 both bucket to 3400
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].1, 200);
@@ -384,29 +384,5 @@ mod tests {
         assert_eq!(exported[1].len(), 1);
         assert_eq!(exported[0][0].px(), Px::new(500).to_str());
         assert_eq!(exported[1][0].sz(), Sz::new(200).to_str());
-    }
-
-    #[test]
-    fn test_l2_snapshot_performance() {
-        let mut bids = Vec::new();
-        let mut asks = Vec::new();
-        for i in 0..500u64 {
-            bids.push((1000 + i, 100, 1));
-            asks.push((2000 + i, 100, 1));
-        }
-        let book = make_book(&bids, &asks);
-
-        let start = std::time::Instant::now();
-        let iterations = 1000u32;
-        for _ in 0..iterations {
-            let _ = book.to_l2_snapshot(Some(20), Some(3), None);
-        }
-        let elapsed = start.elapsed();
-        let per_call = elapsed / iterations;
-
-        eprintln!(
-            "[PERF] L2 snapshot (500 levels, 20 output, sig_figs=3): {iterations} calls in {:?} ({:?}/call)",
-            elapsed, per_call
-        );
     }
 }

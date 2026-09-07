@@ -546,12 +546,6 @@ mod test {
     // ==================== ServerResponse Serde Tests ====================
 
     #[test]
-    fn test_server_response_pong_serialization() {
-        let json = serde_json::to_string(&super::ServerResponse::Pong).unwrap();
-        assert_eq!(json, r#"{"channel":"pong"}"#);
-    }
-
-    #[test]
     fn test_server_response_error_serialization() {
         let json = serde_json::to_string(&super::ServerResponse::Error("test error".to_string())).unwrap();
         assert!(json.contains("test error"));

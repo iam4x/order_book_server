@@ -14,10 +14,6 @@ impl Markets {
     const fn empty() -> Self {
         Self { include_perps: false, include_spot: false, include_hip3: false }
     }
-
-    const fn flags(self) -> (bool, bool, bool) {
-        (self.include_perps, self.include_spot, self.include_hip3)
-    }
 }
 
 impl Default for Markets {
@@ -217,19 +213,15 @@ async fn main() -> Result<()> {
     // Register Prometheus metrics
     server::metrics::register_metrics();
 
-    let full_address = format!("{}:{}", args.address, args.port);
-
-    let (include_perps, include_spot, include_hip3) = args.markets.flags();
-
     // Build config
     let config = ServerConfig {
-        address: full_address.clone(),
+        address: format!("{}:{}", args.address, args.port),
         compression_level: args.compression_level,
         data_dir: args.data_dir,
         secret: args.secret,
-        include_perps,
-        include_spot,
-        include_hip3,
+        include_perps: args.markets.include_perps,
+        include_spot: args.markets.include_spot,
+        include_hip3: args.markets.include_hip3,
         snapshot_mode: args.snapshot_mode,
         docker_container: args.docker_container,
         hlnode_binary: args.hlnode_binary,
@@ -292,10 +284,7 @@ async fn main() -> Result<()> {
 
     // Start metrics server if port > 0
     if config.metrics_port > 0 {
-        let metrics_port = config.metrics_port;
-        tokio::spawn(async move {
-            start_metrics_server(metrics_port).await;
-        });
+        tokio::spawn(start_metrics_server(config.metrics_port));
     }
 
     tokio::select! {

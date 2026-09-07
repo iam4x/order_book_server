@@ -6,12 +6,9 @@ use std::{
     io::{Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-    },
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use chrono::NaiveDate;
@@ -485,7 +482,7 @@ impl FileReader {
     }
 }
 
-fn submit_file_read(sink: &FileLineSink, read: FileRead, last_event: Option<&AtomicU64>) -> bool {
+fn submit_file_read(sink: &FileLineSink, read: FileRead) -> bool {
     if read.continuity == FileContinuity::Lost && !sink.submit_continuity_loss() {
         return false;
     }
@@ -493,16 +490,13 @@ fn submit_file_read(sink: &FileLineSink, read: FileRead, last_event: Option<&Ato
         if !sink.submit(line) {
             return false;
         }
-        if let Some(last_event) = last_event {
-            last_event.store(Instant::now().elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
-        }
     }
     true
 }
 
 /// Spawn a file watcher thread for a single event source
 /// Uses polling with inotify hints for streaming files
-fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU64>) -> thread::JoinHandle<()> {
+fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink) -> thread::JoinHandle<()> {
     let source = sink.source();
     let source_name = match source {
         EventSource::OrderStatuses => "OrderStatuses",
@@ -552,7 +546,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
 
                         if event.kind.is_create() {
                             info!("{} new file: {:?}", source_name, path.file_name());
-                            if !submit_file_read(&sink, reader.on_create(path), None) {
+                            if !submit_file_read(&sink, reader.on_create(path)) {
                                 error!("{} channel closed, exiting", source_name);
                                 return;
                             }
@@ -563,7 +557,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                         }
 
                         // EVENT-DRIVEN: Read data when inotify fires modify event
-                        if !submit_file_read(&sink, reader.on_modify(), Some(last_event.as_ref())) {
+                        if !submit_file_read(&sink, reader.on_modify()) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -574,8 +568,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Fallback polling - safety net for missed events
-                    // This runs every 500ms instead of every 10ms
-                    if !submit_file_read(&sink, reader.on_modify(), Some(last_event.as_ref())) {
+                    if !submit_file_read(&sink, reader.on_modify()) {
                         error!("{} channel closed, exiting", source_name);
                         return;
                     }
@@ -591,7 +584,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink, last_event: Arc<AtomicU6
                 if let Some(newer_file) = reader.check_for_newer_file() {
                     info!("{} detected newer file (day rotation?): {:?}", source_name, newer_file.file_name());
                     // Switch to the new file
-                    if !submit_file_read(&sink, reader.on_create(&newer_file), None) {
+                    if !submit_file_read(&sink, reader.on_create(&newer_file)) {
                         error!("{} channel closed, exiting", source_name);
                         return;
                     }
@@ -606,33 +599,24 @@ pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     features: FeatureSet,
     order_sync_recorder: Option<OrderSyncRecorder>,
-) -> (Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+) -> (Receiver<FileEvent>, Vec<thread::JoinHandle<()>>) {
     // The bound caps the in-memory backlog. When full, blocking_send parks the
     // file readers and leaves unread events on disk.
     let (tx, rx) = channel(10_000);
     let mut handles = Vec::new();
 
-    let last_order_status = Arc::new(AtomicU64::new(0));
-    let last_fills = Arc::new(AtomicU64::new(0));
-    let last_order_diffs = Arc::new(AtomicU64::new(0));
-
     // HFT mode uses streaming directories (for --stream-with-block-info)
     for source in enabled_event_sources(features) {
         let dir = source.event_source_dir_streaming(&data_dir);
         info!("{} dir: {:?}", source, dir);
-        let last_event = match source {
-            EventSource::OrderStatuses => last_order_status.clone(),
-            EventSource::Fills => last_fills.clone(),
-            EventSource::OrderDiffs => last_order_diffs.clone(),
-        };
         let Some(sink) = file_line_sink(source, features, tx.clone(), order_sync_recorder.clone()) else {
             error!("Order-sync fill watcher could not start without a recorder");
             continue;
         };
-        handles.push(spawn_file_watcher(dir, sink, last_event));
+        handles.push(spawn_file_watcher(dir, sink));
     }
 
-    (rx, handles, last_order_status, last_fills, last_order_diffs)
+    (rx, handles)
 }
 
 #[cfg(test)]

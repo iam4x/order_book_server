@@ -112,7 +112,7 @@ impl Add<Self> for Sz {
     }
 }
 
-// Multiply all sizes and prices by 10^MAX_DECIMALS for ease of computation.
+// Prices and sizes use eight decimal places.
 const MULTIPLIER: f64 = 100_000_000.0;
 
 impl Debug for Px {
@@ -403,13 +403,6 @@ mod tests {
         assert_eq!(bid, Side::Bid);
         assert_eq!(serde_json::to_string(&Side::Ask).unwrap(), r#""A""#);
         assert_eq!(serde_json::to_string(&Side::Bid).unwrap(), r#""B""#);
-    }
-
-    #[test]
-    fn test_side_ordering() {
-        // Just verify it's deterministic
-        let sides = [Side::Ask, Side::Bid];
-        assert!(sides[0] <= sides[1] || sides[0] >= sides[1]);
     }
 
     // ==================== Oid Tests ====================

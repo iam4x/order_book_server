@@ -37,7 +37,6 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     let output_path = match config.mode {
         SnapshotMode::Docker => {
             // Docker mode: run command inside container
-            // data_dir should be the path containing node_*_by_block directories
             // Snapshot goes to parent of data_dir (sibling to "data" folder)
             let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
             let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
@@ -139,10 +138,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     Err("Snapshot file not created".into())
 }
 
-/// Get the visor state path based on config
-/// Get the visor state path based on config
-/// data_dir should be the path containing node_*_by_block directories
-/// visor_abci_state.json is in parent/hyperliquid_data/
+/// Resolve visor_abci_state.json from the override or parent/hyperliquid_data/.
 pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
     config.visor_state_path.clone().unwrap_or_else(|| {
         let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
@@ -172,9 +168,7 @@ pub(super) fn all_l2_snapshot_params() -> HashSet<L2SnapshotParams> {
     params
 }
 
-/// Build the seven L2 aggregation variants for a single coin's order book.
-/// Pulled out of `compute_l2_snapshots` so incremental updates can call it
-/// per coin without rerunning the full universe scan.
+/// Build the requested L2 aggregation variants for one coin.
 fn compute_l2_variants_for_coin<O: InnerOrder>(
     order_book: &crate::order_book::OrderBook<O>,
     requested_params: &HashSet<L2SnapshotParams>,
@@ -185,15 +179,8 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
     params.into_iter().zip(order_book.to_l2_snapshots(max_levels, &raw_params)).collect()
 }
 
-/// Incremental rebuild: recomputes variants only for `changed_coins`, reuses
-/// the cached `Arc<HashMap>` for every other coin. Returns a fresh `L2Snapshots`
-/// holding `Arc::clone`d entries — the outgoing broadcast message and the
-/// listener-side cache share the underlying inner maps, so unchanged coins
-/// cost a single Arc bump per broadcast instead of a full level-vector clone.
-///
-/// Also evicts cache entries for coins no longer present in `order_books`
-/// (e.g. when a coin is delisted and the multi-book removes it). Without
-/// this the cache would grow monotonically with the universe size.
+/// Recompute changed coins and missing variants, retaining unchanged cache entries.
+/// Return only recomputed entries and evict coins absent from `order_books`.
 pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     order_books: &OrderBooks<O>,
     changed_coins: &HashSet<Coin>,
@@ -258,7 +245,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        order_book::{Px, Side, Sz, multi_book::Snapshots, types::InnerOrder},
+        order_book::{Px, Side, Sz, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
 

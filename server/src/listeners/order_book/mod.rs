@@ -618,9 +618,7 @@ pub(crate) struct OrderBookListener {
     // 50ms L2 throttle window; otherwise changes suppressed by the throttle are
     // never recomputed and subscribers can see stale L2 while BBO is current.
     pending_l2_changed_coins: HashSet<Coin>,
-    // Incremental L2 snapshot cache. Each per-coin entry is Arc'd and shared with
-    // the broadcast Arc, so unchanged coins cost an atomic bump rather than a
-    // full level-vector clone. Invalidated in `init_from_snapshot`.
+    // Incremental L2 snapshot cache, cleared when the order book is replaced.
     l2_snapshot_cache: HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
     l2_prepared_hashes: HashMap<L2SubscriptionKey, u64>,
     next_l2_version: u64,
@@ -985,18 +983,8 @@ impl OrderBookListener {
             return None;
         }
 
-        // Throttled L2 snapshot broadcast for L2Book subscribers.
-        // l2_snapshots_uncached() walks every coin x every aggregation variant, so
-        // limit to 20 broadcasts/sec max (50ms). Skip entirely when no coin changed
-        // since the previous L2 compute - there's nothing new to send and the
-        // per-client dedup would drop it anyway.
-        // (Heartbeat resend for quiet coins is handled per-connection in handle_socket.)
-        //
-        // CRITICAL: the receiver_count gate must wrap l2_snapshots_uncached(), not
-        // sit between compute and send. A prior version updated last_l2_broadcast
-        // only when receivers existed, so with zero subscribers the throttle reset
-        // never fired and the par_iter ran on every event - tens of GB of allocator
-        // churn per hour and a pinned listener mutex.
+        // Gate snapshot computation on changed coins, active subscriptions, and
+        // receivers. Heartbeats for quiet coins are handled by each connection.
         if self.pending_l2_changed_coins.is_empty() {
             return None;
         }
@@ -1470,16 +1458,7 @@ impl StatsAccumulator {
                 self.ops = self.ops.saturating_add(fills);
             }
             EventBatch::BookDiffs(batch) => {
-                let ops = batch
-                    .events_ref()
-                    .iter()
-                    .map(|diff| match &diff.raw_book_diff {
-                        crate::types::OrderDiff::New { .. } => 1,
-                        crate::types::OrderDiff::Update { .. } => 1,
-                        crate::types::OrderDiff::Remove => 1,
-                    })
-                    .sum::<u64>();
-                self.ops = self.ops.saturating_add(ops);
+                self.ops = self.ops.saturating_add(batch.events_len() as u64);
             }
             EventBatch::Orders(_) => {}
         }
@@ -1600,8 +1579,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let order_sync_recorder = listener.lock().await.order_sync_recorder();
 
     // Start only the file watchers needed by the enabled features.
-    let (mut file_events, _handles, _last_os, _last_fills, _last_diffs) =
-        parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder);
+    let (mut file_events, _handles) = parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder);
 
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<SnapshotTaskResult>();
     let refresh_interval = snapshot_refresh_interval(config.snapshot_refresh_hours);
