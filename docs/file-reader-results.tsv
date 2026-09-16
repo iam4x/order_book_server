@@ -1,0 +1,12 @@
+revision	measurements
+before	bytes=67108932 lines=565808 elapsed=171.447073ms throughput_mib_s=373.29 largest_read_return_bytes=67108932 vm_hwm_kib=226048
+after	bytes=67108932 lines=565808 elapsed=148.522085ms throughput_mib_s=430.91 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=41964
+after	bytes=67108932 lines=565808 elapsed=146.280092ms throughput_mib_s=437.52 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=42024
+after	bytes=67108932 lines=565808 elapsed=144.987428ms throughput_mib_s=441.42 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=44268
+concurrent	reader_enabled=true bytes=16777287 lines=142853 elapsed=34.820246ms writer_elapsed=9.323685ms throughput_mib_s=459.50 longest_append_flush=15.5µs read_calls=136 batches_submitted=67 largest_read_return_bytes=262200 vm_hwm_kib=25312
+concurrent	reader_enabled=true bytes=16777287 lines=142853 elapsed=34.275914ms writer_elapsed=9.379018ms throughput_mib_s=466.80 longest_append_flush=13.208µs read_calls=124 batches_submitted=67 largest_read_return_bytes=262200 vm_hwm_kib=25084
+concurrent	reader_enabled=true bytes=16777287 lines=142853 elapsed=35.410869ms writer_elapsed=9.9966ms throughput_mib_s=451.84 longest_append_flush=15.917µs read_calls=118 batches_submitted=68 largest_read_return_bytes=262200 vm_hwm_kib=24816
+concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.072099ms writer_elapsed=9.927184ms throughput_mib_s=1588.55 longest_append_flush=112.875µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30284
+concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.003975ms writer_elapsed=9.882184ms throughput_mib_s=1599.37 longest_append_flush=245.832µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30284
+concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.188225ms writer_elapsed=10.063058ms throughput_mib_s=1570.45 longest_append_flush=264.124µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30260
+after_review_confirmation	bytes=67108932 lines=565808 elapsed=143.031683ms throughput_mib_s=447.45 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=42224

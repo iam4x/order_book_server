@@ -8,7 +8,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    CounterVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 lazy_static! {
@@ -168,6 +169,42 @@ lazy_static! {
         &["source"]
     ).expect("metric can be created");
 
+    pub static ref FILE_READ_BYTES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("order_stream_read_bytes_total", "Bytes read from node stream files"),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_READ_CALLS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("order_stream_read_calls_total", "Node stream read attempts"),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_READ_DURATION: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("order_stream_read_duration_seconds", "Time spent reading and framing a stream chunk, including reconciliation when due")
+            .buckets(vec![0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0]),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_UNREAD_BYTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("order_stream_unread_bytes", "Unread bytes in the currently tracked node file at the last read"),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_QUEUE_BYTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("order_stream_queue_bytes", "Reserved bytes for queued stream batches, including the merge cursor"),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_BACKPRESSURE_SECONDS_TOTAL: CounterVec = CounterVec::new(
+        Opts::new("order_stream_backpressure_seconds_total", "Seconds watcher threads spend waiting for queue capacity"),
+        &["source"]
+    ).expect("metric can be created");
+
+    pub static ref FILE_WATCHER_WAKEUPS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("order_stream_watcher_wakeups_total", "Watcher notification/poll wakeups and reconciliation passes"),
+        &["source", "reason"]
+    ).expect("metric can be created");
+
     // ==================== ORDERBOOK STATS ====================
 
     /// Total orders currently in the orderbook
@@ -256,6 +293,13 @@ pub fn register_metrics() {
     // File watcher metrics
     REGISTRY.register(Box::new(FILE_EVENTS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(FILE_LINES_PARSED_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(FILE_READ_BYTES_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(FILE_READ_CALLS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(FILE_READ_DURATION.clone())).ok();
+    REGISTRY.register(Box::new(FILE_UNREAD_BYTES.clone())).ok();
+    REGISTRY.register(Box::new(FILE_QUEUE_BYTES.clone())).ok();
+    REGISTRY.register(Box::new(FILE_BACKPRESSURE_SECONDS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(FILE_WATCHER_WAKEUPS_TOTAL.clone())).ok();
 
     // Orderbook stats
     REGISTRY.register(Box::new(ORDERBOOK_ORDERS_TOTAL.clone())).ok();
