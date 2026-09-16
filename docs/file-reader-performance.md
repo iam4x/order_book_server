@@ -58,3 +58,9 @@ A callback benchmark shares the signal between threads and submits five million 
 ```sh
 cargo test -p server --release release_notification_storm -- --ignored --nocapture
 ```
+
+## Final critical-review checks
+
+After the startup, replay, and source-scheduling fixes, the three-run file benchmark median was 440.15 MiB/s with 42,348 KiB peak RSS. All 565,808 records were delivered in order. The ingest checkpoint passed at 462,081 lines/s.
+
+The final concurrent-appender samples had median writer elapsed times of 10.31 ms with the reader and 10.02 ms without it. These small local samples show why a zero-impact claim would be unjustified. See [the critical review](pr-8-critical-review.md) for the reproduced failures, fixes, and production validation limits.

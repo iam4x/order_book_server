@@ -219,9 +219,11 @@ impl Drop for SourceQueue {
 /// Merge book streams by height while they have unread data. An EOF marker lets
 /// the other streams keep moving when a source has no more events available.
 /// Start each block with statuses, then alternate book sources within that block.
+/// Fills use alternating delivery turns rather than participating in book height order.
 pub(crate) struct FileEventReceiver {
     sources: Vec<SourceQueue>,
     last_book_event: Option<(EventSource, u64)>,
+    last_delivery: Option<EventSource>,
 }
 
 impl FileEventReceiver {
@@ -239,6 +241,7 @@ impl FileEventReceiver {
         let waiting_for_book = self.sources.iter().any(|source| {
             source.source != EventSource::Fills && source.head.is_none() && !source.caught_up && !source.closed
         });
+        let fill_turn = self.last_delivery != Some(EventSource::Fills);
         let selected = self
             .sources
             .iter()
@@ -251,13 +254,13 @@ impl FileEventReceiver {
                 } else {
                     EventSource::OrderStatuses
                 };
-                let priority =
-                    if source.source == EventSource::Fills { 2 } else { u8::from(source.source != preferred) };
-                Some((index, height, priority))
+                let stream_priority = u8::from((source.source == EventSource::Fills) != fill_turn);
+                Some((index, height, stream_priority, u8::from(source.source != preferred)))
             })
-            .min_by_key(|&(_, height, priority)| (height, priority));
-        if let Some((index, height, _)) = selected {
+            .min_by_key(|&(_, height, stream_priority, book_priority)| (stream_priority, height, book_priority));
+        if let Some((index, height, _, _)) = selected {
             let source = &mut self.sources[index];
+            self.last_delivery = Some(source.source);
             if source.source != EventSource::Fills {
                 self.last_book_event = Some((source.source, height));
             }
@@ -563,7 +566,7 @@ pub(super) fn file_event_channels(sources: &[EventSource], capacity: usize) -> (
             )
         })
         .unzip();
-    (senders, FileEventReceiver { sources, last_book_event: None })
+    (senders, FileEventReceiver { sources, last_book_event: None, last_delivery: None })
 }
 
 /// Uses *_streaming directories (for --stream-with-block-info mode)

@@ -403,7 +403,7 @@ Enable the node output flags required by your selected features:
 
 1. The Hyperliquid node writes real-time events to `*_streaming/` directories as newline-delimited JSON
 2. One inotify watcher thread runs for each event source required by `--features`
-3. Watchers read through an open descriptor in 256 KiB chunks and send owned line batches through per-source queues, with a 32 MiB allocation budget per source. The receiver merges book streams by height. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
+3. Watchers read through an open descriptor in 256 KiB chunks and send owned line batches through per-source queues, with a 32 MiB allocation budget per source. The receiver merges book streams by height, prefers statuses at each new height, and then alternates book sources at that height. Fills receive separate alternating turns so their backlog cannot starve book updates. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
 5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
 6. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication

@@ -16,3 +16,12 @@ callback_before_review	sample=3 notifications=5000000 elapsed=24.83398ms ns_per_
 callback_after_review	sample=1 notifications=5000000 elapsed=13.608716ms ns_per_notification=2.72
 callback_after_review	sample=2 notifications=5000000 elapsed=13.471008ms ns_per_notification=2.69
 callback_after_review	sample=3 notifications=5000000 elapsed=13.283675ms ns_per_notification=2.66
+critical_review_file	bytes=67108932 lines=565808 elapsed=147.315799ms throughput_mib_s=434.44 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=44168
+critical_review_file	bytes=67108932 lines=565808 elapsed=143.855349ms throughput_mib_s=444.89 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=42348
+critical_review_file	bytes=67108932 lines=565808 elapsed=145.40472ms throughput_mib_s=440.15 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=42204
+critical_review_writer_on	reader_enabled=true bytes=16777287 lines=142853 elapsed=33.475333ms writer_elapsed=10.190849ms throughput_mib_s=477.97 longest_append_flush=20.042µs read_calls=128 batches_submitted=67 largest_read_return_bytes=262200 vm_hwm_kib=24168
+critical_review_writer_on	reader_enabled=true bytes=16777287 lines=142853 elapsed=32.711168ms writer_elapsed=10.308307ms throughput_mib_s=489.13 longest_append_flush=14.583µs read_calls=118 batches_submitted=68 largest_read_return_bytes=262200 vm_hwm_kib=24692
+critical_review_writer_on	reader_enabled=true bytes=16777287 lines=142853 elapsed=34.749789ms writer_elapsed=11.418346ms throughput_mib_s=460.44 longest_append_flush=278.583µs read_calls=119 batches_submitted=68 largest_read_return_bytes=262237 vm_hwm_kib=24700
+critical_review_writer_off	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.150641ms writer_elapsed=10.022516ms throughput_mib_s=1576.26 longest_append_flush=26.375µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30580
+critical_review_writer_off	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.701974ms writer_elapsed=10.595015ms throughput_mib_s=1495.06 longest_append_flush=17.791µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30544
+critical_review_writer_off	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.010267ms writer_elapsed=9.899642ms throughput_mib_s=1598.37 longest_append_flush=21.583µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30584
