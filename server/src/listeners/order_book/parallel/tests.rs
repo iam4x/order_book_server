@@ -446,3 +446,18 @@ async fn startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler
     result.unwrap();
     std::fs::remove_dir_all(base).unwrap();
 }
+
+#[test]
+fn notifications_survive_flags_cleared_before_the_pending_token_is_consumed() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let signal = WatcherSignal { flags: AtomicU8::new(0), tx };
+    signal.notify(NOTIFY_DATA);
+    assert_eq!(signal.take(), NOTIFY_DATA);
+    signal.notify(NOTIFY_RESCAN);
+    assert!(rx.try_recv().is_ok());
+    assert_eq!(signal.take(), NOTIFY_RESCAN);
+    signal.notify(NOTIFY_ERROR);
+    assert!(rx.try_recv().is_ok());
+    signal.notify(NOTIFY_DATA);
+    assert_eq!(signal.take(), NOTIFY_ERROR | NOTIFY_DATA);
+}

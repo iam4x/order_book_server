@@ -48,3 +48,13 @@ Each source reads at most 256 KiB per call, retains at most 16 MiB of a partial 
 The callback retains one notification token and combines data/rescan/error flags. Normal reads use the held descriptor; pathname checks and discovery run on rescan hints or a one-second timer. Discovery skips hour directories older than the tracked day. A 10 ms data poll covers missed notifications. Streams are append-only within an inode; observed shrink and inode replacement trigger recovery. An in-place truncate and regrow beyond the previous offset between probes cannot be distinguished from append by this reader, as before.
 
 Full queues park reader threads, leaving the remaining events in node files. No reader file lock or write blocks the node. CPU, memory bandwidth, page cache, disk reads, snapshots, and replay-journal writes still share host resources. Validate node block lag and writer latency on the deployment host under peak traffic; these local fixtures cannot prove that `hl-node` remains unaffected.
+
+## Notification callback review
+
+The callback used to attempt a channel send for every notification, including when its wakeup was already pending. It now attempts a send only when the combined flags change from empty to pending. Rescan and error flags still accumulate, and a test covers a flag reset while the old wakeup token remains queued.
+
+A callback benchmark shares the signal between threads and submits five million data notifications while the receiver retains its one pending token. Across three samples, median callback time fell from 24.83 ms to 13.47 ms, a 45.8% reduction. This measures coalescing work under a notification storm; it excludes kernel notification delivery and is not a node-writer latency estimate.
+
+```sh
+cargo test -p server --release release_notification_storm -- --ignored --nocapture
+```
