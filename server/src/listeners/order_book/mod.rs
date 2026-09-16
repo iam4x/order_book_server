@@ -1717,6 +1717,28 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
             }
 
+            // Start snapshots ahead of file events so a continuous backlog cannot starve the timer.
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let is_ready = listener.lock().await.is_ready();
+                if config.features.requires_book_state() && is_ready && next_refresh_at.is_none() {
+                    next_refresh_at = refresh_interval.map(|interval| now + interval);
+                }
+                if start_snapshot_if_due(
+                    &listener,
+                    config.features,
+                    snapshot_fetch_pending,
+                    next_refresh_at,
+                    repair_backoff.retry_at(),
+                    now,
+                    &snapshot_config,
+                    &snapshot_fetch_task_tx,
+                    ignore_spot,
+                ).await {
+                    snapshot_fetch_pending = true;
+                }
+            }
+
             ready_count = file_events.recv_many(&mut ready_events, 64) => {
                 if ready_count == 0 {
                     return Err("File event channel closed".into());
@@ -1733,6 +1755,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             stream_gaps.push(source);
                             continue;
                         }
+                        parallel::FileEvent::CaughtUp => continue,
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
@@ -1755,28 +1778,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
                 for parsed in parsed_events {
                     listener.apply_parsed_hft(parsed);
-                }
-            }
-
-            // Periodic snapshot fetch: startup snapshot until ready, then recurring refreshes.
-            _ = ticker.tick() => {
-                let now = Instant::now();
-                let is_ready = listener.lock().await.is_ready();
-                if config.features.requires_book_state() && is_ready && next_refresh_at.is_none() {
-                    next_refresh_at = refresh_interval.map(|interval| now + interval);
-                }
-                if start_snapshot_if_due(
-                    &listener,
-                    config.features,
-                    snapshot_fetch_pending,
-                    next_refresh_at,
-                    repair_backoff.retry_at(),
-                    now,
-                    &snapshot_config,
-                    &snapshot_fetch_task_tx,
-                    ignore_spot,
-                ).await {
-                    snapshot_fetch_pending = true;
                 }
             }
         }
@@ -3176,8 +3177,8 @@ mod tests {
         assert!(drain_latest_l2(&mut rx).is_some());
     }
 
-    #[test]
-    fn hft_ingest_throughput_checkpoint() {
+    #[tokio::test]
+    async fn hft_ingest_throughput_checkpoint() {
         const INITIAL_PENDING: u64 = 8_800;
         const MATCHED_PAIRS: u64 = 36_200;
         const STATUS_HEIGHT: u64 = 1_000;
@@ -3203,17 +3204,35 @@ mod tests {
             events.push((new_diff_line_at_block("BTC", oid, "1", DIFF_HEIGHT), EventSource::OrderDiffs));
         }
 
+        let (senders, mut file_events) =
+            parallel::file_event_channels(&[EventSource::OrderStatuses, EventSource::OrderDiffs], total_lines * 2);
+        for (line, source) in events {
+            match source {
+                EventSource::OrderStatuses => senders[0].try_send(parallel::FileEvent::OrderStatus(line)).unwrap(),
+                EventSource::OrderDiffs => senders[1].try_send(parallel::FileEvent::OrderDiff(line)).unwrap(),
+                EventSource::Fills => unreachable!(),
+            }
+        }
+        drop(senders);
         let started = Instant::now();
         let mut slowest_drain = Duration::ZERO;
-        let mut events = events.into_iter();
         loop {
-            let ready: Vec<_> = events.by_ref().take(64).collect();
-            if ready.is_empty() {
+            let mut ready = Vec::with_capacity(64);
+            if file_events.recv_many(&mut ready, 64).await == 0 {
                 break;
             }
             let drain_started = Instant::now();
-            let parsed: Vec<_> =
-                ready.into_iter().map(|(line, source)| parse_hft_event(line, source).unwrap().unwrap()).collect();
+            let parsed: Vec<_> = ready
+                .into_iter()
+                .map(|event| {
+                    let (line, source) = match event {
+                        parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
+                        parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
+                        _ => unreachable!(),
+                    };
+                    parse_hft_event(line, source).unwrap().unwrap()
+                })
+                .collect();
             for event in parsed {
                 listener.apply_parsed_hft(event);
             }
@@ -3244,6 +3263,69 @@ mod tests {
             lines_per_second >= PRODUCTION_LINES_PER_SECOND,
             "HFT ingest throughput {lines_per_second:.0} lines/s is below observed production rate {PRODUCTION_LINES_PER_SECOND:.0}"
         );
+    }
+
+    #[tokio::test]
+    async fn watcher_backlog_preserves_order_pairs_during_startup_and_live_catchup() {
+        const ORDERS: u64 = 12_000;
+        let user = "0x0000000000000000000000000000000000000001";
+
+        for startup in [true, false] {
+            let (tx, _rx) = channel(16);
+            let mut listener = listener_without_snapshot(tx, features("bbo"));
+            if startup {
+                listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial).unwrap();
+            } else {
+                listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
+            }
+            let (senders, mut events) =
+                parallel::file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 30_000);
+            for oid in 1..=ORDERS {
+                senders[0]
+                    .try_send(parallel::FileEvent::OrderDiff(new_diff_line_at_block(
+                        "BTC",
+                        oid,
+                        "1",
+                        (oid - 1) / 1_000 + 1,
+                    )))
+                    .unwrap();
+            }
+            for oid in 1..=ORDERS {
+                senders[1]
+                    .try_send(parallel::FileEvent::OrderStatus(order_status_line_at_block(
+                        "BTC",
+                        oid,
+                        user,
+                        (oid - 1) / 1_000 + 1,
+                    )))
+                    .unwrap();
+            }
+            drop(senders);
+
+            loop {
+                let mut ready = Vec::with_capacity(64);
+                if events.recv_many(&mut ready, 64).await == 0 {
+                    break;
+                }
+                for event in ready {
+                    let (line, source) = match event {
+                        parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
+                        parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
+                        _ => panic!("unexpected file event"),
+                    };
+                    listener.apply_parsed_hft(parse_hft_event(line, source).unwrap().unwrap());
+                }
+            }
+            if startup {
+                let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false);
+                listener.install_snapshot_state(state, 0, SnapshotTaskKind::Initial).unwrap();
+            }
+            let state = listener.order_book_state.as_ref().unwrap();
+            assert_eq!(state.order_count(), usize::try_from(ORDERS).unwrap(), "startup={startup}");
+            assert_eq!(state.pending_new_diffs_count(), 0);
+            assert_eq!(state.pending_order_statuses_count(), 0);
+            assert!(!listener.repair_pending(), "healthy backlog must not trigger a snapshot repair");
+        }
     }
 
     #[test]
