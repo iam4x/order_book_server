@@ -418,8 +418,6 @@ When a queue fills, its reader waits and leaves the remaining backlog in the nod
 
 The reader still shares CPU, memory bandwidth, page cache, and storage with the node. Lower reader allocations and fewer channel operations reduce contention; they do not guarantee zero node impact. Snapshot computation and replay-journal writes also consume resources. Check node block lag alongside `order_stream_unread_bytes`, `order_stream_queue_bytes`, and `order_stream_backpressure_seconds_total` during peak traffic. A growing unread backlog with a full queue indicates downstream processing pressure.
 
-See [the file-reader benchmark](docs/file-reader-performance.md) for the workload, commands, and measured limits.
-
 ## Performance
 
 ### Deduplication
