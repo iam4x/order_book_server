@@ -3342,6 +3342,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn large_block_batches_after_fill_backlog_do_not_overflow_pending_diffs() {
+        const ORDERS: u64 = 12_000;
+        let user = "0x0000000000000000000000000000000000000001";
+        let mut statuses: serde_json::Value =
+            serde_json::from_str(&order_status_line_at_block("BTC", 1, user, 2)).unwrap();
+        let mut diffs: serde_json::Value = serde_json::from_str(&new_diff_line_at_block("BTC", 1, "1", 2)).unwrap();
+        for oid in 2..=ORDERS {
+            let mut status = statuses["events"][0].clone();
+            status["order"]["oid"] = oid.into();
+            statuses["events"].as_array_mut().unwrap().push(status);
+            let mut diff = diffs["events"][0].clone();
+            diff["oid"] = oid.into();
+            diffs["events"].as_array_mut().unwrap().push(diff);
+        }
+        let (tx, _rx) = channel(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo,stats"));
+        listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial).unwrap();
+        let sources = parallel::enabled_event_sources(features("bbo,stats"));
+        assert_eq!(sources, [EventSource::OrderStatuses, EventSource::Fills, EventSource::OrderDiffs]);
+        let (senders, mut events) = parallel::file_event_channels(&sources, 9);
+        senders[0].try_send(parallel::FileEvent::OrderStatus(statuses.to_string())).unwrap();
+        senders[1].try_send(parallel::FileEvent::Fill(r#"{"block_number":1}"#.into())).unwrap();
+        senders[2].try_send(parallel::FileEvent::OrderDiff(diffs.to_string())).unwrap();
+        drop(senders);
+        loop {
+            let mut ready = Vec::new();
+            if events.recv_many(&mut ready, 64).await == 0 {
+                break;
+            }
+            for event in ready {
+                let (line, source) = match event {
+                    parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
+                    parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
+                    parallel::FileEvent::Fill(_) => continue,
+                    event @ parallel::FileEvent::ContinuityLost(_) => panic!("unexpected event: {event:?}"),
+                };
+                listener.apply_parsed_hft(parse_hft_event(line, source).unwrap().unwrap());
+            }
+        }
+        let snapshot = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false);
+        listener.install_snapshot_state(snapshot, 0, SnapshotTaskKind::Initial).unwrap();
+        let state = listener.order_book_state.as_ref().unwrap();
+        assert_eq!(state.order_count(), usize::try_from(ORDERS).unwrap());
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert!(!listener.repair_pending());
+    }
+
     #[test]
     fn l2_dirty_coins_recompute_non_top_levels_after_throttle() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);

@@ -59,10 +59,10 @@ async fn merge_preserves_source_order_and_alternates_equal_height_lines() {
     drop(senders);
     let mut ready = Vec::new();
     assert_eq!(rx.recv_many(&mut ready, 16).await, 6);
-    assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[1], FileEvent::OrderStatus(_)));
-    assert!(matches!(&ready[2], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[3], FileEvent::OrderStatus(_)));
+    assert!(matches!(&ready[0], FileEvent::OrderStatus(_)));
+    assert!(matches!(&ready[1], FileEvent::OrderDiff(_)));
+    assert!(matches!(&ready[2], FileEvent::OrderStatus(_)));
+    assert!(matches!(&ready[3], FileEvent::OrderDiff(_)));
     assert!(matches!(&ready[4], FileEvent::OrderStatus(line) if line.contains("11")));
     assert!(matches!(&ready[5], FileEvent::OrderDiff(line) if line.contains("12")));
 }
@@ -278,7 +278,7 @@ async fn byte_budget_stalls_reader_while_appends_continue_and_releases_after_dra
             caught_up: false,
             closed: false,
         }],
-        next_source: 0,
+        last_book_event: None,
     };
     let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: sender };
     assert!(submit_file_read(&sink, reader.read_tracked()));

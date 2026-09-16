@@ -218,9 +218,10 @@ impl Drop for SourceQueue {
 
 /// Merge book streams by height while they have unread data. An EOF marker lets
 /// the other streams keep moving when a source has no more events available.
+/// Start each block with statuses, then alternate book sources within that block.
 pub(crate) struct FileEventReceiver {
     sources: Vec<SourceQueue>,
-    next_source: usize,
+    last_book_event: Option<(EventSource, u64)>,
 }
 
 impl FileEventReceiver {
@@ -238,14 +239,29 @@ impl FileEventReceiver {
         let waiting_for_book = self.sources.iter().any(|source| {
             source.source != EventSource::Fills && source.head.is_none() && !source.caught_up && !source.closed
         });
-        let selected = (0..self.sources.len())
-            .map(|offset| (self.next_source + offset) % self.sources.len())
-            .filter(|&index| !waiting_for_book || self.sources[index].source == EventSource::Fills)
-            .filter_map(|index| self.sources[index].head.as_ref().map(|(height, _)| (index, *height)))
-            .min_by_key(|(_, height)| *height);
-        if let Some((index, _)) = selected {
-            self.next_source = (index + 1) % self.sources.len();
-            return Poll::Ready(self.sources[index].head.take().map(|(_, event)| event));
+        let selected = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| !waiting_for_book || source.source == EventSource::Fills)
+            .filter_map(|(index, source)| {
+                let height = source.head.as_ref()?.0;
+                let preferred = if self.last_book_event == Some((EventSource::OrderStatuses, height)) {
+                    EventSource::OrderDiffs
+                } else {
+                    EventSource::OrderStatuses
+                };
+                let priority =
+                    if source.source == EventSource::Fills { 2 } else { u8::from(source.source != preferred) };
+                Some((index, height, priority))
+            })
+            .min_by_key(|&(_, height, priority)| (height, priority));
+        if let Some((index, height, _)) = selected {
+            let source = &mut self.sources[index];
+            if source.source != EventSource::Fills {
+                self.last_book_event = Some((source.source, height));
+            }
+            return Poll::Ready(source.head.take().map(|(_, event)| event));
         }
         if self.sources.iter().all(|source| source.closed && source.head.is_none()) {
             Poll::Ready(None)
@@ -546,7 +562,7 @@ pub(super) fn file_event_channels(sources: &[EventSource], capacity: usize) -> (
             )
         })
         .unzip();
-    (senders, FileEventReceiver { sources, next_source: 0 })
+    (senders, FileEventReceiver { sources, last_book_event: None })
 }
 
 /// Uses *_streaming directories (for --stream-with-block-info mode)
