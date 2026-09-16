@@ -1579,7 +1579,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let order_sync_recorder = listener.lock().await.order_sync_recorder();
 
     // Start only the file watchers needed by the enabled features.
-    let (mut file_events, _handles) = parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder);
+    let (mut file_events, _handles) =
+        parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder).await?;
 
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<SnapshotTaskResult>();
     let refresh_interval = snapshot_refresh_interval(config.snapshot_refresh_hours);

@@ -410,6 +410,8 @@ Enable the node output flags required by your selected features:
 
 ### File readers and node resource use
 
+Snapshot scheduling starts only after every enabled watcher has registered notifications and attached to its initial stream position. Existing complete records are skipped, an incomplete trailing record is retained, and files first discovered afterward are read from the beginning. Startup attachment failures stop initialization.
+
 Notifications coalesce into one pending wakeup per watcher. Normal reads reuse the open file descriptor. A 10 ms fallback checks for missed writes; a one-second reconciliation checks file identity and discovers rotations. A replacement or hourly successor drains the previous descriptor before switching; an unreadable predecessor reports continuity loss and permits recovery. Partial records, UTF-8 splits, and detected continuity loss retain their recovery paths.
 
 When a queue fills, its reader waits and leaves the remaining backlog in the node's files. Readers open those files read-only and take no file locks. The 32 MiB budget covers queued batches and the merge cursor, including string/vector capacities. Reader buffers and the processor's current batch are separate: reads are capped at 256 KiB, records at 16 MiB, and each receive turn stops after 256 KiB or the record that crosses that threshold. These limits do not cap total server RSS.
