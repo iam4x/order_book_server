@@ -290,3 +290,30 @@ async fn release_concurrent_append_latency() {
         vm_hwm_kib().map_or_else(|| "unavailable".to_string(), |value| value.to_string())
     );
 }
+
+#[test]
+#[ignore = "release notification callback benchmark"]
+fn release_notification_storm() {
+    const NOTIFICATIONS: u32 = 5_000_000;
+    for sample in 1..=3 {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let signal = Arc::new(WatcherSignal { flags: AtomicU8::new(0), tx });
+        let callback_signal = Arc::clone(&signal);
+        let elapsed = thread::spawn(move || {
+            let started = Instant::now();
+            for _ in 0..NOTIFICATIONS {
+                callback_signal.notify(std::hint::black_box(NOTIFY_DATA));
+            }
+            started.elapsed()
+        })
+        .join()
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(signal.take(), NOTIFY_DATA);
+        println!(
+            "sample={sample} notifications={NOTIFICATIONS} elapsed={elapsed:?} ns_per_notification={:.2}",
+            elapsed.as_secs_f64() * 1e9 / f64::from(NOTIFICATIONS)
+        );
+    }
+}

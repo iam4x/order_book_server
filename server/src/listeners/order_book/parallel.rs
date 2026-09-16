@@ -419,8 +419,9 @@ struct WatcherSignal {
 
 impl WatcherSignal {
     fn notify(&self, flags: u8) {
-        self.flags.fetch_or(flags, AtomicOrdering::Release);
-        let _ = self.tx.try_send(());
+        if self.flags.fetch_or(flags, AtomicOrdering::Release) == 0 {
+            let _ = self.tx.try_send(());
+        }
     }
 
     fn take(&self) -> u8 {

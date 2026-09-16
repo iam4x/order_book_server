@@ -10,3 +10,9 @@ concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.072099ms 
 concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.003975ms writer_elapsed=9.882184ms throughput_mib_s=1599.37 longest_append_flush=245.832µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30284
 concurrent	reader_enabled=false bytes=16777287 lines=142853 elapsed=10.188225ms writer_elapsed=10.063058ms throughput_mib_s=1570.45 longest_append_flush=264.124µs read_calls=0 batches_submitted=0 largest_read_return_bytes=0 vm_hwm_kib=30260
 after_review_confirmation	bytes=67108932 lines=565808 elapsed=143.031683ms throughput_mib_s=447.45 read_calls=258 batches_submitted=257 largest_read_return_bytes=262202 vm_hwm_kib=42224
+callback_before_review	sample=1 notifications=5000000 elapsed=25.28927ms ns_per_notification=5.06
+callback_before_review	sample=2 notifications=5000000 elapsed=24.68248ms ns_per_notification=4.94
+callback_before_review	sample=3 notifications=5000000 elapsed=24.83398ms ns_per_notification=4.97
+callback_after_review	sample=1 notifications=5000000 elapsed=13.608716ms ns_per_notification=2.72
+callback_after_review	sample=2 notifications=5000000 elapsed=13.471008ms ns_per_notification=2.69
+callback_after_review	sample=3 notifications=5000000 elapsed=13.283675ms ns_per_notification=2.66
