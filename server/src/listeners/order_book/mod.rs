@@ -1755,7 +1755,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             stream_gaps.push(source);
                             continue;
                         }
-                        parallel::FileEvent::CaughtUp => continue,
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
@@ -3205,15 +3204,25 @@ mod tests {
         }
 
         let (senders, mut file_events) =
-            parallel::file_event_channels(&[EventSource::OrderStatuses, EventSource::OrderDiffs], total_lines * 2);
-        for (line, source) in events {
-            match source {
-                EventSource::OrderStatuses => senders[0].try_send(parallel::FileEvent::OrderStatus(line)).unwrap(),
-                EventSource::OrderDiffs => senders[1].try_send(parallel::FileEvent::OrderDiff(line)).unwrap(),
-                EventSource::Fills => unreachable!(),
-            }
-        }
-        drop(senders);
+            parallel::file_event_channels(&[EventSource::OrderStatuses, EventSource::OrderDiffs], 256);
+        let (statuses, diffs): (Vec<_>, Vec<_>) =
+            events.into_iter().partition(|(_, source)| *source == EventSource::OrderStatuses);
+        let producers: Vec<_> = senders
+            .into_iter()
+            .zip([statuses, diffs])
+            .map(|(sender, events)| {
+                std::thread::spawn(move || {
+                    let mut lines = events.into_iter().map(|(line, _)| line);
+                    loop {
+                        let batch: Vec<_> = lines.by_ref().take(256).collect();
+                        if batch.is_empty() {
+                            break;
+                        }
+                        assert!(sender.send_lines(batch));
+                    }
+                })
+            })
+            .collect();
         let started = Instant::now();
         let mut slowest_drain = Duration::ZERO;
         loop {
@@ -3237,6 +3246,9 @@ mod tests {
                 listener.apply_parsed_hft(event);
             }
             slowest_drain = slowest_drain.max(drain_started.elapsed());
+        }
+        for producer in producers {
+            producer.join().unwrap();
         }
         let maintenance_started = Instant::now();
         listener.maintain_state();

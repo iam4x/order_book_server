@@ -400,12 +400,23 @@ Enable the node output flags required by your selected features:
 ```
 
 **Data flow:**
+
 1. The Hyperliquid node writes real-time events to `*_streaming/` directories as newline-delimited JSON
 2. One inotify watcher thread runs for each event source required by `--features`
-3. Watcher threads send events directly into a bounded Tokio channel. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
+3. Watchers read through an open descriptor in 256 KiB chunks and send owned line batches through per-source queues, with a 32 MiB allocation budget per source. The receiver merges book streams by height. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
 5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
 6. Changed BBOs and L2 snapshots are broadcast to subscribed WebSocket clients with deduplication
+
+### File readers and node resource use
+
+Notifications coalesce into one pending wakeup per watcher. Normal reads reuse the open file descriptor. A 10 ms fallback checks for missed writes; a one-second reconciliation checks file identity and discovers rotations. A replacement or hourly successor drains the previous descriptor before switching; an unreadable predecessor reports continuity loss and permits recovery. Partial records, UTF-8 splits, and detected continuity loss retain their recovery paths.
+
+When a queue fills, its reader waits and leaves the remaining backlog in the node's files. Readers open those files read-only and take no file locks. The 32 MiB budget covers queued batches and the merge cursor, including string/vector capacities. Reader buffers and the processor's current batch are separate: reads are capped at 256 KiB, records at 16 MiB, and each receive turn stops after 256 KiB or the record that crosses that threshold. These limits do not cap total server RSS.
+
+The reader still shares CPU, memory bandwidth, page cache, and storage with the node. Lower reader allocations and fewer channel operations reduce contention; they do not guarantee zero node impact. Snapshot computation and replay-journal writes also consume resources. Check node block lag alongside `order_stream_unread_bytes`, `order_stream_queue_bytes`, and `order_stream_backpressure_seconds_total` during peak traffic. A growing unread backlog with a full queue indicates downstream processing pressure.
+
+See [the file-reader benchmark](docs/file-reader-performance.md) for the workload, commands, and measured limits.
 
 ## Performance
 
@@ -464,6 +475,13 @@ curl http://localhost:9090/metrics
 | | `event_processing_latency_seconds{event_type}` | Per-event processing latency |
 | **File Watcher** | `file_events_total{source}` | File events received by source |
 | | `file_lines_parsed_total{source}` | Lines parsed from files by source |
+| | `order_stream_read_bytes_total{source}` | Bytes read from node stream files |
+| | `order_stream_read_calls_total{source}` | Reader attempts, including EOF probes |
+| | `order_stream_read_duration_seconds{source}` | Read/framing duration, including reconciliation when due |
+| | `order_stream_unread_bytes{source}` | Unread bytes in the current file at the last read; excludes later files |
+| | `order_stream_queue_bytes{source}` | Allocations reserved for queued batches and the merge cursor |
+| | `order_stream_backpressure_seconds_total{source}` | Time the reader waits for queue capacity |
+| | `order_stream_watcher_wakeups_total{source,reason}` | Notification/poll wakeups and reconciliation passes |
 | **Errors** | `parse_errors_total{type}` | JSON parse errors by source |
 | | `orderbook_repair_requests_total{reason}` | Snapshot repair requests after pending-pair or stream data loss |
 | | `ws_send_errors_total` | WebSocket send errors |
