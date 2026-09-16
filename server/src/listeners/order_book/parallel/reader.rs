@@ -246,9 +246,43 @@ impl FileReader {
         Self { tracked: None, pending: None, base_dir, read_buf: vec![0; READ_CHUNK_BYTES] }
     }
 
+    pub(super) fn attach(base_dir: PathBuf) -> std::io::Result<Self> {
+        let mut reader = Self::new(base_dir);
+        if let Some(path) = reader.latest_initial_file()? {
+            let mut opened = OpenedStream::open(&path)?.ok_or_else(|| {
+                std::io::Error::other(format!("Stream disappeared during startup: {}", path.display()))
+            })?;
+            let end = opened.file.metadata()?.len();
+            let mut offset = end;
+            let floor = end.saturating_sub(MAX_PARTIAL_LINE_BYTES as u64 + 1);
+            while offset > floor {
+                let start = offset.saturating_sub(READ_CHUNK_BYTES as u64).max(floor);
+                let length = usize::try_from(offset - start).unwrap_or(READ_CHUNK_BYTES);
+                opened.file.seek(SeekFrom::Start(start))?;
+                opened.file.read_exact(&mut reader.read_buf[..length])?;
+                if let Some(newline) = reader.read_buf[..length].iter().rposition(|&byte| byte == b'\n') {
+                    offset = start + newline as u64 + 1;
+                    break;
+                }
+                offset = start;
+            }
+            if end - offset > MAX_PARTIAL_LINE_BYTES as u64 {
+                return Err(std::io::Error::other("Initial stream tail exceeds the maximum record size"));
+            }
+            opened.file.seek(SeekFrom::Start(offset))?;
+            reader.tracked = Some(TrackedStream::new(opened, offset));
+        }
+        Ok(reader)
+    }
+
     pub(super) fn check_for_newer_file(&mut self) -> Option<PathBuf> {
         let Some(current_path) = self.tracked.as_ref().map(|tracked| tracked.opened.path.clone()) else {
-            return self.latest_initial_file();
+            return self
+                .stream_files(NaiveDate::MIN)
+                .into_iter()
+                .filter_map(|path| StreamKey::from_path(&path).map(|key| (key, path)))
+                .min_by_key(|(key, _)| *key)
+                .map(|(_, path)| path);
         };
         match OpenedStream::open(&current_path) {
             Ok(Some(opened))
@@ -285,6 +319,7 @@ impl FileReader {
         self.read_tracked()
     }
 
+    #[cfg(test)]
     pub(super) fn start_tracking(&mut self, path: &Path) {
         let Some(mut opened) = Self::open_candidate(path) else {
             return;
@@ -404,27 +439,44 @@ impl FileReader {
         }
     }
 
-    fn latest_initial_file(&self) -> Option<PathBuf> {
-        let latest_day = std::fs::read_dir(self.base_dir.join("hourly"))
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|entry| {
-                let day = NaiveDate::parse_from_str(entry.file_name().to_str()?, "%Y%m%d").ok()?;
-                Some((day, entry.path()))
-            })
-            .max_by_key(|(day, _)| *day)?
-            .1;
-        std::fs::read_dir(latest_day)
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter_map(|entry| {
+    fn latest_initial_file(&self) -> std::io::Result<Option<PathBuf>> {
+        let days = match std::fs::read_dir(self.base_dir.join("hourly")) {
+            Ok(days) => days,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut candidates = Vec::new();
+        for entry in days {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(day) =
+                entry.file_name().to_str().and_then(|name| NaiveDate::parse_from_str(name, "%Y%m%d").ok())
+            {
+                candidates.push((day, entry.path()));
+            }
+        }
+        candidates.sort_unstable_by_key(|(day, _)| std::cmp::Reverse(*day));
+        for (_, day) in candidates {
+            let mut latest = None;
+            for entry in std::fs::read_dir(day)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
                 let path = entry.path();
-                StreamKey::from_path(&path).map(|key| (key, path))
-            })
-            .max_by_key(|(key, _)| *key)
-            .map(|(_, path)| path)
+                if let Some(key) = StreamKey::from_path(&path)
+                    && latest.as_ref().is_none_or(|(last, _)| key > *last)
+                {
+                    latest = Some((key, path));
+                }
+            }
+            if let Some((_, path)) = latest {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
     }
 
     fn stream_files(&self, minimum_day: NaiveDate) -> Vec<PathBuf> {
@@ -484,10 +536,6 @@ impl FileReader {
         self.tracked.as_ref().map(|tracked| tracked.opened.path.as_path())
     }
 
-    pub(super) const fn is_tracking(&self) -> bool {
-        self.tracked.is_some()
-    }
-
     #[cfg(test)]
     pub(super) fn file_position(&self) -> u64 {
         self.tracked.as_ref().map_or(0, |tracked| tracked.offset)
@@ -500,402 +548,4 @@ impl FileReader {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Write;
-
-    use super::*;
-
-    fn stream_test_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("orderbook-reader-{name}-{}", std::process::id()));
-        drop(std::fs::remove_dir_all(&path));
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn hour_file(base: &Path, hour: u8) -> PathBuf {
-        let day = base.join("hourly/20260826");
-        std::fs::create_dir_all(&day).unwrap();
-        day.join(hour.to_string())
-    }
-
-    fn append(path: &Path, bytes: &[u8]) {
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(bytes).unwrap();
-    }
-
-    fn reconcile_and_read(reader: &mut FileReader) -> FileRead {
-        match reader.check_for_newer_file() {
-            Some(path) => reader.on_create(&path),
-            None => reader.read_tracked(),
-        }
-    }
-
-    #[test]
-    fn reads_at_most_one_chunk_per_call() {
-        let base = stream_test_dir("chunk-bound");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        append(&file, &vec![b'a'; READ_CHUNK_BYTES * 2 + 1]);
-
-        assert_eq!(reader.read_tracked().bytes_read, READ_CHUNK_BYTES);
-        assert_eq!(reader.partial_line().len(), READ_CHUNK_BYTES);
-        assert_eq!(reader.read_tracked().bytes_read, READ_CHUNK_BYTES);
-        assert_eq!(reader.read_tracked().bytes_read, 1);
-        assert_eq!(reader.read_tracked().progress, ReadProgress::Idle);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn utf8_split_across_chunks_is_decoded_after_newline() {
-        let base = stream_test_dir("utf8-split");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        let mut bytes = vec![b'a'; READ_CHUNK_BYTES - 1];
-        bytes.extend_from_slice("🦀\n".as_bytes());
-        append(&file, &bytes);
-
-        assert!(reader.read_tracked().lines.is_empty());
-        assert_eq!(reader.tracked.as_ref().unwrap().partial_line.len(), READ_CHUNK_BYTES);
-        let second = reader.read_tracked();
-        assert_eq!(second.lines, vec![format!("{}🦀", "a".repeat(READ_CHUNK_BYTES - 1))]);
-        assert_eq!(second.continuity, FileContinuity::Preserved);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn invalid_utf8_loses_continuity_and_recovers_next_record() {
-        let base = stream_test_dir("invalid-utf8");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        append(&file, b"\xff\n{\"ok\":true}\n");
-
-        let read = reader.read_tracked();
-        assert_eq!(read.continuity, FileContinuity::Lost);
-        assert_eq!(read.lines, vec![r#"{"ok":true}"#]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn oversized_record_is_bounded_and_recovers_at_newline() {
-        let base = stream_test_dir("oversize");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        append(&file, &vec![b'x'; MAX_PARTIAL_LINE_BYTES + 1]);
-        append(&file, b"\n{}\n");
-
-        let mut continuity_lost = false;
-        let mut lines = Vec::new();
-        loop {
-            let read = reader.read_tracked();
-            continuity_lost |= read.continuity == FileContinuity::Lost;
-            lines.extend(read.lines);
-            assert!(reader.tracked.as_ref().unwrap().partial_line.len() <= MAX_PARTIAL_LINE_BYTES);
-            assert!(reader.tracked.as_ref().unwrap().partial_line.capacity() <= MAX_PARTIAL_LINE_BYTES);
-            if read.progress == ReadProgress::Idle {
-                break;
-            }
-        }
-        assert!(continuity_lost);
-        assert_eq!(lines, vec!["{}"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn exact_limit_record_and_remainder_fit_batch_budget() {
-        let base = stream_test_dir("exact-limit");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        append(&file, &vec![b'x'; MAX_PARTIAL_LINE_BYTES]);
-        append(&file, b"\n{}\n");
-
-        let read = loop {
-            let read = reader.read_tracked();
-            if !read.lines.is_empty() {
-                break read;
-            }
-        };
-        assert_eq!(read.lines.len(), 2);
-        assert_eq!(read.lines[0].len(), MAX_PARTIAL_LINE_BYTES);
-        assert_eq!(read.lines[1], "{}");
-        let charged =
-            read.lines.capacity() * size_of::<String>() + read.lines.iter().map(String::capacity).sum::<usize>();
-        assert!(charged <= 32 * 1024 * 1024, "batch charged {charged} bytes");
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn truncation_clears_partial_and_reads_from_zero() {
-        let base = stream_test_dir("truncate");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        append(&file, b"partial");
-        assert_eq!(reader.read_tracked().progress, ReadProgress::Data);
-        std::fs::write(&file, b"{}\n").unwrap();
-
-        let read = reader.read_tracked();
-        assert_eq!(read.continuity, FileContinuity::Lost);
-        assert_eq!(read.lines, vec!["{}"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn large_predecessor_drains_in_chunks_before_successor() {
-        let base = stream_test_dir("large-rotation");
-        let old = hour_file(&base, 1);
-        let new = hour_file(&base, 2);
-        std::fs::write(&old, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&old);
-        let old_line = format!("{}\n", "x".repeat(READ_CHUNK_BYTES * 2));
-        append(&old, old_line.as_bytes());
-        std::fs::write(&new, b"new\n").unwrap();
-
-        let first = reader.on_create(&new);
-        assert_eq!(first.bytes_read, READ_CHUNK_BYTES);
-        assert_eq!(reader.current_path(), Some(old.as_path()));
-        assert_eq!(reader.read_tracked().bytes_read, READ_CHUNK_BYTES);
-        assert_eq!(reader.current_path(), Some(old.as_path()));
-        assert_eq!(reader.read_tracked().bytes_read, 1);
-        let switched = reader.read_tracked();
-        assert_eq!(switched.progress, ReadProgress::Data);
-        assert_eq!(reader.current_path(), Some(new.as_path()));
-        assert_eq!(reader.read_tracked().lines, vec!["new"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn earliest_successor_is_preferred() {
-        let base = stream_test_dir("earliest");
-        let current = hour_file(&base, 1);
-        std::fs::write(&current, []).unwrap();
-        std::fs::write(hour_file(&base, 3), []).unwrap();
-        std::fs::write(hour_file(&base, 2), []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&current);
-
-        assert_eq!(reader.check_for_newer_file(), Some(hour_file(&base, 2)));
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    fn finish_switch(reader: &mut FileReader, successor: &Path) -> FileRead {
-        while reader.current_path() != Some(successor) {
-            reader.read_tracked();
-        }
-        reader.read_tracked()
-    }
-
-    #[test]
-    fn repeated_read_failure_reports_one_loss_until_healthy() {
-        let base = stream_test_dir("failure-latch");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, []).unwrap();
-        let opened = FileReader::open_candidate(&file).unwrap();
-        let mut tracked = TrackedStream::new(opened, 0);
-        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
-        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Preserved);
-        tracked.mark_read_healthy();
-        assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn invalid_start_and_directory_create_are_ignored() {
-        let base = stream_test_dir("invalid-candidates");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, b"old\n").unwrap();
-        let day = file.parent().unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        let position = reader.file_position();
-
-        reader.start_tracking(day);
-        reader.start_tracking(&day.join("missing"));
-        reader.on_create(day);
-        assert_eq!(reader.current_path(), Some(file.as_path()));
-        assert_eq!(reader.file_position(), position);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn duplicate_create_preserves_offset_without_replay() {
-        let base = stream_test_dir("duplicate-create");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, b"old\n").unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        let position = reader.file_position();
-        assert_eq!(reader.on_create(&file).progress, ReadProgress::Idle);
-        assert_eq!(reader.file_position(), position);
-        append(&file, b"new\n");
-        assert_eq!(reconcile_and_read(&mut reader).lines, vec!["new"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn first_modify_attaches_at_eof() {
-        let base = stream_test_dir("first-modify");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, b"old\n").unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        assert_eq!(reader.read_tracked().progress, ReadProgress::Idle);
-        append(&file, b"new\n");
-        assert_eq!(reader.read_tracked().lines, vec!["new"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn same_inode_shrink_rewinds_and_reports_loss() {
-        let base = stream_test_dir("shrink");
-        let file = hour_file(&base, 1);
-        std::fs::write(&file, b"long-existing-line\n").unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&file);
-        std::fs::OpenOptions::new().write(true).truncate(true).open(&file).unwrap().write_all(b"{}\n").unwrap();
-        let read = reader.read_tracked();
-        assert_eq!(read.continuity, FileContinuity::Lost);
-        assert_eq!(read.lines, vec!["{}"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn same_path_replacement_drains_old_and_restarts_at_zero() {
-        for (name, replacement) in [("equal", b"new\n".as_slice()), ("larger", b"replacement\n".as_slice())] {
-            let base = stream_test_dir(name);
-            let file = hour_file(&base, 1);
-            std::fs::write(&file, b"old\n").unwrap();
-            let mut reader = FileReader::new(base.clone());
-            reader.start_tracking(&file);
-            let temporary = file.with_extension("replacement");
-            std::fs::write(&temporary, replacement).unwrap();
-            std::fs::rename(&temporary, &file).unwrap();
-
-            let staged = reconcile_and_read(&mut reader);
-            assert_eq!(staged.continuity, FileContinuity::Lost);
-            let read = finish_switch(&mut reader, &file);
-            assert_eq!(read.lines, vec![std::str::from_utf8(replacement).unwrap().trim_end()]);
-            std::fs::remove_dir_all(base).unwrap();
-        }
-    }
-
-    #[test]
-    fn missing_predecessor_is_drained_then_reports_loss() {
-        let base = stream_test_dir("missing-predecessor");
-        let old = hour_file(&base, 1);
-        let new = hour_file(&base, 2);
-        std::fs::write(&old, []).unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&old);
-        append(&old, b"old\n");
-        std::fs::remove_file(&old).unwrap();
-        std::fs::write(&new, b"new\n").unwrap();
-        assert_eq!(reader.check_for_newer_file(), Some(new.clone()));
-        let first = reader.on_create(&new);
-        assert_eq!(first.lines, vec!["old"]);
-        let transition = reader.read_tracked();
-        assert_eq!(transition.continuity, FileContinuity::Lost);
-        assert_eq!(finish_switch(&mut reader, &new).lines, vec!["new"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn unreadable_predecessor_switches_to_healthy_successor() {
-        let base = stream_test_dir("unreadable-predecessor");
-        let old = hour_file(&base, 1);
-        let new = hour_file(&base, 2);
-        std::fs::write(&old, []).unwrap();
-        std::fs::write(&new, b"new\n").unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&old);
-        reader.tracked.as_mut().unwrap().opened.file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
-
-        let switched = reader.on_create(&new);
-        assert_eq!(switched.continuity, FileContinuity::Lost);
-        assert_eq!(switched.progress, ReadProgress::Data);
-        assert_eq!(reader.current_path(), Some(new.as_path()));
-        assert_eq!(reader.read_tracked().lines, vec!["new"]);
-        std::fs::remove_dir_all(base).unwrap();
-    }
-
-    #[test]
-    fn skipped_hour_and_trailing_partial_report_loss() {
-        for (name, old_hour, new_hour, tail) in
-            [("skipped", 1, 3, b"".as_slice()), ("partial", 1, 2, b"partial".as_slice())]
-        {
-            let base = stream_test_dir(name);
-            let old = hour_file(&base, old_hour);
-            let new = hour_file(&base, new_hour);
-            std::fs::write(&old, []).unwrap();
-            let mut reader = FileReader::new(base.clone());
-            reader.start_tracking(&old);
-            append(&old, tail);
-            std::fs::write(&new, b"new\n").unwrap();
-            let mut lost = reader.on_create(&new).continuity == FileContinuity::Lost;
-            while reader.current_path() != Some(new.as_path()) {
-                lost |= reader.read_tracked().continuity == FileContinuity::Lost;
-            }
-            assert!(lost);
-            assert_eq!(reader.read_tracked().lines, vec!["new"]);
-            std::fs::remove_dir_all(base).unwrap();
-        }
-    }
-
-    #[test]
-    fn day_rollover_and_ordinary_rotation_preserve_continuity() {
-        for rollover in [false, true] {
-            let base = stream_test_dir(if rollover { "rollover" } else { "ordinary" });
-            let old = if rollover {
-                let day = base.join("hourly/20260826");
-                std::fs::create_dir_all(&day).unwrap();
-                day.join("23")
-            } else {
-                hour_file(&base, 1)
-            };
-            let new = if rollover {
-                let day = base.join("hourly/20260827");
-                std::fs::create_dir_all(&day).unwrap();
-                day.join("0")
-            } else {
-                hour_file(&base, 2)
-            };
-            std::fs::write(&old, []).unwrap();
-            let mut reader = FileReader::new(base.clone());
-            reader.start_tracking(&old);
-            append(&old, b"old\n");
-            std::fs::write(&new, b"new\n").unwrap();
-            let old_read = reader.on_create(&new);
-            assert_eq!(old_read.lines, vec!["old"]);
-            assert_eq!(old_read.continuity, FileContinuity::Preserved);
-            let transition = reader.read_tracked();
-            assert_eq!(transition.continuity, FileContinuity::Preserved);
-            assert_eq!(reader.read_tracked().lines, vec!["new"]);
-            std::fs::remove_dir_all(base).unwrap();
-        }
-    }
-
-    #[test]
-    fn delayed_older_create_is_ignored() {
-        let base = stream_test_dir("older-create");
-        let older = hour_file(&base, 1);
-        let current = hour_file(&base, 2);
-        std::fs::write(&older, b"older\n").unwrap();
-        std::fs::write(&current, b"current\n").unwrap();
-        let mut reader = FileReader::new(base.clone());
-        reader.start_tracking(&current);
-        assert_eq!(reader.on_create(&older).progress, ReadProgress::Idle);
-        assert_eq!(reader.current_path(), Some(current.as_path()));
-        std::fs::remove_dir_all(base).unwrap();
-    }
-}
+mod tests;
