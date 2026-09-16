@@ -393,12 +393,19 @@ impl OrderBookState {
     /// HFT-specific: Process OrderDiffs independently without block synchronization
     /// Uses bidirectional caching - if status already arrived, add order immediately
     /// Returns the set of coins that were modified (for selective BBO broadcast)
+    #[cfg(test)]
     pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
         self.apply_order_diffs_hft_inner(batch, OrderDiffApplyMode::Live)
     }
 
-    pub(super) fn replay_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
-        self.apply_order_diffs_hft_inner(batch, OrderDiffApplyMode::Replay)
+    pub(super) fn apply_order_diffs_after_snapshot(
+        &mut self,
+        batch: Batch<NodeDataOrderDiff>,
+        snapshot_height: u64,
+    ) -> Result<HashSet<Coin>> {
+        let mode =
+            if batch.block_number() <= snapshot_height { OrderDiffApplyMode::Replay } else { OrderDiffApplyMode::Live };
+        self.apply_order_diffs_hft_inner(batch, mode)
     }
 
     fn apply_order_diffs_hft_inner(
@@ -946,7 +953,7 @@ mod tests {
 
         let stale_update =
             make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "3.0".to_string(), new_sz: "4.0".to_string() });
-        let changed = state.replay_order_diffs_hft(make_diff_batch(vec![stale_update])).unwrap();
+        let changed = state.apply_order_diffs_after_snapshot(make_diff_batch(vec![stale_update]), u64::MAX).unwrap();
 
         let coins = HashSet::from([Coin::new("BTC")]);
         let (_time, bbos) = state.get_bbos_for_coins(&coins);

@@ -529,6 +529,7 @@ struct SnapshotReplayOutcome {
 
 fn replay_snapshot_cache(
     state: &mut OrderBookState,
+    replay_cutoff_height: u64,
     snapshot_height: u64,
     mut replay_cache: SnapshotReplayCache,
 ) -> Result<SnapshotReplayOutcome> {
@@ -554,13 +555,11 @@ fn replay_snapshot_cache(
         match tag {
             b'S' => match sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(json) {
                 Ok(batch) => {
-                    if batch.block_number() <= snapshot_height {
+                    if batch.block_number() <= replay_cutoff_height {
                         continue;
                     }
                     if let Err(err) = state.apply_order_statuses_hft(batch) {
-                        warn!(
-                            "Skipping cached order-status replay line above snapshot height {snapshot_height}: {err}"
-                        );
+                        warn!("Skipping cached order-status replay line above cutoff {replay_cutoff_height}: {err}");
                         clean = false;
                     }
                     replayed_lines += 1;
@@ -572,11 +571,11 @@ fn replay_snapshot_cache(
             },
             b'D' => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(json) {
                 Ok(batch) => {
-                    if batch.block_number() <= snapshot_height {
+                    if batch.block_number() <= replay_cutoff_height {
                         continue;
                     }
-                    if let Err(err) = state.replay_order_diffs_hft(batch) {
-                        warn!("Skipping cached order-diff replay line above snapshot height {snapshot_height}: {err}");
+                    if let Err(err) = state.apply_order_diffs_after_snapshot(batch, snapshot_height) {
+                        warn!("Skipping cached order-diff replay line above cutoff {replay_cutoff_height}: {err}");
                         clean = false;
                     }
                     replayed_lines += 1;
@@ -853,7 +852,8 @@ impl OrderBookListener {
         let current_time = (kind == SnapshotTaskKind::Refresh)
             .then(|| self.order_book_state.as_ref().map(OrderBookState::time))
             .flatten();
-        let replay_outcome = replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_cache)?;
+        let replay_outcome =
+            replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, snapshot_height, replay_cache)?;
         let replay_repair_reasons = new_order_book.take_repair_reasons();
         let replay_clean = replay_outcome.clean && replay_repair_reasons.is_empty();
         if let Some(current_time) = current_time {
@@ -884,12 +884,6 @@ impl OrderBookListener {
         matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs)
             && self.features.requires_book_state()
             && height <= self.stream_ignore_through_height
-    }
-
-    fn should_replay_guard_stream_batch(&self, event_source: EventSource, height: u64) -> bool {
-        matches!(event_source, EventSource::OrderDiffs)
-            && self.features.requires_book_state()
-            && height <= self.stream_replay_guard_through_height
     }
 
     // forcibly grab current snapshot
@@ -1207,8 +1201,6 @@ impl OrderBookListener {
         let ParsedHftEvent { line, event_source, height, event_batch } = parsed;
         let source_label = source_label(event_source);
         let ignore_for_book_state = self.should_ignore_stream_batch(event_source, height);
-        let replay_guard_for_book_state =
-            !ignore_for_book_state && self.should_replay_guard_stream_batch(event_source, height);
         if !ignore_for_book_state {
             self.record_snapshot_replay_line(event_source, &line);
         }
@@ -1266,13 +1258,7 @@ impl OrderBookListener {
                 if self.features.requires_book_state() && !ignore_for_book_state {
                     self.order_book_state.as_mut().map_or_else(
                         || Ok(HashSet::new()),
-                        |state| {
-                            if replay_guard_for_book_state {
-                                state.replay_order_diffs_hft(batch)
-                            } else {
-                                state.apply_order_diffs_hft(batch)
-                            }
-                        },
+                        |state| state.apply_order_diffs_after_snapshot(batch, self.stream_replay_guard_through_height),
                     )
                 } else {
                     Ok(HashSet::new())
@@ -2628,6 +2614,21 @@ mod tests {
 
         assert_eq!(current_bid_sz(&listener, "BTC"), "4");
         assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
+    }
+
+    #[test]
+    fn journal_and_queued_updates_after_snapshot_height_have_identical_semantics() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+        listener.process_data_hft(update_diff_line_at_block("BTC", 1, "3", "4", 23), EventSource::OrderDiffs).unwrap();
+        let snapshot = order_book_state_with_bids(&[("BTC", &[(1, "100", "5")])], 22);
+        listener.install_snapshot_state_with_replay_cutoff(snapshot, 22, 20, SnapshotTaskKind::Initial).unwrap();
+        assert_eq!(
+            current_bid_sz(&listener, "BTC"),
+            "4",
+            "a post-snapshot update must not be discarded by replay guards"
+        );
     }
 
     #[test]
