@@ -279,6 +279,7 @@ async fn byte_budget_stalls_reader_while_appends_continue_and_releases_after_dra
             closed: false,
         }],
         last_book_event: None,
+        last_delivery: None,
     };
     let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: sender };
     assert!(submit_file_read(&sink, reader.read_tracked()));
@@ -460,4 +461,23 @@ fn notifications_survive_flags_cleared_before_the_pending_token_is_consumed() {
     assert!(rx.try_recv().is_ok());
     signal.notify(NOTIFY_DATA);
     assert_eq!(signal.take(), NOTIFY_ERROR | NOTIFY_DATA);
+}
+
+#[tokio::test]
+async fn historical_fill_backlog_cannot_starve_ready_book_events() {
+    let (senders, mut receiver) =
+        file_event_channels(&[EventSource::OrderStatuses, EventSource::Fills, EventSource::OrderDiffs], 12);
+    senders[0].try_send(status_at(100)).unwrap();
+    senders[2].try_send(diff_at(100)).unwrap();
+    for height in 1..=3 {
+        senders[1].try_send(FileEvent::Fill(format!(r#"{{"block_number":{height}}}"#))).unwrap();
+    }
+    drop(senders);
+    let mut ready = Vec::new();
+    assert_eq!(receiver.recv_many(&mut ready, 2).await, 2);
+    assert!(
+        ready.iter().any(|event| matches!(event, FileEvent::OrderStatus(_))),
+        "book progress must not wait for the unrelated fill backlog"
+    );
+    assert!(ready.iter().any(|event| matches!(event, FileEvent::Fill(_))));
 }
