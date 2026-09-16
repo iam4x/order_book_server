@@ -3,10 +3,12 @@
 
 use std::{
     fs::File,
+    future::poll_fn,
     io::{Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    task::{Context, Poll},
     thread,
     time::Duration,
 };
@@ -14,6 +16,7 @@ use std::{
 use chrono::NaiveDate;
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use sonic_rs::JsonValueTrait;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::{
@@ -32,6 +35,92 @@ pub(crate) enum FileEvent {
     OrderDiff(String),
     Fill(String),
     ContinuityLost(EventSource),
+    CaughtUp,
+}
+
+struct SourceQueue {
+    source: EventSource,
+    rx: Receiver<FileEvent>,
+    head: Option<(u64, FileEvent)>,
+    caught_up: bool,
+    closed: bool,
+}
+
+impl SourceQueue {
+    fn poll_head(&mut self, cx: &mut Context<'_>) {
+        while self.head.is_none() && !self.closed {
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(FileEvent::CaughtUp)) => self.caught_up = true,
+                Poll::Ready(Some(event)) => {
+                    let height = match &event {
+                        FileEvent::OrderStatus(line) | FileEvent::OrderDiff(line) | FileEvent::Fill(line) => {
+                            // Malformed lines still reach the parser and its repair path.
+                            sonic_rs::get_from_str(line, ["block_number"]).ok().and_then(|v| v.as_u64()).unwrap_or(0)
+                        }
+                        FileEvent::ContinuityLost(_) | FileEvent::CaughtUp => 0,
+                    };
+                    self.head = Some((height, event));
+                    self.caught_up = false;
+                }
+                Poll::Ready(None) => self.closed = true,
+                Poll::Pending => break,
+            }
+        }
+    }
+}
+
+/// Merge book streams by height while they have unread data. An EOF marker lets
+/// the other streams keep moving when a source has no more events available.
+pub(crate) struct FileEventReceiver {
+    sources: Vec<SourceQueue>,
+    next_source: usize,
+}
+
+impl FileEventReceiver {
+    pub(super) fn len(&self) -> usize {
+        self.sources.iter().map(|source| source.rx.len() + usize::from(source.head.is_some())).sum()
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<FileEvent>> {
+        for source in &mut self.sources {
+            source.poll_head(cx);
+        }
+        let waiting_for_book = self.sources.iter().any(|source| {
+            source.source != EventSource::Fills && source.head.is_none() && !source.caught_up && !source.closed
+        });
+        let selected = (0..self.sources.len())
+            .map(|offset| (self.next_source + offset) % self.sources.len())
+            .filter(|&index| !waiting_for_book || self.sources[index].source == EventSource::Fills)
+            .filter_map(|index| self.sources[index].head.as_ref().map(|(height, _)| (index, *height)))
+            .min_by_key(|(_, height)| *height);
+        if let Some((index, _)) = selected {
+            self.next_source = (index + 1) % self.sources.len();
+            return Poll::Ready(self.sources[index].head.take().map(|(_, event)| event));
+        }
+        if self.sources.iter().all(|source| source.closed && source.head.is_none()) {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    pub(super) async fn recv_many(&mut self, buffer: &mut Vec<FileEvent>, limit: usize) -> usize {
+        poll_fn(|cx| {
+            let mut received = 0;
+            while received < limit {
+                match self.poll_recv(cx) {
+                    Poll::Ready(Some(event)) => {
+                        buffer.push(event);
+                        received += 1;
+                    }
+                    Poll::Pending if received == 0 => return Poll::Pending,
+                    Poll::Ready(None) | Poll::Pending => break,
+                }
+            }
+            Poll::Ready(received)
+        })
+        .await
+    }
 }
 
 enum FileLineSink {
@@ -84,6 +173,14 @@ impl FileLineSink {
                 event_tx.blocking_send(FileEvent::ContinuityLost(EventSource::Fills)).is_ok()
             }
         }
+    }
+
+    fn submit_caught_up(&self) -> bool {
+        let tx = match self {
+            Self::Events { tx, .. } => tx,
+            Self::FillProgress { event_tx, .. } => event_tx,
+        };
+        tx.blocking_send(FileEvent::CaughtUp).is_ok()
     }
 }
 
@@ -494,6 +591,14 @@ fn submit_file_read(sink: &FileLineSink, read: FileRead) -> bool {
     true
 }
 
+fn submit_available(sink: &FileLineSink, reader: &mut FileReader) -> bool {
+    let read = reader.on_modify();
+    let empty = read.lines.is_empty();
+    // Sending a backlog may block while the node appends more data. Only
+    // declare EOF on an empty read, not at the end of the old buffer.
+    submit_file_read(sink, read) && (!empty || sink.submit_caught_up())
+}
+
 /// Spawn a file watcher thread for a single event source
 /// Uses polling with inotify hints for streaming files
 fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink) -> thread::JoinHandle<()> {
@@ -557,7 +662,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink) -> thread::JoinHandle<()
                         }
 
                         // EVENT-DRIVEN: Read data when inotify fires modify event
-                        if !submit_file_read(&sink, reader.on_modify()) {
+                        if !submit_available(&sink, &mut reader) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -568,7 +673,7 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink) -> thread::JoinHandle<()
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // Fallback polling - safety net for missed events
-                    if !submit_file_read(&sink, reader.on_modify()) {
+                    if !submit_available(&sink, &mut reader) {
                         error!("{} channel closed, exiting", source_name);
                         return;
                     }
@@ -594,19 +699,35 @@ fn spawn_file_watcher(dir: PathBuf, sink: FileLineSink) -> thread::JoinHandle<()
     })
 }
 
+pub(super) fn file_event_channels(
+    sources: &[EventSource],
+    capacity: usize,
+) -> (Vec<Sender<FileEvent>>, FileEventReceiver) {
+    let per_source_capacity = (capacity / sources.len().max(1)).max(1);
+    let (senders, sources) = sources
+        .iter()
+        .map(|&source| {
+            let (tx, rx) = channel(per_source_capacity);
+            (tx, SourceQueue { source, rx, head: None, caught_up: false, closed: false })
+        })
+        .unzip();
+    (senders, FileEventReceiver { sources, next_source: 0 })
+}
+
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     features: FeatureSet,
     order_sync_recorder: Option<OrderSyncRecorder>,
-) -> (Receiver<FileEvent>, Vec<thread::JoinHandle<()>>) {
+) -> (FileEventReceiver, Vec<thread::JoinHandle<()>>) {
     // The bound caps the in-memory backlog. When full, blocking_send parks the
     // file readers and leaves unread events on disk.
-    let (tx, rx) = channel(10_000);
+    let sources = enabled_event_sources(features);
+    let (senders, rx) = file_event_channels(&sources, 10_000);
     let mut handles = Vec::new();
 
     // HFT mode uses streaming directories (for --stream-with-block-info)
-    for source in enabled_event_sources(features) {
+    for (source, tx) in sources.into_iter().zip(senders) {
         let dir = source.event_source_dir_streaming(&data_dir);
         info!("{} dir: {:?}", source, dir);
         let Some(sink) = file_line_sink(source, features, tx.clone(), order_sync_recorder.clone()) else {
@@ -637,6 +758,121 @@ mod tests {
 
     fn features(value: &str) -> FeatureSet {
         value.parse().expect("valid features")
+    }
+
+    fn diff_at(height: u64) -> FileEvent {
+        FileEvent::OrderDiff(format!(r#"{{"block_number":{height}}}"#))
+    }
+
+    fn status_at(height: u64) -> FileEvent {
+        FileEvent::OrderStatus(format!(r#"{{"block_number":{height}}}"#))
+    }
+
+    #[tokio::test]
+    async fn merge_waits_for_a_readers_next_batch_without_losing_heads_on_cancellation() {
+        let (senders, mut rx) = file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 8);
+        senders[0].try_send(diff_at(20)).unwrap();
+        let mut ready = Vec::new();
+        assert!(tokio::time::timeout(Duration::from_millis(10), rx.recv_many(&mut ready, 8)).await.is_err());
+        assert!(ready.is_empty());
+
+        senders[1].try_send(status_at(10)).unwrap();
+        senders[1].try_send(FileEvent::CaughtUp).unwrap();
+        senders[0].try_send(FileEvent::CaughtUp).unwrap();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+        assert!(matches!(&ready[0], FileEvent::OrderStatus(_)));
+        assert!(matches!(&ready[1], FileEvent::OrderDiff(_)));
+
+        ready.clear();
+        senders[0].try_send(diff_at(21)).unwrap();
+        senders[0].try_send(FileEvent::CaughtUp).unwrap();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 1, "a quiet status stream must not stall diffs");
+        drop(senders);
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 0);
+    }
+
+    #[tokio::test]
+    async fn merge_preserves_source_order_and_alternates_equal_height_lines() {
+        let (senders, mut rx) = file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 16);
+        for event in [diff_at(10), diff_at(10), diff_at(12)] {
+            senders[0].try_send(event).unwrap();
+        }
+        for event in [status_at(10), status_at(10), status_at(11)] {
+            senders[1].try_send(event).unwrap();
+        }
+        drop(senders);
+        let mut ready = Vec::new();
+        assert_eq!(rx.recv_many(&mut ready, 16).await, 6);
+        assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
+        assert!(matches!(&ready[1], FileEvent::OrderStatus(_)));
+        assert!(matches!(&ready[2], FileEvent::OrderDiff(_)));
+        assert!(matches!(&ready[3], FileEvent::OrderStatus(_)));
+        assert!(matches!(&ready[4], FileEvent::OrderStatus(line) if line.contains("11")));
+        assert!(matches!(&ready[5], FileEvent::OrderDiff(line) if line.contains("12")));
+    }
+
+    #[tokio::test]
+    async fn merge_checks_for_new_backlog_after_an_eof_marker() {
+        let (senders, mut rx) = file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 8);
+        senders[0].try_send(FileEvent::CaughtUp).unwrap();
+        senders[0].try_send(diff_at(10)).unwrap();
+        senders[1].try_send(status_at(20)).unwrap();
+        drop(senders);
+        let mut ready = Vec::new();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+        assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
+        assert!(matches!(&ready[1], FileEvent::OrderStatus(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_keeps_gaps_and_malformed_lines_for_the_repair_path() {
+        let (senders, mut rx) = file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 8);
+        senders[0].try_send(FileEvent::ContinuityLost(EventSource::OrderDiffs)).unwrap();
+        senders[0].try_send(FileEvent::OrderDiff("malformed".to_string())).unwrap();
+        senders[0].try_send(diff_at(10)).unwrap();
+        drop(senders);
+        let mut ready = Vec::new();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 3);
+        assert!(matches!(&ready[0], FileEvent::ContinuityLost(EventSource::OrderDiffs)));
+        assert!(matches!(&ready[1], FileEvent::OrderDiff(line) if line == "malformed"));
+        assert!(matches!(&ready[2], FileEvent::OrderDiff(line) if line.contains("10")));
+    }
+
+    #[tokio::test]
+    async fn fills_do_not_wait_for_book_readers_and_do_not_hold_up_book_events() {
+        let (senders, mut rx) =
+            file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);
+        senders[2].try_send(FileEvent::Fill(r#"{"block_number":10}"#.to_string())).unwrap();
+        let mut ready = Vec::new();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 1);
+        assert!(matches!(&ready[0], FileEvent::Fill(_)));
+
+        ready.clear();
+        senders[0].try_send(diff_at(11)).unwrap();
+        senders[0].try_send(FileEvent::CaughtUp).unwrap();
+        senders[1].try_send(FileEvent::CaughtUp).unwrap();
+        assert_eq!(rx.recv_many(&mut ready, 8).await, 1);
+        assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
+    }
+
+    #[test]
+    fn readers_report_eof_after_submitting_available_lines() {
+        let base_dir = stream_test_dir("reader-eof");
+        let day_dir = base_dir.join("hourly/20260916");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("19");
+        std::fs::write(&path, "").unwrap();
+        let mut reader = FileReader::new(base_dir.clone());
+        reader.start_tracking(&path);
+        append_to_file(&path, "{\"block_number\":10}\n");
+        let (tx, mut rx) = channel(2);
+        let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx };
+        assert!(submit_available(&sink, &mut reader));
+        assert!(matches!(rx.try_recv(), Ok(FileEvent::OrderDiff(_))));
+        assert!(rx.try_recv().is_err(), "the node may have appended while the previous read was sent");
+        assert!(submit_available(&sink, &mut reader));
+        assert!(matches!(rx.try_recv(), Ok(FileEvent::CaughtUp)));
+        std::fs::remove_dir_all(base_dir).unwrap();
     }
 
     #[test]
