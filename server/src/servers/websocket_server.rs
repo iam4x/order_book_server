@@ -236,8 +236,6 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let ignore_spot = !config.include_spot; // For OrderBookListener (legacy)
     let compression_level = config.compression_level;
 
-    // Resolve data directory
-    // Central task: listen to messages and forward them for distribution
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
         let mut listener = OrderBookListener::new(Some(internal_message_tx), ignore_spot, config.features);
@@ -725,7 +723,7 @@ async fn handle_socket(
                 }
             }
 
-            _ = outbound.closed() => {
+            _ = outbound.data_tx.closed() => {
                 break;
             }
         }
@@ -979,10 +977,6 @@ impl Outbound {
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
-
-    async fn closed(&self) {
-        self.data_tx.closed().await;
-    }
 }
 
 fn spawn_writer(socket: WebSocket) -> (WsRead, Outbound, WsWriter) {
@@ -1056,11 +1050,8 @@ fn filter_universe(
 ) -> HashSet<String> {
     universe
         .iter()
-        .filter_map(|c| {
-            let include =
-                (c.is_perp() && include_perps) || (c.is_spot() && include_spot) || (c.is_hip3() && include_hip3);
-            if include { Some(c.clone().value()) } else { None }
-        })
+        .filter(|coin| market_filter_allows_coin_ref(coin, (include_perps, include_spot, include_hip3)))
+        .map(Coin::value)
         .collect()
 }
 
@@ -1232,16 +1223,23 @@ mod tests {
 
         registrations.register(&default_levels);
         registrations.register(&ten_levels);
+        registrations.register(&ten_levels);
+        let mut other_connection = ConnectionL2Registrations::new(Arc::clone(&registry));
+        other_connection.register(&default_levels);
         registrations.unregister(&default_levels);
 
+        assert!(registry.active_keys().contains(&default_key));
+        drop(other_connection);
         assert!(!registry.active_keys().contains(&default_key));
         assert!(registry.active_keys().contains(&ten_levels_key));
-        assert!(registry.active_coins().contains(&Coin::new("BTC")));
 
         registrations.unregister(&ten_levels);
 
         assert!(registry.active_keys().is_empty());
-        assert!(registry.active_coins().is_empty());
+
+        registrations.register(&ten_levels);
+        drop(registrations);
+        assert!(registry.active_keys().is_empty());
     }
 
     #[test]
@@ -1474,7 +1472,7 @@ mod tests {
 
         assert!(!outbound.send_payload(bytes::Bytes::from_static(b"x")));
         assert!(!outbound.send_pong());
-        outbound.closed().await;
+        outbound.data_tx.closed().await;
         drop(outbound);
     }
 
@@ -1683,7 +1681,7 @@ fn send_ws_order_updates(outbound: &Outbound, subscription: &Subscription, batch
         let user_updates: Vec<OrderUpdate> = statuses
             .into_iter()
             .filter(|status| status.user == user_addr)
-            .map(|status| OrderUpdate::new(status.user, time, height, status))
+            .map(|status| OrderUpdate { user: status.user, time, height, order_status: status })
             .collect();
 
         if !user_updates.is_empty() {

@@ -46,46 +46,9 @@ impl<O: InnerOrder> OrderBook<O> {
 }
 
 impl Snapshot<InnerLevel> {
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn to_l2_snapshot(
-        &self,
-        n_levels: Option<usize>,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u64>,
-    ) -> Self {
-        let [bids, asks] = &self.0;
-        let bids = l2_levels_to_l2_levels(bids, Side::Bid, n_levels, n_sig_figs, mantissa);
-        let asks = l2_levels_to_l2_levels(asks, Side::Ask, n_levels, n_sig_figs, mantissa);
-        Self([bids, asks])
-    }
-
     pub(crate) fn export_inner_snapshot(self) -> [Vec<Level>; 2] {
         self.0.map(|b| b.into_iter().map(Level::from).collect())
     }
-}
-
-#[must_use]
-#[cfg(test)]
-fn l2_levels_to_l2_levels(
-    levels: &[InnerLevel],
-    side: Side,
-    n_levels: Option<usize>,
-    n_sig_figs: Option<u32>,
-    mantissa: Option<u64>,
-) -> Vec<InnerLevel> {
-    let mut new_levels = Vec::new();
-    if n_levels == Some(0) {
-        return new_levels;
-    }
-    let mut cur_level: Option<InnerLevel> = None;
-    for level in levels {
-        if build_l2_level(&mut cur_level, &mut new_levels, n_levels, n_sig_figs, mantissa, side, level.clone()) {
-            break;
-        }
-    }
-    new_levels.extend(cur_level.take());
-    new_levels
 }
 
 #[must_use]
@@ -187,7 +150,7 @@ fn map_to_l2_levels_many(
         .collect()
 }
 
-pub(super) fn build_l2_level(
+fn build_l2_level(
     cur_level: &mut Option<InnerLevel>,
     levels: &mut Vec<InnerLevel>,
     n_levels: Option<usize>,
@@ -283,7 +246,7 @@ mod tests {
     #[test]
     fn test_l2_no_aggregation() {
         let book = make_book(&[(500, 100, 2), (400, 200, 1)], &[(600, 150, 1), (700, 300, 1)]);
-        let snapshot = book.to_l2_snapshot(None, None, None);
+        let snapshot = book.to_l2_snapshots(None, &[(None, None)]).remove(0);
         let [bids, asks] = to_levels(snapshot);
         assert_eq!(bids, vec![(500, 200, 2), (400, 200, 1)]);
         assert_eq!(asks, vec![(600, 150, 1), (700, 300, 1)]);
@@ -293,7 +256,7 @@ mod tests {
     fn test_l2_n_levels_truncation() {
         let book =
             make_book(&[(500, 100, 1), (400, 100, 1), (300, 100, 1)], &[(600, 100, 1), (700, 100, 1), (800, 100, 1)]);
-        let snapshot = book.to_l2_snapshot(Some(2), None, None);
+        let snapshot = book.to_l2_snapshots(Some(2), &[(None, None)]).remove(0);
         let [bids, asks] = to_levels(snapshot);
         assert_eq!(bids.len(), 2);
         assert_eq!(asks.len(), 2);
@@ -319,7 +282,7 @@ mod tests {
     #[test]
     fn test_l2_zero_levels() {
         let book = make_book(&[(500, 100, 1)], &[(600, 100, 1)]);
-        let snapshot = book.to_l2_snapshot(Some(0), None, None);
+        let snapshot = book.to_l2_snapshots(Some(0), &[(None, None)]).remove(0);
         let [bids, asks] = to_levels(snapshot);
         assert!(bids.is_empty());
         assert!(asks.is_empty());
@@ -337,7 +300,7 @@ mod tests {
                 (342_000_000_000, 100, 1), // 3420.0
             ],
         );
-        let snapshot = book.to_l2_snapshot(None, Some(2), None);
+        let snapshot = book.to_l2_snapshots(None, &[(Some(2), None)]).remove(0);
         let [bids, _] = to_levels(snapshot);
         // With 2 sig figs, bids at 3401 and 3405 both bucket to 3400
         assert_eq!(bids.len(), 1);
@@ -366,19 +329,9 @@ mod tests {
     }
 
     #[test]
-    fn test_l2_from_l2_matches_l2_from_l4() {
-        let book =
-            make_book(&[(500, 100, 3), (490, 200, 2), (480, 50, 1)], &[(510, 100, 2), (520, 200, 1), (530, 50, 1)]);
-        let raw_l2 = book.to_l2_snapshot(None, None, None);
-        let from_l4 = book.to_l2_snapshot(Some(2), Some(2), None);
-        let from_l2 = raw_l2.to_l2_snapshot(Some(2), Some(2), None);
-        assert_eq!(to_levels(from_l4), to_levels(from_l2));
-    }
-
-    #[test]
     fn test_export_inner_snapshot_converts_to_level() {
         let book = make_book(&[(500, 100, 1)], &[(600, 200, 1)]);
-        let snapshot = book.to_l2_snapshot(None, None, None);
+        let snapshot = book.to_l2_snapshots(None, &[(None, None)]).remove(0);
         let exported = snapshot.export_inner_snapshot();
         assert_eq!(exported[0].len(), 1);
         assert_eq!(exported[1].len(), 1);

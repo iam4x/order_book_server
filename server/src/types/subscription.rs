@@ -162,12 +162,6 @@ pub(crate) struct OrderUpdate {
     pub order_status: NodeDataOrderStatus,
 }
 
-impl OrderUpdate {
-    pub(crate) fn new(user: Address, time: u64, height: u64, order_status: NodeDataOrderStatus) -> Self {
-        Self { user, time, height, order_status }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "channel", content = "data")]
 #[serde(rename_all = "camelCase")]
