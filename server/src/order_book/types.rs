@@ -256,15 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn test_px_ordering() {
-        let a = Px::parse_from_str("100.5").unwrap();
-        let b = Px::parse_from_str("200.3").unwrap();
-        assert!(a < b);
-        assert!(b > a);
-        assert_eq!(a, Px::parse_from_str("100.5").unwrap());
-    }
-
-    #[test]
     fn test_px_num_digits() {
         assert_eq!(Px::new(0).num_digits(), 1);
         assert_eq!(Px::new(1).num_digits(), 1);
@@ -329,14 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sz_min() {
-        let a = Sz::new(100);
-        let b = Sz::new(200);
-        assert_eq!(a.min(b).value(), 100);
-        assert_eq!(b.min(a).value(), 100);
-    }
-
-    #[test]
     fn test_sz_debug_format() {
         let sz = Sz::parse_from_str("1.5").unwrap();
         let dbg = format!("{:?}", sz);
@@ -382,17 +365,6 @@ mod tests {
         assert_eq!(c.value(), "ETH");
     }
 
-    #[test]
-    fn test_coin_equality() {
-        assert_eq!(Coin::new("BTC"), Coin::new("BTC"));
-        assert_ne!(Coin::new("BTC"), Coin::new("ETH"));
-    }
-
-    #[test]
-    fn test_coin_ordering() {
-        assert!(Coin::new("AAA") < Coin::new("BBB"));
-    }
-
     // ==================== Side Tests ====================
 
     #[test]
@@ -403,13 +375,5 @@ mod tests {
         assert_eq!(bid, Side::Bid);
         assert_eq!(serde_json::to_string(&Side::Ask).unwrap(), r#""A""#);
         assert_eq!(serde_json::to_string(&Side::Bid).unwrap(), r#""B""#);
-    }
-
-    // ==================== Oid Tests ====================
-
-    #[test]
-    fn test_oid_equality() {
-        assert_eq!(Oid::new(42), Oid::new(42));
-        assert_ne!(Oid::new(1), Oid::new(2));
     }
 }

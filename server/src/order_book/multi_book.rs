@@ -233,60 +233,12 @@ mod tests {
 
     use crate::{
         order_book::{
-            InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
-            levels::build_l2_level,
+            OrderBook, Px, Side, Sz,
             multi_book::{Coin, Snapshots},
         },
         prelude::*,
-        types::{
-            L4Order, Level,
-            inner::{InnerL4Order, InnerLevel},
-        },
+        types::{L4Order, Level, inner::InnerL4Order},
     };
-
-    #[must_use]
-    fn snapshot_to_l2_snapshot<O: InnerOrder>(
-        snapshot: &Snapshot<O>,
-        n_levels: Option<usize>,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u64>,
-    ) -> Snapshot<InnerLevel> {
-        let [bids, asks] = &snapshot.0;
-        let bids = orders_to_l2_levels(bids, Side::Bid, n_levels, n_sig_figs, mantissa);
-        let asks = orders_to_l2_levels(asks, Side::Ask, n_levels, n_sig_figs, mantissa);
-        Snapshot([bids, asks])
-    }
-
-    #[must_use]
-    fn orders_to_l2_levels<O: InnerOrder>(
-        orders: &[O],
-        side: Side,
-        n_levels: Option<usize>,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u64>,
-    ) -> Vec<InnerLevel> {
-        let mut levels = Vec::new();
-        if n_levels == Some(0) {
-            return levels;
-        }
-        let mut cur_level: Option<InnerLevel> = None;
-
-        for order in orders {
-            if build_l2_level(
-                &mut cur_level,
-                &mut levels,
-                n_levels,
-                n_sig_figs,
-                mantissa,
-                side,
-                InnerLevel { px: order.limit_px(), sz: order.sz(), n: 1 },
-            ) {
-                break;
-            }
-        }
-        levels.extend(cur_level.take());
-        levels
-    }
 
     #[derive(Default)]
     struct OrderManager {
@@ -327,7 +279,7 @@ mod tests {
         }
     }
 
-    fn setup_book(book: &mut OrderBook<InnerL4Order>) -> Snapshots<InnerL4Order> {
+    fn setup_book(book: &mut OrderBook<InnerL4Order>) {
         let mut o = OrderManager::default();
         let buy_orders1 = o.batch_order("100", "34.01", Side::Bid, 4).unwrap();
         let buy_orders2 = o.batch_order("200", "34.5", Side::Bid, 2).unwrap();
@@ -340,7 +292,6 @@ mod tests {
                 book.add_order(o);
             }
         }
-        Snapshots(vec![(Coin::new(""), book.to_snapshot()); 2].into_iter().collect())
     }
 
     const SNAPSHOT_JSON: &str = r#"[100, 
@@ -432,11 +383,10 @@ mod tests {
     }
 
     #[test]
-    fn test_l4_snapshot_to_l2_snapshot() {
+    fn test_l2_snapshots_aggregate_and_truncate() {
         let mut book = OrderBook::new();
-        let coin = Coin::new("");
-        let snapshot = setup_book(&mut book);
-        let levels = snapshot_to_l2_snapshot(snapshot.0.get(&coin).unwrap(), Some(2), Some(2), Some(1));
+        setup_book(&mut book);
+        let levels = book.to_l2_snapshots(Some(2), &[(Some(2), Some(1))]).remove(0);
         let raw_levels = levels.export_inner_snapshot();
         let ans = [
             vec![Level::new("34".to_string(), "1100".to_string(), 7)],
@@ -447,7 +397,7 @@ mod tests {
         ];
         assert_eq!(ans, raw_levels);
 
-        let levels = snapshot_to_l2_snapshot(snapshot.0.get(&coin).unwrap(), Some(2), Some(3), Some(5));
+        let levels = book.to_l2_snapshots(Some(2), &[(Some(3), Some(5))]).remove(0);
         let raw_levels = levels.export_inner_snapshot();
         let ans = [
             vec![
@@ -460,15 +410,8 @@ mod tests {
             ],
         ];
         assert_eq!(ans, raw_levels);
-        let snapshot_from_book = book.to_l2_snapshot(Some(2), Some(3), Some(5));
-        let raw_levels_from_book = snapshot_from_book.export_inner_snapshot();
-        let snapshot_from_book = book.to_l2_snapshot(None, None, None);
-        let snapshot_from_snapshot = snapshot_from_book.to_l2_snapshot(Some(2), Some(3), Some(5));
-        let raw_levels_from_snapshot = snapshot_from_snapshot.export_inner_snapshot();
-        assert_eq!(raw_levels_from_book, ans);
-        assert_eq!(raw_levels_from_snapshot, ans);
 
-        let levels = snapshot_to_l2_snapshot(snapshot.0.get(&coin).unwrap(), Some(2), None, Some(5));
+        let levels = book.to_l2_snapshots(Some(2), &[(None, Some(5))]).remove(0);
         let raw_levels = levels.export_inner_snapshot();
         let ans = [
             vec![

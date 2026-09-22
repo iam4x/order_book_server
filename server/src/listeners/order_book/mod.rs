@@ -280,49 +280,19 @@ impl AllBboSubscriptionRegistry {
 
 #[derive(Default)]
 pub(crate) struct L2SubscriptionRegistry {
-    params: StdMutex<HashMap<L2SnapshotParams, usize>>,
-    coins: StdMutex<HashMap<Coin, usize>>,
     keys: StdMutex<HashMap<L2SubscriptionKey, usize>>,
 }
 
 impl L2SubscriptionRegistry {
-    fn params(&self) -> StdMutexGuard<'_, HashMap<L2SnapshotParams, usize>> {
-        self.params.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn coins(&self) -> StdMutexGuard<'_, HashMap<Coin, usize>> {
-        self.coins.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     fn keys(&self) -> StdMutexGuard<'_, HashMap<L2SubscriptionKey, usize>> {
         self.keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn register_l2(&self, key: L2SubscriptionKey) {
-        *self.params().entry(key.params).or_insert(0) += 1;
-        *self.coins().entry(key.coin.clone()).or_insert(0) += 1;
         *self.keys().entry(key).or_insert(0) += 1;
     }
 
     pub(crate) fn unregister_l2(&self, key: &L2SubscriptionKey) {
-        let mut counts = self.params();
-        if let Some(count) = counts.get_mut(&key.params) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&key.params);
-            }
-        }
-        drop(counts);
-
-        let mut counts = self.coins();
-        if let Some(count) = counts.get_mut(&key.coin) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&key.coin);
-            }
-        }
-        drop(counts);
-
         let mut counts = self.keys();
         if let Some(count) = counts.get_mut(key) {
             *count -= 1;
@@ -330,16 +300,6 @@ impl L2SubscriptionRegistry {
                 counts.remove(key);
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_params(&self) -> HashSet<L2SnapshotParams> {
-        self.params().keys().copied().collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_coins(&self) -> HashSet<Coin> {
-        self.coins().keys().cloned().collect()
     }
 
     pub(crate) fn active_keys(&self) -> HashSet<L2SubscriptionKey> {
@@ -1215,8 +1175,6 @@ impl OrderBookListener {
         FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
         let process_start = Instant::now();
 
-        // HFT mode: Process events DIRECTLY without block-level synchronization
-        // This is arbor's key insight - process independently with order-level caching
         let result = match event_batch {
             EventBatch::Orders(batch) => {
                 let should_broadcast = self.features.l4book() || self.features.orderupdates();
@@ -1302,9 +1260,6 @@ impl OrderBookListener {
             self.order_book_state.as_mut().map(OrderBookState::take_repair_reasons).unwrap_or_default();
         self.request_pending_repairs(pending_repair_reasons);
 
-        // Fast BBO broadcast - ONLY for coins that changed AND only when someone is
-        // listening. Without the receiver-count gate we'd `get_bbos_for_coins` and
-        // spawn a tokio task per change even with zero subscribers, wasting CPU.
         if !changed_coins.is_empty() {
             if self.features.l2book() {
                 self.pending_l2_changed_coins.extend(changed_coins.iter().cloned());
@@ -1323,8 +1278,6 @@ impl OrderBookListener {
                         if tx.receiver_count() > 0 {
                             let bbo_start = Instant::now();
                             let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                            // broadcast::Sender::send is non-blocking; the previous
-                            // tokio::spawn wrapper added task overhead with no benefit.
                             let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
                             drop(tx.send(msg));
                             BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
@@ -1527,11 +1480,6 @@ impl PreparedL2Book {
         &self.payload
     }
 }
-
-// ============================================================================
-// HFT-OPTIMIZED VERSION
-// Uses parallel file watchers and immediate OrderDiff processing
-// ============================================================================
 
 pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
     let dir = match config.data_dir.clone() {
@@ -1946,7 +1894,7 @@ mod tests {
         // that a throttled change invalidates this cached entry before the next L2 send.
         let state = listener.order_book_state.as_ref().expect("state initialized");
         let empty = HashSet::new();
-        let requested_params = listener.l2_subscription_registry.active_params();
+        let requested_params = HashSet::from([L2SnapshotParams::new(None, None)]);
         let (_time, seeded) =
             state.l2_snapshots_incremental(&empty, &requested_params, &mut listener.l2_snapshot_cache);
         assert_eq!(l2_best_bid_sz(&seeded, "BTC"), "1");
