@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{Router, extract::Query, response::IntoResponse, routing::get};
+use axum::{Router, extract::Query, response::IntoResponse, routing::get, serve::ListenerExt};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
 use serde::Deserialize;
@@ -332,7 +332,11 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             }),
         );
 
-    let tcp_listener = TcpListener::bind(&config.address).await?;
+    let tcp_listener = TcpListener::bind(&config.address).await?.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            log::warn!("failed to set TCP_NODELAY on incoming connection: {err}");
+        }
+    });
     info!("WebSocket server running at ws://{}", config.address);
 
     if let Err(err) = axum::serve(tcp_listener, app).await {

@@ -194,7 +194,14 @@ async fn start_metrics_server(port: u16) {
 
     log::info!("Metrics server listening on http://{}/metrics", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("failed to bind metrics port");
+    use axum::serve::ListenerExt;
+
+    let listener =
+        tokio::net::TcpListener::bind(&addr).await.expect("failed to bind metrics port").tap_io(|tcp_stream| {
+            if let Err(err) = tcp_stream.set_nodelay(true) {
+                log::warn!("failed to set TCP_NODELAY on metrics connection: {err}");
+            }
+        });
     axum::serve(listener, app).await.expect("metrics server failed");
 }
 
