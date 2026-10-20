@@ -462,7 +462,7 @@ fn fetch_snapshot(
             .await?;
             let height_source = loaded_snapshot.height_source;
             let visor_heights = (visor_height_before.ok(), visor_height_after.as_ref().ok().copied());
-            let SnapshotHeights { state_height, replay_guard_height } = snapshot_heights(
+            let heights = snapshot_heights(
                 height_source,
                 loaded_snapshot.height,
                 state_height_before,
@@ -480,6 +480,7 @@ fn fetch_snapshot(
                 .ok_or("Snapshot replay journal has not captured a line from every book stream yet")?;
             // The block at each source's journal start may straddle the start of
             // capture, so every block through the latest start comes from disk.
+            let SnapshotHeights { state_height, replay_guard_height } = heights;
             let replay_cutoff_height = state_height.max(journal_start_height);
             let mut new_order_book =
                 OrderBookState::from_snapshot(loaded_snapshot.snapshots, state_height, 0, ignore_spot, book_mode);
@@ -501,18 +502,8 @@ fn fetch_snapshot(
                 visor_heights.0, visor_heights.1, history.replayed_lines
             );
 
-            let mut listener = listener.lock().await;
-            let outcome = listener.install_snapshot_state_with_replay_cutoff(
-                new_order_book,
-                replay_guard_height,
-                replay_cutoff_height,
-                kind,
-            )?;
-            if !history.clean && matches!(outcome, SnapshotInstallOutcome::Installed { .. }) {
-                listener.request_repair("replay_apply");
-            }
-            drop(listener);
-            Ok(outcome)
+            let prepared = PreparedSnapshot { state: new_order_book, heights, replay_cutoff_height, history };
+            listener.lock().await.install_snapshot(prepared, kind)
         }
         .await;
 
@@ -561,6 +552,14 @@ async fn start_snapshot_if_due(
     true
 }
 
+/// A snapshot state with its disk history applied, ready to replay the journal and install.
+struct PreparedSnapshot {
+    state: OrderBookState,
+    heights: SnapshotHeights,
+    replay_cutoff_height: u64,
+    history: SnapshotReplayOutcome,
+}
+
 struct SnapshotReplayOutcome {
     replayed_lines: usize,
     clean: bool,
@@ -569,6 +568,10 @@ struct SnapshotReplayOutcome {
 impl SnapshotReplayOutcome {
     const fn new() -> Self {
         Self { replayed_lines: 0, clean: true }
+    }
+
+    const fn merge(self, other: Self) -> Self {
+        Self { replayed_lines: self.replayed_lines + other.replayed_lines, clean: self.clean && other.clean }
     }
 
     /// Apply one replayed stream line with a block above `after_height` to `state`.
@@ -862,13 +865,30 @@ impl OrderBookListener {
         self.install_snapshot_state_with_replay_cutoff(new_order_book, snapshot_height, snapshot_height, kind)
     }
 
+    #[cfg(test)]
     fn install_snapshot_state_with_replay_cutoff(
         &mut self,
-        mut new_order_book: OrderBookState,
-        snapshot_height: u64,
+        state: OrderBookState,
+        replay_guard_height: u64,
         replay_cutoff_height: u64,
         kind: SnapshotTaskKind,
     ) -> Result<SnapshotInstallOutcome> {
+        let heights = SnapshotHeights { state_height: state.height(), replay_guard_height };
+        let history = SnapshotReplayOutcome::new();
+        self.install_snapshot(PreparedSnapshot { state, heights, replay_cutoff_height, history }, kind)
+    }
+
+    fn install_snapshot(
+        &mut self,
+        prepared: PreparedSnapshot,
+        kind: SnapshotTaskKind,
+    ) -> Result<SnapshotInstallOutcome> {
+        let PreparedSnapshot {
+            state: mut new_order_book,
+            heights: SnapshotHeights { state_height, replay_guard_height },
+            replay_cutoff_height,
+            history,
+        } = prepared;
         let replay_cache = self.snapshot_replay_cache.take().unwrap_or_default();
         let captured_repair_epoch = replay_cache.repair_epoch;
         if replay_cache.overflowed {
@@ -877,7 +897,7 @@ impl OrderBookListener {
             let failure_reason = replay_cache.failure_reason.as_deref().unwrap_or("unknown replay journal failure");
             if kind == SnapshotTaskKind::Refresh {
                 warn!(
-                    "Skipping background snapshot refresh at height {snapshot_height}: replay journal failed \
+                    "Skipping background snapshot refresh at state height {state_height}: replay journal failed \
                      ({cached_lines} lines / {cached_bytes} bytes): {failure_reason}"
                 );
                 return Ok(SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes });
@@ -891,12 +911,12 @@ impl OrderBookListener {
 
         if kind == SnapshotTaskKind::Refresh && replay_cutoff_height < replay_cache.started_book_height {
             warn!(
-                "Skipping background snapshot refresh at height {snapshot_height}: replay cutoff {replay_cutoff_height} \
-                 was behind current book height {} when replay capture started",
+                "Skipping background snapshot refresh at state height {state_height}: replay cutoff \
+                 {replay_cutoff_height} was behind current book height {} when replay capture started",
                 replay_cache.started_book_height
             );
             return Ok(SnapshotInstallOutcome::SkippedStaleSnapshot {
-                snapshot_height,
+                snapshot_height: state_height,
                 replay_cutoff_height,
                 started_book_height: replay_cache.started_book_height,
             });
@@ -905,8 +925,9 @@ impl OrderBookListener {
         let current_time = (kind == SnapshotTaskKind::Refresh)
             .then(|| self.order_book_state.as_ref().map(OrderBookState::time))
             .flatten();
-        let replay_outcome =
-            replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, snapshot_height, replay_cache)?;
+        let journal =
+            replay_snapshot_cache(&mut new_order_book, replay_cutoff_height, replay_guard_height, replay_cache)?;
+        let replay_outcome = history.merge(journal);
         let replay_repair_reasons = new_order_book.take_repair_reasons();
         let replay_clean = replay_outcome.clean && replay_repair_reasons.is_empty();
         if let Some(current_time) = current_time {
@@ -916,7 +937,7 @@ impl OrderBookListener {
         }
         let old_universe = self.last_universe.clone();
         let reset_l2_version = kind == SnapshotTaskKind::Initial;
-        self.replace_order_book_state(new_order_book, replay_cutoff_height, snapshot_height, reset_l2_version);
+        self.replace_order_book_state(new_order_book, replay_cutoff_height, replay_guard_height, reset_l2_version);
         if replay_clean {
             self.repair_completed_epoch = self.repair_completed_epoch.max(captured_repair_epoch);
         } else {
@@ -926,8 +947,8 @@ impl OrderBookListener {
         self.broadcast_universe_after_snapshot(old_universe);
         self.force_snapshot_refresh_updates();
         info!(
-            "Order book ready at height {snapshot_height}; replay cutoff {replay_cutoff_height}; replayed \
-             {} cached stream lines",
+            "Order book ready at state height {state_height}; replay cutoff {replay_cutoff_height}; replayed \
+             {} stream lines",
             replay_outcome.replayed_lines
         );
         Ok(SnapshotInstallOutcome::Installed { replayed_lines: replay_outcome.replayed_lines })
@@ -1707,7 +1728,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
                         match outcome {
                             SnapshotInstallOutcome::Installed { replayed_lines } => {
-                                info!("{kind:?} snapshot installed after replaying {replayed_lines} cached lines");
+                                info!("{kind:?} snapshot installed after replaying {replayed_lines} stream lines");
                             }
                             SnapshotInstallOutcome::SkippedReplayOverflow { cached_lines, cached_bytes } => {
                                 warn!(
@@ -2433,6 +2454,27 @@ mod tests {
     }
 
     #[test]
+    fn unclean_disk_history_keeps_the_repair_pending_after_install() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+        listener.request_repair("stream_gap");
+        let install = |listener: &mut OrderBookListener, clean: bool| {
+            listener.begin_snapshot_replay();
+            let state = order_book_state_with_bids(&[("BTC", &[(1, "100", "1")])], 10);
+            let heights = SnapshotHeights { state_height: 10, replay_guard_height: 10 };
+            let history = SnapshotReplayOutcome { replayed_lines: 1, clean };
+            let prepared = PreparedSnapshot { state, heights, replay_cutoff_height: 10, history };
+            listener.install_snapshot(prepared, SnapshotTaskKind::Refresh).expect("refresh installs")
+        };
+
+        assert_eq!(install(&mut listener, false), SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert!(listener.repair_pending());
+
+        assert_eq!(install(&mut listener, true), SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+        assert!(!listener.repair_pending());
+    }
+
+    #[test]
     fn diffs_only_status_stream_faults_do_not_request_snapshot_repair() {
         let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("l2book,orderupdates"));
@@ -2755,18 +2797,13 @@ mod tests {
         let history =
             replay_stream_history(&mut new_state, &data_dir, state_height, replay_cutoff_height, visor_height)
                 .expect("history covers the replay window");
-        let outcome = listener
-            .install_snapshot_state_with_replay_cutoff(
-                new_state,
-                visor_height,
-                replay_cutoff_height,
-                SnapshotTaskKind::Refresh,
-            )
-            .expect("refresh installs");
-
         assert_eq!(journal_start_height, 21);
         assert_eq!(history.replayed_lines, 4);
-        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        let heights = SnapshotHeights { state_height, replay_guard_height: visor_height };
+        let prepared = PreparedSnapshot { state: new_state, heights, replay_cutoff_height, history };
+        let outcome = listener.install_snapshot(prepared, SnapshotTaskKind::Refresh).expect("refresh installs");
+
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 4 });
         assert_eq!(
             btc_orders(&mut listener),
             vec![
