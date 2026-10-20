@@ -1165,14 +1165,6 @@ impl OrderBookListener {
         self.ready_l2_job.take()
     }
 
-    fn mark_books_idle(&mut self, now: Instant) {
-        self.block_gate.on_books_idle(now);
-    }
-
-    fn block_quiet_deadline(&self) -> Option<Instant> {
-        self.block_gate.quiet_deadline()
-    }
-
     /// A late timer can fire with lines already queued; applying them decides whether the block ended.
     fn close_quiet_block(&mut self, now: Instant, file_events: &parallel::FileEventReceiver) {
         if file_events.queued_book_lines() == 0 && self.block_gate.close_if_quiet(now) {
@@ -1303,16 +1295,10 @@ impl OrderBookListener {
         FILE_EVENTS_TOTAL.with_label_values(&[source_label]).inc();
         FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
         if apply_to_book {
-            match event_source {
-                EventSource::OrderDiffs => {
-                    if self.block_gate.close_before_diff(height) {
-                        self.publish_complete_block();
-                    }
-                    self.block_gate = BlockGate::open(height);
-                }
-                EventSource::OrderStatuses => self.block_gate.on_status_line(),
-                EventSource::Fills => {}
+            if self.block_gate.closes_before(event_source, height) {
+                self.publish_complete_block();
             }
+            self.block_gate.open_for(event_source, height);
         }
         let process_start = Instant::now();
 
@@ -1775,7 +1761,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         let now = Instant::now();
                         let repair_pending = {
                             let listener = listener.lock().await;
-                            quiet_deadline = listener.block_quiet_deadline();
+                            quiet_deadline = listener.block_gate.quiet_deadline();
                             listener.repair_pending()
                         };
                         if repair_pending {
@@ -1852,10 +1838,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 for event in events {
                     match event {
                         ReadyEvent::Parsed(parsed) => listener.apply_parsed_hft(parsed),
-                        ReadyEvent::BooksCaughtUp => listener.mark_books_idle(Instant::now()),
+                        ReadyEvent::BooksCaughtUp => listener.block_gate.on_books_idle(Instant::now()),
                     }
                 }
-                quiet_deadline = listener.block_quiet_deadline();
+                quiet_deadline = listener.block_gate.quiet_deadline();
             }
         }
     }
@@ -3847,7 +3833,7 @@ mod tests {
 
     fn close_block_after_quiet(listener: &mut OrderBookListener) {
         let now = Instant::now();
-        listener.mark_books_idle(now);
+        listener.block_gate.on_books_idle(now);
         listener.close_quiet_block(now + block_gate::BLOCK_QUIET, &drained_file_events());
     }
 
@@ -3984,7 +3970,7 @@ mod tests {
         apply_btc_bid(&mut listener, 3, 11);
 
         let idle_at = Instant::now();
-        listener.mark_books_idle(idle_at);
+        listener.block_gate.on_books_idle(idle_at);
         listener.close_quiet_block(idle_at + Duration::from_millis(1), &drained_file_events());
         flush_l2_on_timer(&mut listener);
         assert_eq!(published_btc_bids(&mut rx), vec![]);
@@ -4010,7 +3996,7 @@ mod tests {
         senders[0].try_send(parallel::FileEvent::OrderDiff(btc_bid_line_in_block(3, "1", 11))).unwrap();
 
         let idle_at = Instant::now();
-        listener.mark_books_idle(idle_at);
+        listener.block_gate.on_books_idle(idle_at);
         listener.close_quiet_block(idle_at + block_gate::BLOCK_QUIET, &file_events);
         assert_eq!(published_btc_bids(&mut rx), vec![], "the queued block 11 line has not applied");
 
