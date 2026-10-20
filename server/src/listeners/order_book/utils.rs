@@ -1,9 +1,12 @@
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
+use chrono::NaiveDate;
 use log::{error, info};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tokio::process::Command;
@@ -74,10 +77,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
         }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
-            let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {
-                let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-                parent_dir.join("hyperliquid_data/abci_state.rmp")
-            });
+            let abci_path = get_abci_state_path(config);
             let output_path =
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
 
@@ -144,6 +144,56 @@ pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
         let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
         parent_dir.join("hyperliquid_data/visor_abci_state.json")
     })
+}
+
+/// Resolve the host path of `abci_state.rmp` from the override or `parent/hyperliquid_data/`.
+pub(super) fn get_abci_state_path(config: &SnapshotConfig) -> PathBuf {
+    config.abci_state_path.clone().unwrap_or_else(|| {
+        let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
+        parent_dir.join("hyperliquid_data/abci_state.rmp")
+    })
+}
+
+/// Resolve the block height `abci_state.rmp` was saved at. hl-node hard-links it to
+/// the latest `periodic_abci_states/<YYYYMMDD>/<height>.rmp`, so the periodic
+/// file sharing its inode names the height.
+pub(super) fn abci_state_height(abci_state_path: &Path, data_dir: &Path) -> Result<u64> {
+    let state = fs::metadata(abci_state_path)
+        .map_err(|err| format!("Failed to read abci state {}: {err}", abci_state_path.display()))?;
+    let periodic_dir = data_dir.join("periodic_abci_states");
+    let mut days = Vec::new();
+    for entry in fs::read_dir(&periodic_dir)
+        .map_err(|err| format!("Failed to list periodic abci states {}: {err}", periodic_dir.display()))?
+    {
+        let entry = entry?;
+        if let Some(day) = entry.file_name().to_str().and_then(|name| NaiveDate::parse_from_str(name, "%Y%m%d").ok()) {
+            days.push((day, entry.path()));
+        }
+    }
+    days.sort_unstable_by_key(|(day, _)| Reverse(*day));
+    for (_, day_dir) in days {
+        for entry in fs::read_dir(day_dir)? {
+            let entry = entry?;
+            let Some(height) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".rmp"))
+                .and_then(|height| height.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let metadata = entry.metadata()?;
+            if metadata.dev() == state.dev() && metadata.ino() == state.ino() {
+                return Ok(height);
+            }
+        }
+    }
+    Err(format!(
+        "No file in {} shares an inode with {}; cannot resolve the abci state height",
+        periodic_dir.display(),
+        abci_state_path.display()
+    )
+    .into())
 }
 
 impl L2SnapshotParams {
@@ -248,6 +298,58 @@ mod tests {
         order_book::{Px, Side, Sz, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
+
+    fn abci_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("orderbook-abci-{name}-{}", std::process::id()));
+        drop(fs::remove_dir_all(&path));
+        fs::create_dir_all(path.join("hyperliquid_data")).unwrap();
+        path
+    }
+
+    #[test]
+    fn abci_state_height_follows_periodic_hard_link() {
+        let dir = abci_test_dir("hard-link");
+        let periodic = dir.join("data/periodic_abci_states/20261020");
+        fs::create_dir_all(&periodic).unwrap();
+        fs::write(periodic.join("1190880000.rmp"), b"older").unwrap();
+        fs::write(periodic.join("1190890000.rmp"), b"state").unwrap();
+        let abci = dir.join("hyperliquid_data/abci_state.rmp");
+        fs::hard_link(periodic.join("1190890000.rmp"), &abci).unwrap();
+
+        assert_eq!(abci_state_height(&abci, &dir.join("data")).unwrap(), 1_190_890_000);
+    }
+
+    #[test]
+    fn abci_state_height_rejects_dangling_and_copied_state() {
+        let dir = abci_test_dir("unlinked");
+        let periodic = dir.join("data/periodic_abci_states/20261020");
+        fs::create_dir_all(&periodic).unwrap();
+        fs::write(periodic.join("1190890000.rmp"), b"state").unwrap();
+        let data_dir = dir.join("data");
+
+        let dangling = dir.join("hyperliquid_data/dangling.rmp");
+        std::os::unix::fs::symlink(periodic.join("1190900000.rmp"), &dangling).unwrap();
+        let err = abci_state_height(&dangling, &data_dir).unwrap_err().to_string();
+        assert!(err.starts_with("Failed to read abci state"), "{err}");
+
+        let copied = dir.join("hyperliquid_data/abci_state.rmp");
+        fs::copy(periodic.join("1190890000.rmp"), &copied).unwrap();
+        let err = abci_state_height(&copied, &data_dir).unwrap_err().to_string();
+        assert!(err.starts_with("No file in"), "{err}");
+    }
+
+    #[test]
+    fn abci_state_height_finds_save_in_previous_day_after_midnight() {
+        let dir = abci_test_dir("midnight");
+        let previous_day = dir.join("data/periodic_abci_states/20261019");
+        fs::create_dir_all(&previous_day).unwrap();
+        fs::create_dir_all(dir.join("data/periodic_abci_states/20261020")).unwrap();
+        fs::write(previous_day.join("1190890000.rmp"), b"state").unwrap();
+        let abci = dir.join("hyperliquid_data/abci_state.rmp");
+        fs::hard_link(previous_day.join("1190890000.rmp"), &abci).unwrap();
+
+        assert_eq!(abci_state_height(&abci, &dir.join("data")).unwrap(), 1_190_890_000);
+    }
 
     fn order(oid: u64, coin: &str, side: Side, sz: &str, px: &str) -> InnerL4Order {
         InnerL4Order {
