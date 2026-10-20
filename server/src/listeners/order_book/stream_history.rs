@@ -28,18 +28,8 @@ pub(super) fn replay_stream_history(
         .iter()
         .map(|&source| SourceCursor::open(source, data_dir, after_height, through_height, &mut outcome.clean))
         .collect::<Result<Vec<_>>>()?;
-    let count = cursors.len();
-    let mut last = count.saturating_sub(1);
-    // Within a block, rotate between sources line by line like the live receiver,
-    // so a large block cannot overflow one side's pending cache before the other arrives.
-    while let Some((_, _, index)) = cursors
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cursor)| {
-            cursor.head.as_ref().map(|(block, _)| (*block, (index + count - last - 1) % count, index))
-        })
-        .min()
-    {
+    let mut last = cursors.len().saturating_sub(1);
+    while let Some(index) = next_cursor(&cursors, last) {
         last = index;
         let cursor = &mut cursors[index];
         if let Some((_, line)) = cursor.head.take() {
@@ -48,6 +38,19 @@ pub(super) fn replay_stream_history(
         cursor.advance(&mut outcome.clean)?;
     }
     Ok(outcome)
+}
+
+/// The cursor whose head has the lowest block. Within a block, sources take turns
+/// line by line after `last`, like the live receiver, so a large block cannot
+/// overflow one side's pending cache before the other side's lines arrive.
+fn next_cursor(cursors: &[SourceCursor], last: usize) -> Option<usize> {
+    let turns_after_last = |index: usize| (index + cursors.len() - last - 1) % cursors.len();
+    cursors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cursor)| cursor.head.as_ref().map(|(block, _)| (*block, turns_after_last(index), index)))
+        .min()
+        .map(|(_, _, index)| index)
 }
 
 struct SourceCursor {
