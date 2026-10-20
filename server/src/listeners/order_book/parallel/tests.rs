@@ -397,11 +397,10 @@ async fn drains_bursts_and_rotation_after_consumer_stalls(name: &str, mode: Stre
 }
 
 #[tokio::test]
-async fn poll_watcher_yields_a_record_written_in_pieces_once_and_discovers_the_next_hour() {
-    const FIRST: &str =
-        "{\"block_number\":7,\"payload\":\"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\"}";
+async fn poll_watcher_holds_a_partial_record_until_complete_and_discovers_the_next_hour() {
+    const FIRST: &str = "{\"block_number\":7,\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}";
     const SECOND: &str = "{\"block_number\":8}";
-    let base_dir = stream_test_dir("poll-pieces");
+    let base_dir = stream_test_dir("poll-partial");
     let day_dir = base_dir.join("hourly/20260916");
     std::fs::create_dir_all(&day_dir).unwrap();
     let path = day_dir.join("19");
@@ -410,13 +409,15 @@ async fn poll_watcher_yields_a_record_written_in_pieces_once_and_discovers_the_n
     let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: senders.remove(0) };
     let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink, POLL);
     ready.await.unwrap();
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-    for (index, piece) in format!("{FIRST}\n").as_bytes().chunks(3).enumerate() {
-        std::io::Write::write_all(&mut file, piece).unwrap();
-        if index % 4 == 0 {
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
+    let caught_up = async |receiver: &mut FileEventReceiver| {
+        let message = tokio::time::timeout(Duration::from_secs(5), receiver.sources[0].rx.recv()).await.unwrap();
+        matches!(message, Some(SourceMessage::CaughtUp))
+    };
+    assert!(caught_up(&mut receiver).await, "attached at EOF");
+    let (head, tail) = FIRST.split_at(FIRST.len() / 2);
+    append_to_file(&path, head);
+    assert!(caught_up(&mut receiver).await, "read the partial record to EOF without emitting a line");
+    append_to_file(&path, &format!("{tail}\n"));
     std::fs::write(day_dir.join("20"), format!("{SECOND}\n")).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         let mut ready = Vec::new();
