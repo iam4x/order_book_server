@@ -19,13 +19,14 @@ use crate::{
 pub(super) fn replay_stream_history(
     state: &mut OrderBookState,
     data_dir: &Path,
-    sources: &[EventSource],
     after_height: u64,
     through_height: u64,
     replay_guard_height: u64,
 ) -> Result<SnapshotReplayOutcome> {
     let mut outcome = SnapshotReplayOutcome { replayed_lines: 0, clean: true };
-    let mut cursors = sources
+    let mut cursors = state
+        .book_mode()
+        .sources()
         .iter()
         .map(|&source| SourceCursor::open(source, data_dir, after_height, through_height, &mut outcome.clean))
         .collect::<Result<Vec<_>>>()?;
@@ -324,7 +325,7 @@ mod tests {
         let data_dir = two_hour_history("across-hours");
         let mut state = empty_state(30, BookMode::DiffsOnly);
 
-        let outcome = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 30, 45, 30).unwrap();
+        let outcome = replay_stream_history(&mut state, &data_dir, 30, 45, 30).unwrap();
 
         assert_eq!(outcome.replayed_lines, 15);
         assert!(outcome.clean);
@@ -336,7 +337,7 @@ mod tests {
         let data_dir = two_hour_history("mid-file");
         let mut state = empty_state(60, BookMode::DiffsOnly);
 
-        let outcome = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 60, 70, 60).unwrap();
+        let outcome = replay_stream_history(&mut state, &data_dir, 60, 70, 60).unwrap();
 
         assert_eq!(outcome.replayed_lines, 10);
         assert_eq!(btc_bid_oids(&state), (61..=70).collect::<Vec<_>>());
@@ -353,7 +354,7 @@ mod tests {
         write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &newer, "");
         let mut state = empty_state(10, BookMode::DiffsOnly);
 
-        let outcome = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 10, 12, 10).unwrap();
+        let outcome = replay_stream_history(&mut state, &data_dir, 10, 12, 10).unwrap();
 
         assert_eq!(outcome.replayed_lines, 3);
         assert!(outcome.clean);
@@ -366,10 +367,7 @@ mod tests {
         write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &bid_lines(41..=80), "");
         let mut state = empty_state(30, BookMode::DiffsOnly);
 
-        let err = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 30, 45, 30)
-            .err()
-            .unwrap()
-            .to_string();
+        let err = replay_stream_history(&mut state, &data_dir, 30, 45, 30).err().unwrap().to_string();
 
         assert!(err.contains("does not reach back to block 30"), "{err}");
         assert_eq!(btc_bid_oids(&state), Vec::<u64>::new());
@@ -380,10 +378,7 @@ mod tests {
         let data_dir = two_hour_history("ends-early");
         let mut state = empty_state(60, BookMode::DiffsOnly);
 
-        let err = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 60, 80, 60)
-            .err()
-            .unwrap()
-            .to_string();
+        let err = replay_stream_history(&mut state, &data_dir, 60, 80, 60).err().unwrap().to_string();
 
         assert_eq!(err, "OrderDiffs history on disk ends before block 81");
     }
@@ -397,15 +392,7 @@ mod tests {
         write_hour(&data_dir, EventSource::OrderStatuses, "20261020", 0, &statuses, "");
         let mut state = empty_state(0, BookMode::StatusPaired);
 
-        let outcome = replay_stream_history(
-            &mut state,
-            &data_dir,
-            &[EventSource::OrderDiffs, EventSource::OrderStatuses],
-            0,
-            10_001,
-            0,
-        )
-        .unwrap();
+        let outcome = replay_stream_history(&mut state, &data_dir, 0, 10_001, 0).unwrap();
 
         assert_eq!(outcome.replayed_lines, 20_002);
         assert!(outcome.clean);
@@ -428,15 +415,7 @@ mod tests {
         write_hour(&data_dir, EventSource::OrderStatuses, "20261020", 0, &statuses, "");
         let mut state = empty_state(0, BookMode::StatusPaired);
 
-        let outcome = replay_stream_history(
-            &mut state,
-            &data_dir,
-            &[EventSource::OrderDiffs, EventSource::OrderStatuses],
-            0,
-            1,
-            0,
-        )
-        .unwrap();
+        let outcome = replay_stream_history(&mut state, &data_dir, 0, 1, 0).unwrap();
 
         assert_eq!(outcome.replayed_lines, 20_002);
         assert!(outcome.clean);
