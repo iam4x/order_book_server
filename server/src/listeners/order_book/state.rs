@@ -30,6 +30,9 @@ pub(super) struct OrderBookState {
     resolved_order_tombstones: ResolvedOrderTombstones,
     order_status_height: u64,
     order_diff_height: u64,
+    // The block of the latest applied diff batch. Unlike `order_diff_height` it moves back
+    // when hl-node rewrites older blocks after a restart.
+    last_diff_block: u64,
     repair_reasons: HashSet<PendingRepairReason>,
 }
 
@@ -165,6 +168,7 @@ impl OrderBookState {
             resolved_order_tombstones: ResolvedOrderTombstones::default(),
             order_status_height: height,
             order_diff_height: height,
+            last_diff_block: height,
             repair_reasons: HashSet::new(),
         }
     }
@@ -187,6 +191,10 @@ impl OrderBookState {
 
     pub(super) const fn order_diff_height(&self) -> u64 {
         self.order_diff_height
+    }
+
+    pub(super) const fn last_diff_block(&self) -> u64 {
+        self.last_diff_block
     }
 
     pub(super) fn set_time(&mut self, time: u64) {
@@ -457,6 +465,7 @@ impl OrderBookState {
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
         self.order_diff_height = self.order_diff_height.max(height);
+        self.last_diff_block = height;
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
