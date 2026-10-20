@@ -919,8 +919,10 @@ impl OrderBookListener {
             self.request_pending_repairs(replay_repair_reasons);
         }
         self.broadcast_universe_after_snapshot(old_universe);
-        // Replayed lines may end partway through a block; publish once it closes.
-        self.block_gate = BlockGate::open(self.order_book_state.as_ref().map_or(0, OrderBookState::order_diff_height));
+        // Replayed lines may end partway through a block; publish once it closes. The streams may
+        // already be idle and will not report it again, so the quiet window starts now.
+        let block = self.order_book_state.as_ref().map_or(0, OrderBookState::order_diff_height);
+        self.block_gate = BlockGate::idle(block, Instant::now());
         self.force_snapshot_refresh_updates();
         info!(
             "Order book ready at state height {state_height}; replay cutoff {replay_cutoff_height}; replayed \
@@ -1783,7 +1785,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
                         let now = Instant::now();
-                        let repair_pending = listener.lock().await.repair_pending();
+                        let repair_pending = {
+                            let listener = listener.lock().await;
+                            quiet_deadline = listener.block_quiet_deadline();
+                            listener.repair_pending()
+                        };
                         if repair_pending {
                             repair_backoff.record_failure(now);
                         } else {
@@ -4025,6 +4031,47 @@ mod tests {
         assert_eq!(file_events.recv_many(&mut ready, 8).await, 1);
         let Some(parallel::FileEvent::OrderDiff(line)) = ready.pop() else { panic!("expected the queued diff") };
         listener.apply_parsed_hft(parse_hft_event(line, EventSource::OrderDiffs).unwrap().unwrap());
+        close_block_after_quiet(&mut listener);
+        assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn a_snapshot_installed_while_book_streams_are_idle_publishes_after_the_quiet_window() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+        let state = order_book_state_with_bids_and_time(
+            &[("BTC", &[(1, "100", "2")])],
+            10,
+            BLOCK_10_TIME_MS,
+            BookMode::DiffsOnly,
+        );
+        listener.install_snapshot_state(state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+        assert_eq!(published_btc_bids(&mut rx), vec![]);
+
+        listener.close_quiet_block(Instant::now() + block_gate::BLOCK_QUIET, &drained_file_events());
+        assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_10_TIME_MS, "100".to_string(), "2".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_book_line_after_a_snapshot_install_keeps_its_block_open() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo"));
+        listener.begin_snapshot_replay();
+        apply_btc_bid(&mut listener, 2, 11);
+        let state = order_book_state_with_bids_and_time(
+            &[("BTC", &[(1, "100", "1")])],
+            10,
+            BLOCK_10_TIME_MS,
+            BookMode::DiffsOnly,
+        );
+        let outcome = listener.install_snapshot_state(state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
+
+        apply_btc_bid(&mut listener, 3, 11);
+        listener.close_quiet_block(Instant::now() + block_gate::BLOCK_QUIET, &drained_file_events());
+        assert_eq!(published_btc_bids(&mut rx), vec![], "block 11 got a line after the install");
+
         close_block_after_quiet(&mut listener);
         assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
     }
