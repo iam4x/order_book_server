@@ -199,10 +199,11 @@ fn repeated_read_failure_reports_one_loss_until_healthy() {
     std::fs::write(&file, []).unwrap();
     let opened = FileReader::open_candidate(&file).unwrap();
     let mut tracked = TrackedStream::new(opened, 0);
-    assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
-    assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Preserved);
+    let err = std::io::Error::other("injected");
+    assert_eq!(tracked.report_read_failure("read", &err).continuity, FileContinuity::Lost);
+    assert_eq!(tracked.report_read_failure("read", &err).continuity, FileContinuity::Preserved);
     tracked.mark_read_healthy();
-    assert_eq!(tracked.report_read_failure().continuity, FileContinuity::Lost);
+    assert_eq!(tracked.report_read_failure("read", &err).continuity, FileContinuity::Lost);
     std::fs::remove_dir_all(base).unwrap();
 }
 
