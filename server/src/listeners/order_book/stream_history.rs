@@ -68,11 +68,13 @@ impl SourceCursor {
         clean: &mut bool,
     ) -> Result<Self> {
         let dir = source.event_source_dir_streaming(data_dir);
-        let files: Vec<PathBuf> = hourly_stream_files(&dir, NaiveDate::MIN).into_iter().map(|(_, path)| path).collect();
+        let mut files: Vec<PathBuf> =
+            hourly_stream_files(&dir, NaiveDate::MIN).into_iter().map(|(_, path)| path).collect();
         let mut start = None;
-        for (index, path) in files.iter().enumerate() {
+        for (index, path) in files.iter().enumerate().rev() {
             if first_block(path)?.is_some_and(|block| block <= after_height) {
                 start = Some(index);
+                break;
             }
         }
         let Some(start) = start else {
@@ -80,22 +82,14 @@ impl SourceCursor {
                 format!("{source} history in {} does not reach back to block {after_height}", dir.display()).into()
             );
         };
-        let mut files = files.into_iter().skip(start);
-        let Some(path) = files.next() else {
-            return Err(format!("{source} history start file disappeared").into());
-        };
+        let next_files = files.split_off(start + 1);
+        let path = files.swap_remove(start);
         let mut reader = BufReader::new(File::open(&path)?);
         let len = reader.get_ref().metadata()?.len();
         let offset = first_offset_after(&mut reader, len, after_height)?;
         reader.seek(SeekFrom::Start(offset))?;
-        let mut cursor = Self {
-            source,
-            reader,
-            next_files: files.collect::<Vec<_>>().into_iter(),
-            after_height,
-            through_height,
-            head: None,
-        };
+        let mut cursor =
+            Self { source, reader, next_files: next_files.into_iter(), after_height, through_height, head: None };
         cursor.advance(clean)?;
         Ok(cursor)
     }
