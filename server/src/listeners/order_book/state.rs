@@ -6,6 +6,7 @@ use std::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
+    BookMode,
     listeners::order_book::{L2Snapshots, TimedSnapshots},
     order_book::{
         Coin, InnerOrder, Oid, Px, QueuePlacement, RawBbo, Sz,
@@ -23,6 +24,7 @@ pub(super) struct OrderBookState {
     height: u64,
     time: u64,
     ignore_spot: bool,
+    book_mode: BookMode,
     pending_order_statuses: FxHashMap<Oid, Pending<NodeDataOrderStatus>>,
     pending_new_diffs: FxHashMap<Oid, Pending<PendingNewDiff>>,
     resolved_order_tombstones: ResolvedOrderTombstones,
@@ -120,6 +122,30 @@ fn record_insert_before_placement(placement: QueuePlacement) {
     }
 }
 
+fn order_from_new_diff(diff: &NodeDataOrderDiff, coin: Coin, sz: Sz, time: u64) -> Result<InnerL4Order> {
+    let oid = diff.oid();
+    let side = diff
+        .side()
+        .ok_or_else(|| -> Error { format!("Missing side for OrderDiff::New oid={oid:?} coin={coin:?}").into() })?;
+    Ok(InnerL4Order {
+        user: diff.user(),
+        coin,
+        side,
+        limit_px: Px::parse_from_str(diff.px())?,
+        sz,
+        oid: oid.value(),
+        timestamp: time,
+        trigger_condition: "N/A".to_string(),
+        is_trigger: false,
+        trigger_px: "0.0".to_string(),
+        is_position_tpsl: false,
+        reduce_only: false,
+        order_type: "Limit".to_string(),
+        tif: Some("Alo".to_string()),
+        cloid: None,
+    })
+}
+
 impl OrderBookState {
     pub(super) fn from_snapshot(
         snapshot: Snapshots<InnerL4Order>,
@@ -127,9 +153,11 @@ impl OrderBookState {
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
+        book_mode: BookMode,
     ) -> Self {
         Self {
             ignore_spot,
+            book_mode,
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
@@ -441,29 +469,9 @@ impl OrderBookState {
                         continue;
                     }
 
-                    if coin.is_spot() && diff.is_statusless_system_user() {
+                    if self.book_mode == BookMode::DiffsOnly || (coin.is_spot() && diff.is_statusless_system_user()) {
                         self.pending_order_statuses.remove(&oid);
-                        let side = diff.side().ok_or_else(|| -> Error {
-                            format!("Missing side for statusless system order oid={oid:?} coin={coin:?}").into()
-                        })?;
-                        let inner_order = InnerL4Order {
-                            user: diff.user(),
-                            coin: coin.clone(),
-                            side,
-                            limit_px: Px::parse_from_str(diff.px())?,
-                            sz,
-                            oid: oid.value(),
-                            timestamp: time,
-                            trigger_condition: "N/A".to_string(),
-                            is_trigger: false,
-                            trigger_px: "0.0".to_string(),
-                            is_position_tpsl: false,
-                            reduce_only: false,
-                            order_type: "Limit".to_string(),
-                            tif: Some("Alo".to_string()),
-                            cloid: None,
-                        };
-                        self.add_resolved_order(inner_order, insert_before);
+                        self.add_resolved_order(order_from_new_diff(&diff, coin.clone(), sz, time)?, insert_before);
                         changed_coins.insert(coin);
                         continue;
                     }
@@ -575,16 +583,72 @@ mod tests {
 
     use super::*;
     use crate::{
-        order_book::{Sz, multi_book::Snapshots},
+        listeners::order_book::L2SnapshotParams,
+        order_book::{
+            Sz,
+            multi_book::{Snapshots, load_snapshots_from_cli_str},
+            types::Side,
+        },
         types::{L4Order, OrderDiff},
     };
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, 0, 0, true, false)
+        OrderBookState::from_snapshot(snapshots, 0, 0, true, false, BookMode::StatusPaired)
     }
 
-    fn make_l4_order_at(coin: &str, oid: u64, side: crate::order_book::types::Side, px: &str) -> L4Order {
+    fn diffs_only_state(snapshots: Snapshots<InnerL4Order>, height: u64) -> OrderBookState {
+        OrderBookState::from_snapshot(snapshots, height, 0, true, false, BookMode::DiffsOnly)
+    }
+
+    fn cli_snapshots(coin: &str, bids: Vec<L4Order>, asks: Vec<L4Order>) -> Snapshots<InnerL4Order> {
+        let entry = |order: L4Order| (Address::ZERO, order);
+        let json = serde_json::to_string(&vec![(
+            coin,
+            [bids.into_iter().map(entry).collect::<Vec<_>>(), asks.into_iter().map(entry).collect::<Vec<_>>()],
+        )])
+        .unwrap();
+        load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(&json, 0).unwrap().snapshots
+    }
+
+    fn make_order_diff_at(coin: &str, oid: u64, side: Side, px: &str, diff: OrderDiff) -> NodeDataOrderDiff {
+        serde_json::from_value(serde_json::json!({
+            "user": "0x0000000000000000000000000000000000000000",
+            "oid": oid,
+            "side": side,
+            "px": px,
+            "coin": coin,
+            "raw_book_diff": diff
+        }))
+        .unwrap()
+    }
+
+    fn new_diff(coin: &str, oid: u64, side: Side, px: &str, sz: &str) -> NodeDataOrderDiff {
+        make_order_diff_at(coin, oid, side, px, OrderDiff::New { sz: sz.to_string(), insert_before: None })
+    }
+
+    fn bbo(state: &OrderBookState, coin: &str) -> RawBbo {
+        let (_time, mut bbos) = state.get_bbos_for_changed_coins(&HashSet::from([Coin::new(coin)]));
+        bbos.pop().expect("coin bbo").1
+    }
+
+    fn level(px: &str, sz: &str, n: u32) -> (Px, Sz, u32) {
+        (Px::parse_from_str(px).unwrap(), Sz::parse_from_str(sz).unwrap(), n)
+    }
+
+    fn l2_levels(state: &OrderBookState, coin: &str) -> Option<[Vec<(Px, Sz, usize)>; 2]> {
+        let coin = Coin::new(coin);
+        let params = L2SnapshotParams::new(None, None);
+        let (_time, snapshots) = state.l2_snapshots_incremental(
+            &HashSet::from([coin.clone()]),
+            &HashSet::from([params]),
+            &mut HashMap::new(),
+        );
+        let snapshot = snapshots.as_ref().get(&coin)?.get(&params)?.clone();
+        Some(snapshot.as_ref().clone().map(|levels| levels.into_iter().map(|l| (l.px, l.sz, l.n)).collect()))
+    }
+
+    fn make_l4_order_at(coin: &str, oid: u64, side: Side, px: &str) -> L4Order {
         L4Order {
             user: None,
             coin: coin.to_string(),
@@ -607,16 +671,10 @@ mod tests {
     }
 
     fn make_order_status(coin: &str, oid: u64, status: &str) -> NodeDataOrderStatus {
-        make_order_status_at(coin, oid, status, crate::order_book::types::Side::Bid, "100.0")
+        make_order_status_at(coin, oid, status, Side::Bid, "100.0")
     }
 
-    fn make_order_status_at(
-        coin: &str,
-        oid: u64,
-        status: &str,
-        side: crate::order_book::types::Side,
-        px: &str,
-    ) -> NodeDataOrderStatus {
+    fn make_order_status_at(coin: &str, oid: u64, status: &str, side: Side, px: &str) -> NodeDataOrderStatus {
         NodeDataOrderStatus {
             time: NaiveDateTime::parse_from_str("2024-01-15 10:30:00", "%Y-%m-%d %H:%M:%S").unwrap(),
             user: Address::new([0; 20]),
@@ -678,12 +736,12 @@ mod tests {
         .unwrap()
     }
 
-    fn snapshot_oids(state: &OrderBookState, coin: &str, side: crate::order_book::types::Side) -> Vec<u64> {
+    fn snapshot_oids(state: &OrderBookState, coin: &str, side: Side) -> Vec<u64> {
         let snapshots = state.compute_snapshot().snapshot.value();
         let snapshot = snapshots.get(&Coin::new(coin)).expect("coin snapshot");
         let index = match side {
-            crate::order_book::types::Side::Bid => 0,
-            crate::order_book::types::Side::Ask => 1,
+            Side::Bid => 0,
+            Side::Ask => 1,
         };
         snapshot.as_ref()[index].iter().map(|order| order.oid).collect()
     }
@@ -749,7 +807,7 @@ mod tests {
             )]))
             .unwrap();
 
-        assert_eq!(snapshot_oids(&state, "BTC", crate::order_book::types::Side::Bid), vec![1, 3, 2]);
+        assert_eq!(snapshot_oids(&state, "BTC", Side::Bid), vec![1, 3, 2]);
     }
 
     // ==================== Bidirectional Cache: Diff First ====================
@@ -800,7 +858,7 @@ mod tests {
             .unwrap();
         state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 3, "open")])).unwrap();
 
-        assert_eq!(snapshot_oids(&state, "ETH", crate::order_book::types::Side::Bid), vec![1, 3, 2]);
+        assert_eq!(snapshot_oids(&state, "ETH", Side::Bid), vec![1, 3, 2]);
     }
 
     #[test]
@@ -1068,9 +1126,7 @@ mod tests {
     fn test_fully_matched_system_spot_new_suppresses_duplicate() {
         let mut state = empty_state();
         let resting_order: InnerL4Order =
-            (Address::ZERO, make_l4_order_at("@260", 1, crate::order_book::types::Side::Ask, "325.5"))
-                .try_into()
-                .unwrap();
+            (Address::ZERO, make_l4_order_at("@260", 1, Side::Ask, "325.5")).try_into().unwrap();
         state.order_book.add_order(resting_order);
         let diff: NodeDataOrderDiff = serde_json::from_value(serde_json::json!({
             "user": format!("0x{}", "fe".repeat(20)),
@@ -1178,7 +1234,7 @@ mod tests {
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true); // ignore_spot=true
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, BookMode::StatusPaired); // ignore_spot=true
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
@@ -1189,7 +1245,7 @@ mod tests {
     #[test]
     fn test_spot_status_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true);
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, BookMode::StatusPaired);
         let status = make_order_status("@1", 1, "open");
 
         let changed = state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
@@ -1531,5 +1587,155 @@ mod tests {
         assert!(universe.contains(&Coin::new("BTC")));
         assert!(universe.contains(&Coin::new("ETH")));
         assert!(universe.contains(&Coin::new("SOL")));
+    }
+
+    // ==================== Diffs-Only Book Mode ====================
+
+    #[test]
+    fn diffs_only_new_diff_alone_inserts_order() {
+        let mut state = diffs_only_state(Snapshots::new(HashMap::new()), 0);
+
+        let changed =
+            state.apply_order_diffs_hft(make_diff_batch(vec![new_diff("BTC", 42, Side::Bid, "100.5", "1.5")])).unwrap();
+
+        assert_eq!(changed, HashSet::from([Coin::new("BTC")]));
+        assert_eq!(bbo(&state, "BTC"), (Some(level("100.5", "1.5", 1)), None));
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
+    fn diffs_only_new_update_remove_tracks_size() {
+        let mut state = diffs_only_state(Snapshots::new(HashMap::new()), 0);
+
+        state.apply_order_diffs_hft(make_diff_batch(vec![new_diff("ETH", 7, Side::Ask, "2000.0", "5.0")])).unwrap();
+        assert_eq!(bbo(&state, "ETH"), (None, Some(level("2000.0", "5.0", 1))));
+
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff_at(
+                "ETH",
+                7,
+                Side::Ask,
+                "2000.0",
+                OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.25".to_string() },
+            )]))
+            .unwrap();
+        assert_eq!(bbo(&state, "ETH"), (None, Some(level("2000.0", "3.25", 1))));
+
+        state
+            .apply_order_diffs_hft(make_diff_batch(vec![make_order_diff_at(
+                "ETH",
+                7,
+                Side::Ask,
+                "2000.0",
+                OrderDiff::Remove,
+            )]))
+            .unwrap();
+        assert_eq!(bbo(&state, "ETH"), (None, None));
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn diffs_only_trigger_order_enters_book_on_new_diff() {
+        let resting = make_l4_order_at("BTC", 1, Side::Bid, "99.0");
+        let mut trigger = make_l4_order_at("BTC", 2, Side::Bid, "100.5");
+        trigger.is_trigger = true;
+        let snapshots = cli_snapshots("BTC", vec![resting, trigger.clone()], vec![trigger]);
+        let mut state = diffs_only_state(snapshots, 100);
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(bbo(&state, "BTC"), (Some(level("99.0", "1.0", 1)), None));
+
+        state
+            .apply_order_diffs_hft(make_diff_batch_at(vec![new_diff("BTC", 2, Side::Bid, "100.5", "0.5")], 101))
+            .unwrap();
+
+        assert_eq!(state.order_count(), 2);
+        assert_eq!(bbo(&state, "BTC"), (Some(level("100.5", "0.5", 1)), None));
+    }
+
+    #[test]
+    fn diffs_only_replayed_new_for_snapshot_order_is_not_double_counted() {
+        let mut resting = make_l4_order_at("BTC", 1, Side::Bid, "99.0");
+        resting.sz = "0.6".to_string();
+        let mut state = diffs_only_state(cli_snapshots("BTC", vec![resting], Vec::new()), 100);
+
+        state
+            .apply_order_diffs_after_snapshot(
+                make_diff_batch_at(vec![new_diff("BTC", 1, Side::Bid, "99.0", "1.0")], 90),
+                100,
+            )
+            .unwrap();
+
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(bbo(&state, "BTC"), (Some(level("99.0", "0.6", 1)), None));
+    }
+
+    #[test]
+    fn diffs_only_book_matches_status_paired_book() {
+        enum Step {
+            Statuses(Vec<NodeDataOrderStatus>),
+            Diffs(Vec<NodeDataOrderDiff>),
+        }
+        let mut ioc = make_order_status_at("BTC", 6, "open", Side::Bid, "102.0");
+        ioc.order.tif = Some("Ioc".to_string());
+        let update = |coin: &str, oid, side, px: &str, orig: &str, new: &str| {
+            make_order_diff_at(
+                coin,
+                oid,
+                side,
+                px,
+                OrderDiff::Update { orig_sz: orig.to_string(), new_sz: new.to_string() },
+            )
+        };
+        let steps = vec![
+            Step::Statuses(vec![
+                make_order_status_at("BTC", 1, "open", Side::Bid, "100.0"),
+                make_order_status_at("ETH", 3, "open", Side::Ask, "2000.0"),
+                ioc,
+            ]),
+            Step::Diffs(vec![
+                new_diff("BTC", 1, Side::Bid, "100.0", "1.5"),
+                new_diff("BTC", 2, Side::Ask, "101.0", "2.0"),
+                new_diff("ETH", 3, Side::Ask, "2000.0", "3.0"),
+                new_diff("ETH", 4, Side::Bid, "1999.5", "4.0"),
+                new_diff("BTC", 5, Side::Bid, "100.0", "0.5"),
+            ]),
+            Step::Statuses(vec![
+                make_order_status_at("BTC", 2, "open", Side::Ask, "101.0"),
+                make_order_status_at("ETH", 4, "open", Side::Bid, "1999.5"),
+                make_order_status_at("BTC", 5, "open", Side::Bid, "100.0"),
+            ]),
+            Step::Diffs(vec![
+                update("BTC", 1, Side::Bid, "100.0", "1.5", "1.0"),
+                make_order_diff_at("ETH", 3, Side::Ask, "2000.0", OrderDiff::Remove),
+                update("BTC", 2, Side::Ask, "101.0", "2.0", "1.25"),
+            ]),
+        ];
+
+        let mut paired = empty_state();
+        let mut diffs_only = diffs_only_state(Snapshots::new(HashMap::new()), 0);
+        for step in steps {
+            match step {
+                Step::Statuses(statuses) => {
+                    paired.apply_order_statuses_hft(make_status_batch(statuses)).unwrap();
+                }
+                Step::Diffs(diffs) => {
+                    paired.apply_order_diffs_hft(make_diff_batch(diffs.clone())).unwrap();
+                    diffs_only.apply_order_diffs_hft(make_diff_batch(diffs)).unwrap();
+                }
+            }
+        }
+
+        for coin in ["BTC", "ETH"] {
+            assert_eq!(l2_levels(&diffs_only, coin), l2_levels(&paired, coin), "{coin} L2");
+            assert_eq!(bbo(&diffs_only, coin), bbo(&paired, coin), "{coin} BBO");
+        }
+        assert_eq!(bbo(&diffs_only, "BTC"), (Some(level("100.0", "1.5", 2)), Some(level("101.0", "1.25", 1))));
+        assert_eq!(bbo(&diffs_only, "ETH"), (Some(level("1999.5", "4.0", 1)), None));
+        assert_eq!(paired.pending_order_statuses_count(), 0);
+        assert_eq!(paired.pending_new_diffs_count(), 0);
+        assert_eq!(diffs_only.order_count(), 4);
+        assert_eq!(paired.order_count(), 4);
     }
 }
