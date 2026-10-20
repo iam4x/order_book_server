@@ -134,11 +134,12 @@ impl TrackedStream {
         }
     }
 
-    fn report_read_failure(&mut self) -> FileRead {
+    fn report_read_failure(&mut self, action: &str, err: &std::io::Error) -> FileRead {
         self.read_unhealthy = true;
         let continuity = if self.read_failure_reported {
             FileContinuity::Preserved
         } else {
+            error!("Failed to {action} stream file {}: {err}; retrying", self.opened.path.display());
             self.read_failure_reported = true;
             FileContinuity::Lost
         };
@@ -367,17 +368,13 @@ impl FileReader {
     fn read_stream(tracked: &mut TrackedStream, read_buf: &mut [u8]) -> FileRead {
         let metadata = match tracked.opened.file.metadata() {
             Ok(metadata) => metadata,
-            Err(err) => {
-                error!("Failed to inspect open stream file {}: {err}", tracked.opened.path.display());
-                return tracked.report_read_failure();
-            }
+            Err(err) => return tracked.report_read_failure("inspect open", &err),
         };
 
         let mut continuity = FileContinuity::Preserved;
         let state_changed = if metadata.len() < tracked.offset {
             if let Err(err) = tracked.opened.file.seek(SeekFrom::Start(0)) {
-                error!("Failed to rewind stream file {}: {err}", tracked.opened.path.display());
-                return tracked.report_read_failure();
+                return tracked.report_read_failure("rewind", &err);
             }
             tracked.offset = 0;
             tracked.partial_line.clear();
@@ -392,10 +389,7 @@ impl FileReader {
             match tracked.opened.file.read(read_buf) {
                 Ok(bytes) => break bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(err) => {
-                    error!("Failed to read stream file {}: {err}", tracked.opened.path.display());
-                    return tracked.report_read_failure();
-                }
+                Err(err) => return tracked.report_read_failure("read", &err),
             }
         };
         tracked.mark_read_healthy();
