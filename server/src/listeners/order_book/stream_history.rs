@@ -94,17 +94,14 @@ impl SourceCursor {
         let files = hourly_files(&dir)?;
         let mut start = None;
         for (index, path) in files.iter().enumerate() {
-            if first_block(path)?.is_some_and(|block| block <= after_height.saturating_add(1)) {
+            if first_block(path)?.is_some_and(|block| block <= after_height) {
                 start = Some(index);
             }
         }
         let Some(start) = start else {
-            return Err(format!(
-                "{source} history in {} does not reach back to block {}",
-                dir.display(),
-                after_height.saturating_add(1)
-            )
-            .into());
+            return Err(
+                format!("{source} history in {} does not reach back to block {after_height}", dir.display()).into()
+            );
         };
         let mut files = files.into_iter().skip(start);
         let Some(path) = files.next() else {
@@ -341,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn history_replay_keeps_the_part_of_the_first_block_written_before_an_hour_rollover() {
+        let data_dir = history_test_dir("split-block");
+        let mut older = bid_lines(1..=10);
+        older.push(new_bid_line(111, 11));
+        write_hour(&data_dir, EventSource::OrderDiffs, "20261019", 23, &older, "");
+        let mut newer = vec![new_bid_line(112, 11)];
+        newer.extend(bid_lines(12..=20));
+        write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &newer, "");
+        let mut state = empty_state(10, BookMode::DiffsOnly);
+
+        let outcome = replay_stream_history(&mut state, &data_dir, &[EventSource::OrderDiffs], 10, 12, 10).unwrap();
+
+        assert_eq!(outcome.replayed_lines, 3);
+        assert!(outcome.clean);
+        assert_eq!(btc_bid_oids(&state), vec![12, 111, 112]);
+    }
+
+    #[test]
     fn history_replay_fails_when_disk_history_starts_after_the_state_height() {
         let data_dir = history_test_dir("starts-late");
         write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &bid_lines(41..=80), "");
@@ -351,7 +366,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert!(err.contains("does not reach back to block 31"), "{err}");
+        assert!(err.contains("does not reach back to block 30"), "{err}");
         assert_eq!(btc_bid_oids(&state), Vec::<u64>::new());
     }
 
@@ -371,7 +386,7 @@ mod tests {
     #[test]
     fn history_replay_merges_status_paired_sources_by_block() {
         let data_dir = history_test_dir("status-paired");
-        let blocks = 1..=10_002;
+        let blocks = 0..=10_002;
         write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &bid_lines(blocks.clone()), "");
         let statuses: Vec<String> = blocks.map(|block| open_status_line(block, block)).collect();
         write_hour(&data_dir, EventSource::OrderStatuses, "20261020", 0, &statuses, "");
