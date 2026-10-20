@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    future::Future,
     io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
@@ -62,8 +61,6 @@ const SNAPSHOT_REPLAY_REFRESH_MAX_LINES: usize = 10_000_000;
 const SNAPSHOT_REPLAY_REFRESH_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const SNAPSHOT_REPLAY_INITIAL_MAX_LINES: usize = 20_000_000;
 const SNAPSHOT_REPLAY_INITIAL_MAX_BYTES: usize = 8 * 1024 * 1024 * 1024;
-const SNAPSHOT_VISOR_CATCHUP_POLL: Duration = Duration::from_millis(100);
-const SNAPSHOT_VISOR_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_REPAIR_RETRY_BASE: Duration = Duration::from_secs(10);
 const SNAPSHOT_REPAIR_RETRY_MAX: Duration = Duration::from_secs(300);
 
@@ -396,34 +393,6 @@ fn snapshot_heights(
     }
 }
 
-async fn wait_for_visor_floor<F, Fut>(floor: u64, timeout: Duration, mut read_height: F) -> Result<u64>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<u64>>,
-{
-    tokio::time::timeout(timeout, async move {
-        loop {
-            match read_height().await {
-                Ok(observed) if observed >= floor => return Ok(observed),
-                Ok(_) | Err(_) => sleep(SNAPSHOT_VISOR_CATCHUP_POLL).await,
-            }
-        }
-    })
-    .await
-    .map_err(|_| -> Error { format!("Visor did not reach replay floor {floor} within {timeout:?}").into() })?
-}
-
-async fn read_visor_height_at_replay_floor<F, Fut>(floor: u64, timeout: Duration, mut read_height: F) -> Result<u64>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<u64>>,
-{
-    match read_height().await {
-        Ok(observed) if observed >= floor => Ok(observed),
-        Ok(_) | Err(_) => wait_for_visor_floor(floor, timeout, read_height).await,
-    }
-}
-
 fn fetch_snapshot(
     kind: SnapshotTaskKind,
     snapshot_config: SnapshotConfig,
@@ -437,19 +406,13 @@ fn fetch_snapshot(
         let res: Result<SnapshotInstallOutcome> = async {
             // Start replay capture before generating the snapshot so the new state can
             // catch up to events written while hl-node is reading abci_state.rmp.
-            let started_book_height = listener.lock().await.begin_snapshot_replay_for(kind)?;
+            listener.lock().await.begin_snapshot_replay_for(kind)?;
 
             let visor_path = get_visor_path(&snapshot_config);
             let abci_state_path = get_abci_state_path(&snapshot_config);
             let data_dir = snapshot_config.data_dir.clone();
             // Keep the errors rather than returning early: embedded-height output
             // remains safe and depends on neither the visor nor the state file.
-            let visor_height_before =
-                read_visor_height_at_replay_floor(started_book_height, SNAPSHOT_VISOR_CATCHUP_TIMEOUT, || {
-                    let visor_path = visor_path.clone();
-                    async move { read_visor_height(&visor_path).await }
-                })
-                .await;
             let state_height_before = abci_state_height(&abci_state_path, &data_dir);
             let output_fln = process_rmp_file(&snapshot_config).await?;
             let visor_height_after = read_visor_height(&visor_path).await;
@@ -461,7 +424,6 @@ fn fetch_snapshot(
             )
             .await?;
             let height_source = loaded_snapshot.height_source;
-            let visor_heights = (visor_height_before.ok(), visor_height_after.as_ref().ok().copied());
             let heights = snapshot_heights(
                 height_source,
                 loaded_snapshot.height,
@@ -496,10 +458,10 @@ fn fetch_snapshot(
             })
             .await??;
             info!(
-                "Snapshot at state height {state_height} ({height_source:?}); visor height {:?} before and {:?} \
-                 after generation; journal starts at block {journal_start_height}; replayed {} stream history \
+                "Snapshot at state height {state_height} ({height_source:?}); replay guard height \
+                 {replay_guard_height}; journal starts at block {journal_start_height}; replayed {} stream history \
                  lines from disk through replay cutoff {replay_cutoff_height}",
-                visor_heights.0, visor_heights.1, history.replayed_lines
+                history.replayed_lines
             );
 
             let prepared = PreparedSnapshot { state: new_order_book, heights, replay_cutoff_height, history };
@@ -741,15 +703,14 @@ impl OrderBookListener {
 
     #[cfg(test)]
     fn begin_snapshot_replay(&mut self) {
-        let _unused =
-            self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh).expect("temporary replay journal should open");
+        self.begin_snapshot_replay_for(SnapshotTaskKind::Refresh).expect("temporary replay journal should open");
     }
 
-    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<u64> {
+    fn begin_snapshot_replay_for(&mut self, kind: SnapshotTaskKind) -> Result<()> {
         let started_book_height = self.order_book_state.as_ref().map_or(0, OrderBookState::height);
         self.snapshot_replay_cache =
             Some(SnapshotReplayCache::new(started_book_height, kind, self.repair_requested_epoch)?);
-        Ok(started_book_height)
+        Ok(())
     }
 
     fn snapshot_replay_journal_start_height(&self) -> Option<u64> {
@@ -2361,70 +2322,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn visor_waiter_polls_until_replay_floor() {
-        let observations = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([88, 99, 100])));
-        let observed = wait_for_visor_floor(100, Duration::from_secs(1), {
-            let observations = Arc::clone(&observations);
-            move || {
-                let next = observations.lock().unwrap().pop_front().unwrap_or(100);
-                std::future::ready(Ok(next))
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(observed, 100);
-        assert!(observations.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn visor_waiter_retries_transient_read_errors() {
-        let observations = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
-            Err("transient read".into()),
-            Ok(99),
-            Ok(100),
-        ])));
-        let observed = wait_for_visor_floor(100, Duration::from_secs(1), {
-            let observations = Arc::clone(&observations);
-            move || {
-                let next = observations.lock().unwrap().pop_front().unwrap_or(Ok(100));
-                std::future::ready(next)
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(observed, 100);
-        assert!(observations.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_visor_read_retries_an_initial_error() {
-        let observations =
-            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([Err("transient read".into()), Ok(100)])));
-        let observed = read_visor_height_at_replay_floor(100, Duration::from_secs(1), {
-            let observations = Arc::clone(&observations);
-            move || {
-                let next = observations.lock().unwrap().pop_front().unwrap_or(Ok(100));
-                std::future::ready(next)
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(observed, 100);
-        assert!(observations.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn visor_waiter_times_out_below_replay_floor() {
-        let error =
-            wait_for_visor_floor(100, Duration::from_millis(250), || std::future::ready(Ok(99))).await.unwrap_err();
-
-        assert!(error.to_string().contains("Visor did not reach replay floor 100"));
     }
 
     #[test]
