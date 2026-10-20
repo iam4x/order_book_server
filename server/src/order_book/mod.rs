@@ -140,29 +140,52 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 
     pub(crate) fn add_order_before(&mut self, mut order: O, insert_before: Option<Oid>) -> QueuePlacement {
-        // Duplicate oid would silently corrupt state: `oid_to_side_px` would point
-        // at the new (side, px) while `LinkedList::push_back` silently rejects the
-        // re-insert, leaving the original order data in place. Skip and warn.
-        // (A node replay or duplicate-emit is the realistic trigger; we never want
-        // to re-run matching, which would double-count the match against opposite-side
-        // orders that have arrived since.)
-        if self.oid_to_side_px.contains_key(&order.oid()) {
-            log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
+        if self.is_duplicate(&order) {
             return QueuePlacement::NotApplicable;
         }
-        let (maker_orders, maker_totals, resting_book, resting_totals) = match order.side() {
-            Side::Ask => (&mut self.bids, &mut self.bid_totals, &mut self.asks, &mut self.ask_totals),
-            Side::Bid => (&mut self.asks, &mut self.ask_totals, &mut self.bids, &mut self.bid_totals),
+        let (maker_orders, maker_totals) = match order.side() {
+            Side::Ask => (&mut self.bids, &mut self.bid_totals),
+            Side::Bid => (&mut self.asks, &mut self.ask_totals),
         };
         let oids = match_order(maker_orders, maker_totals, &mut order);
         for oid in oids {
             self.oid_to_side_px.remove(&oid);
         }
-        if order.sz().is_positive() {
-            self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            return add_order_to_book(resting_book, resting_totals, order, insert_before);
+        self.insert_resting(order, insert_before)
+    }
+
+    /// Places the order at its price without matching it against the opposite side.
+    pub(crate) fn rest_order_before(&mut self, order: O, insert_before: Option<Oid>) -> QueuePlacement {
+        if self.is_duplicate(&order) {
+            return QueuePlacement::NotApplicable;
         }
-        QueuePlacement::NotApplicable
+        self.insert_resting(order, insert_before)
+    }
+
+    // Duplicate oid would silently corrupt state: `oid_to_side_px` would point
+    // at the new (side, px) while `LinkedList::push_back` silently rejects the
+    // re-insert, leaving the original order data in place. Skip and warn.
+    // (A node replay or duplicate-emit is the realistic trigger; we never want
+    // to re-run matching, which would double-count the match against opposite-side
+    // orders that have arrived since.)
+    fn is_duplicate(&self, order: &O) -> bool {
+        let duplicate = self.oid_to_side_px.contains_key(&order.oid());
+        if duplicate {
+            log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
+        }
+        duplicate
+    }
+
+    fn insert_resting(&mut self, order: O, insert_before: Option<Oid>) -> QueuePlacement {
+        if !order.sz().is_positive() {
+            return QueuePlacement::NotApplicable;
+        }
+        let (resting_book, resting_totals) = match order.side() {
+            Side::Ask => (&mut self.asks, &mut self.ask_totals),
+            Side::Bid => (&mut self.bids, &mut self.bid_totals),
+        };
+        self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
+        add_order_to_book(resting_book, resting_totals, order, insert_before)
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
@@ -562,6 +585,17 @@ mod tests {
         assert_eq!(snapshot_oids(&book, Side::Bid), vec![3, 1]);
         assert_eq!(book.get_bbo().0, Some((Px::new(100), Sz::new(15), 2)));
         assert!(book.get_bbo().1.is_none());
+    }
+
+    #[test]
+    fn test_rest_order_before_leaves_crossing_makers_untouched() {
+        let mut book = OrderBook::new();
+        book.add_order(MinimalOrder::new(1, 5, 101, Side::Ask));
+
+        let placement = book.rest_order_before(MinimalOrder::new(2, 10, 101, Side::Bid), None);
+
+        assert_eq!(placement, QueuePlacement::NotApplicable);
+        assert_eq!(book.get_bbo(), (Some((Px::new(101), Sz::new(10), 1)), Some((Px::new(101), Sz::new(5), 1))));
     }
 
     #[test]
