@@ -166,10 +166,14 @@ impl SnapshotReplayCache {
         })
     }
 
-    /// The highest of each source's first journaled block. Lines before it may
-    /// predate replay capture, so they must come from the stream files on disk.
-    fn journal_start_height(&self) -> Option<u64> {
-        self.first_journaled_blocks.iter().map(|(_, block)| *block).max()
+    /// The highest of each source's first journaled block, once every source has one.
+    /// Lines before it may predate replay capture, so they must come from the stream
+    /// files on disk; a source with no journaled line yet leaves that window open.
+    fn journal_start_height(&self, sources: &[EventSource]) -> Option<u64> {
+        sources.iter().try_fold(0, |height, source| {
+            let (_, block) = self.first_journaled_blocks.iter().find(|(journaled, _)| journaled == source)?;
+            Some(height.max(*block))
+        })
     }
 
     fn push(&mut self, event_source: EventSource, block_number: u64, line: &str) -> Option<String> {
@@ -473,7 +477,7 @@ fn fetch_snapshot(
                 .lock()
                 .await
                 .snapshot_replay_journal_start_height()
-                .ok_or("Snapshot replay journal captured no book stream lines")?;
+                .ok_or("Snapshot replay journal has not captured a line from every book stream yet")?;
             // The block at each source's journal start may straddle the start of
             // capture, so every block through the latest start comes from disk.
             let replay_cutoff_height = state_height.max(journal_start_height);
@@ -736,7 +740,8 @@ impl OrderBookListener {
     }
 
     fn snapshot_replay_journal_start_height(&self) -> Option<u64> {
-        self.snapshot_replay_cache.as_ref().and_then(SnapshotReplayCache::journal_start_height)
+        let sources = self.features.book_mode().sources();
+        self.snapshot_replay_cache.as_ref().and_then(|cache| cache.journal_start_height(sources))
     }
 
     fn clear_snapshot_replay(&mut self) {
@@ -2479,6 +2484,22 @@ mod tests {
 
         assert!(initial_limits.max_lines > refresh_limits.max_lines);
         assert!(initial_limits.max_bytes > refresh_limits.max_bytes);
+    }
+
+    #[test]
+    fn journal_start_height_waits_for_every_book_source() {
+        let mut cache = SnapshotReplayCache::new(0, SnapshotTaskKind::Initial, 0).expect("replay journal should open");
+        let status_paired = [EventSource::OrderDiffs, EventSource::OrderStatuses];
+
+        assert_eq!(cache.push(EventSource::OrderDiffs, 12, "{}"), None);
+        assert_eq!(cache.push(EventSource::OrderDiffs, 13, "{}"), None);
+        assert_eq!(cache.journal_start_height(&status_paired), None);
+        assert_eq!(cache.journal_start_height(&[EventSource::OrderDiffs]), Some(12));
+
+        assert_eq!(cache.push(EventSource::OrderStatuses, 9, "{}"), None);
+        assert_eq!(cache.journal_start_height(&status_paired), Some(12));
+        assert_eq!(cache.push(EventSource::OrderStatuses, 30, "{}"), None);
+        assert_eq!(cache.journal_start_height(&status_paired), Some(12));
     }
 
     #[test]
