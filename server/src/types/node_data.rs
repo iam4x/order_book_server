@@ -12,6 +12,10 @@ use crate::{
 const ASSISTANCE_FUND_USER: Address = Address::repeat_byte(0xFE);
 const HIP2_USER: Address = Address::repeat_byte(0xFF);
 
+pub(crate) const fn is_statusless_system_user(user: Address) -> bool {
+    matches!(user, ASSISTANCE_FUND_USER | HIP2_USER)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderDiff {
     user: Address,
@@ -48,7 +52,7 @@ impl NodeDataOrderDiff {
     }
 
     pub(crate) const fn is_statusless_system_user(&self) -> bool {
-        matches!(self.user, ASSISTANCE_FUND_USER | HIP2_USER)
+        is_statusless_system_user(self.user)
     }
 }
 
