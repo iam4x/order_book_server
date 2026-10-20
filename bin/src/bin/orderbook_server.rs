@@ -132,9 +132,10 @@ struct Args {
     #[arg(long, value_enum, default_value = "poll")]
     stream_watch: StreamWatchMode,
 
-    /// Microseconds to sleep at EOF before reading the stream files again.
+    /// Microseconds to sleep at EOF before reading the stream files again, from 1 to 1000000.
+    /// A longer sleep would delay the one-second scan for new hourly files.
     /// Ignored with --stream-watch inotify.
-    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
     poll_interval_us: u64,
 
     // ========== Snapshot Configuration ==========
@@ -506,6 +507,10 @@ mod tests {
             parsed_stream_watch(&["--poll-interval-us", "500"]),
             Some(StreamWatch::Poll { interval: Duration::from_micros(500) })
         );
+        assert_eq!(
+            parsed_stream_watch(&["--poll-interval-us", "1000000"]),
+            Some(StreamWatch::Poll { interval: Duration::from_secs(1) })
+        );
     }
 
     #[test]
@@ -519,6 +524,7 @@ mod tests {
     #[test]
     fn cli_rejects_invalid_stream_watch_values() {
         assert_eq!(parsed_stream_watch(&["--poll-interval-us", "0"]), None);
+        assert_eq!(parsed_stream_watch(&["--poll-interval-us", "1000001"]), None);
         assert_eq!(parsed_stream_watch(&["--stream-watch", "fanotify"]), None);
     }
 
