@@ -252,6 +252,18 @@ impl FileEventReceiver {
         for source in &mut self.sources {
             source.poll_head(cx);
         }
+        if self.sources.iter().all(|source| source.closed && source.head.is_none()) {
+            return Poll::Ready(None);
+        }
+        // Checked before fills so a fill backlog cannot hold back the report. No book head is
+        // queued when this fires, so it cannot reorder book events.
+        let mut book_sources = self.sources.iter().filter(|source| source.source != EventSource::Fills).peekable();
+        let books_caught_up = book_sources.peek().is_some()
+            && book_sources.all(|source| source.head.is_none() && (source.caught_up || source.closed));
+        if books_caught_up && !self.books_caught_up_reported {
+            self.books_caught_up_reported = true;
+            return Poll::Ready(Some(FileEvent::BooksCaughtUp));
+        }
         let waiting_for_book = self.sources.iter().any(|source| {
             source.source != EventSource::Fills && source.head.is_none() && !source.caught_up && !source.closed
         });
@@ -280,16 +292,6 @@ impl FileEventReceiver {
                 self.books_caught_up_reported = false;
             }
             return Poll::Ready(source.head.take().map(|(_, event)| event));
-        }
-        if self.sources.iter().all(|source| source.closed && source.head.is_none()) {
-            return Poll::Ready(None);
-        }
-        let mut book_sources = self.sources.iter().filter(|source| source.source != EventSource::Fills).peekable();
-        let books_caught_up = book_sources.peek().is_some()
-            && book_sources.all(|source| source.head.is_none() && (source.caught_up || source.closed));
-        if books_caught_up && !self.books_caught_up_reported {
-            self.books_caught_up_reported = true;
-            return Poll::Ready(Some(FileEvent::BooksCaughtUp));
         }
         Poll::Pending
     }
