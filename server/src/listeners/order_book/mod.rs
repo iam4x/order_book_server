@@ -11,6 +11,7 @@ use std::{
 };
 
 use alloy::primitives::Address;
+use block_gate::BlockGate;
 use log::{error, info, warn};
 use stream_history::replay_stream_history;
 use tokio::{
@@ -19,7 +20,7 @@ use tokio::{
         broadcast::Sender,
         mpsc::{UnboundedSender, unbounded_channel},
     },
-    time::{Instant, sleep},
+    time::{Instant, sleep, sleep_until},
 };
 use utils::{EventBatch, SnapshotConfig, abci_state_height, get_abci_state_path, get_visor_path, process_rmp_file};
 
@@ -47,6 +48,7 @@ use crate::{
     },
 };
 
+mod block_gate;
 mod parallel;
 mod state;
 mod stream_history;
@@ -625,6 +627,12 @@ pub(crate) struct OrderBookListener {
     repair_requested_epoch: u64,
     repair_completed_epoch: u64,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    // L2, BBO, and allBBO publish only while this is complete, so subscribers
+    // never see a block that is only partly applied.
+    block_gate: BlockGate,
+    pending_bbo_changed_coins: HashSet<Coin>,
+    // Built when a block closes, then sent by the next L2 flush tick.
+    ready_l2_job: Option<L2FlushJob>,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
     // Coins whose L2 snapshot cache is stale. This intentionally survives the
@@ -661,6 +669,9 @@ impl OrderBookListener {
             repair_requested_epoch: 0,
             repair_completed_epoch: 0,
             internal_message_tx,
+            block_gate: BlockGate::default(),
+            pending_bbo_changed_coins: HashSet::new(),
+            ready_l2_job: None,
             last_l2_broadcast: None,
             pending_l2_changed_coins: HashSet::new(),
             l2_snapshot_cache: HashMap::new(),
@@ -812,8 +823,10 @@ impl OrderBookListener {
             self.next_l2_version = 1;
         }
         self.l2_generation = self.l2_generation.wrapping_add(1);
+        self.ready_l2_job = None;
         self.pending_l2_changed_coins.clear();
         self.pending_allbbo_changed_coins.clear();
+        self.pending_bbo_changed_coins.clear();
     }
 
     #[cfg(test)]
@@ -906,6 +919,8 @@ impl OrderBookListener {
             self.request_pending_repairs(replay_repair_reasons);
         }
         self.broadcast_universe_after_snapshot(old_universe);
+        // Replayed lines may end partway through a block; publish once it closes.
+        self.block_gate = BlockGate::open(self.order_book_state.as_ref().map_or(0, OrderBookState::order_diff_height));
         self.force_snapshot_refresh_updates();
         info!(
             "Order book ready at state height {state_height}; replay cutoff {replay_cutoff_height}; replayed \
@@ -948,19 +963,13 @@ impl OrderBookListener {
         let Some(state) = &self.order_book_state else { return };
         let universe = state.compute_universe();
 
-        if self.features.bbo() && !universe.is_empty() {
-            let (time, bbos) = state.get_bbos_for_coins(&universe);
-            if !bbos.is_empty() {
-                drop(tx.send(Arc::new(InternalMessage::BboUpdate { bbos, time })));
-            }
+        if self.features.bbo() {
+            self.pending_bbo_changed_coins.extend(universe.iter().cloned());
         }
 
         if self.features.allbbo() && self.allbbo_subscription_registry.has_active() {
-            let (time, bbos) = state.get_all_bbos();
-            if !bbos.is_empty() {
-                self.last_allbbo_broadcast = Some(Instant::now());
-                drop(tx.send(Arc::new(InternalMessage::AllBboUpdate { bbos, time })));
-            }
+            self.pending_allbbo_changed_coins.extend(universe);
+            self.last_allbbo_broadcast = None;
         }
 
         if self.features.l2book() {
@@ -1002,6 +1011,16 @@ impl OrderBookListener {
     }
 
     fn take_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
+        if let Some(job) = self.ready_l2_job.take() {
+            return Some(job);
+        }
+        if !self.block_gate.is_complete() {
+            return None;
+        }
+        self.build_l2_flush_job_if_due()
+    }
+
+    fn build_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
         if !self.features.l2book() {
             return None;
         }
@@ -1083,14 +1102,20 @@ impl OrderBookListener {
     }
 
     fn flush_allbbo_if_due(&mut self) {
-        if let Some(msg) = self.take_allbbo_update_if_due() {
+        if self.block_gate.is_complete() {
+            self.publish_allbbo_if_due();
+        }
+    }
+
+    fn publish_allbbo_if_due(&mut self) {
+        if let Some(msg) = self.build_allbbo_update_if_due() {
             if let Some(tx) = &self.internal_message_tx {
                 drop(tx.send(Arc::new(msg)));
             }
         }
     }
 
-    fn take_allbbo_update_if_due(&mut self) -> Option<InternalMessage> {
+    fn build_allbbo_update_if_due(&mut self) -> Option<InternalMessage> {
         if !self.features.allbbo() || self.pending_allbbo_changed_coins.is_empty() {
             return None;
         }
@@ -1125,6 +1150,41 @@ impl OrderBookListener {
         Some(InternalMessage::AllBboUpdate { bbos, time })
     }
 
+    fn publish_pending_bbos(&mut self) {
+        if self.pending_bbo_changed_coins.is_empty() {
+            return;
+        }
+        let changed = std::mem::take(&mut self.pending_bbo_changed_coins);
+        let (Some(state), Some(tx)) = (&self.order_book_state, &self.internal_message_tx) else { return };
+        let bbo_start = Instant::now();
+        let (time, bbos) = state.get_bbos_for_coins(&changed);
+        drop(tx.send(Arc::new(InternalMessage::BboUpdate { bbos, time })));
+        BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
+    }
+
+    /// Publish what the previous block changed, before any line of the next block applies.
+    fn publish_complete_block(&mut self) {
+        self.publish_pending_bbos();
+        self.publish_allbbo_if_due();
+        if self.ready_l2_job.is_none() {
+            self.ready_l2_job = self.build_l2_flush_job_if_due();
+        }
+    }
+
+    fn mark_books_idle(&mut self, now: Instant) {
+        self.block_gate.on_books_idle(now);
+    }
+
+    fn block_quiet_deadline(&self) -> Option<Instant> {
+        self.block_gate.quiet_deadline()
+    }
+
+    fn close_quiet_block(&mut self, now: Instant) {
+        if self.block_gate.close_if_quiet(now) {
+            self.publish_complete_block();
+        }
+    }
+
     fn flush_stats_if_due(&mut self) {
         if let Some(msg) = self.take_stats_update() {
             if let Some(tx) = &self.internal_message_tx {
@@ -1142,6 +1202,11 @@ impl OrderBookListener {
         let time = chrono::Utc::now().timestamp_millis().max(0) as u64;
         Some(InternalMessage::Stats { stats: self.stats.flush(time) })
     }
+}
+
+enum ReadyEvent {
+    Parsed(ParsedHftEvent),
+    BooksCaughtUp,
 }
 
 struct ParsedHftEvent {
@@ -1242,6 +1307,17 @@ impl OrderBookListener {
 
         FILE_EVENTS_TOTAL.with_label_values(&[source_label]).inc();
         FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
+        if apply_to_book {
+            match event_source {
+                EventSource::OrderDiffs => {
+                    if self.block_gate.on_diff_line(height) {
+                        self.publish_complete_block();
+                    }
+                }
+                EventSource::OrderStatuses => self.block_gate.on_status_line(),
+                EventSource::Fills => {}
+            }
+        }
         let process_start = Instant::now();
 
         let result = match event_batch {
@@ -1339,21 +1415,10 @@ impl OrderBookListener {
             {
                 self.pending_allbbo_changed_coins.extend(changed_coins.iter().cloned());
             }
-            self.broadcast_universe_if_changed(&changed_coins);
-
-            if self.features.bbo() {
-                if let Some(state) = &self.order_book_state {
-                    if let Some(tx) = &self.internal_message_tx {
-                        if tx.receiver_count() > 0 {
-                            let bbo_start = Instant::now();
-                            let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
-                            let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
-                            drop(tx.send(msg));
-                            BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
-                        }
-                    }
-                }
+            if self.features.bbo() && self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0) {
+                self.pending_bbo_changed_coins.extend(changed_coins.iter().cloned());
             }
+            self.broadcast_universe_if_changed(&changed_coins);
         }
     }
 }
@@ -1612,12 +1677,18 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let mut next_refresh_at: Option<Instant> = None;
     let mut repair_backoff = RepairRetryBackoff::default();
     let mut ready_events = Vec::with_capacity(64);
+    let mut quiet_deadline: Option<Instant> = None;
 
     info!("Main event loop starting");
 
     loop {
         tokio::select! {
             biased;
+
+            _ = sleep_until(quiet_deadline.unwrap_or_else(Instant::now)), if quiet_deadline.is_some() => {
+                quiet_deadline = None;
+                listener.lock().await.close_quiet_block(Instant::now());
+            }
 
             // Flush throttled book-derived batches on the scheduler, ahead of file
             // events in this biased select, so a full file-event queue cannot starve them.
@@ -1747,7 +1818,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 if ready_count == 0 {
                     return Err("File event channel closed".into());
                 }
-                let mut parsed_events = Vec::with_capacity(ready_count);
+                let mut events = Vec::with_capacity(ready_count);
                 let mut parse_repair_count = 0usize;
                 let mut stream_gaps = Vec::new();
                 for event in ready_events.drain(..) {
@@ -1759,11 +1830,14 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             stream_gaps.push(source);
                             continue;
                         }
-                        parallel::FileEvent::BooksCaughtUp => continue,
+                        parallel::FileEvent::BooksCaughtUp => {
+                            events.push(ReadyEvent::BooksCaughtUp);
+                            continue;
+                        }
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
-                        Ok(Some(parsed)) => parsed_events.push(parsed),
+                        Ok(Some(parsed)) => events.push(ReadyEvent::Parsed(parsed)),
                         Ok(None) => {}
                         Err(err) => {
                             record_hft_parse_error(event_source, line_len, &err);
@@ -1780,9 +1854,13 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 for _ in 0..parse_repair_count {
                     listener.request_repair("parse_error");
                 }
-                for parsed in parsed_events {
-                    listener.apply_parsed_hft(parsed);
+                for event in events {
+                    match event {
+                        ReadyEvent::Parsed(parsed) => listener.apply_parsed_hft(parsed),
+                        ReadyEvent::BooksCaughtUp => listener.mark_books_idle(Instant::now()),
+                    }
                 }
+                quiet_deadline = listener.block_quiet_deadline();
             }
         }
     }
@@ -2747,6 +2825,7 @@ mod tests {
             .expect("initial visor snapshot installs with conservative replay cutoff");
 
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        close_block_after_quiet(&mut listener);
         drop(drain_all(&mut rx));
 
         listener
@@ -2838,6 +2917,7 @@ mod tests {
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
         assert_eq!(current_bid_sz(&listener, "BTC"), "2");
         assert!(listener.snapshot_replay_cache.is_none());
+        close_block_after_quiet(&mut listener);
         assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
     }
 
@@ -2866,6 +2946,7 @@ mod tests {
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
         assert_eq!(current_bid_sz(&listener, "BTC"), "4");
         assert!(listener.snapshot_replay_cache.is_none());
+        close_block_after_quiet(&mut listener);
         assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
     }
 
@@ -3012,6 +3093,7 @@ mod tests {
 
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
         assert_eq!(listener.order_book_state.as_ref().expect("state initialized").time(), 123_456);
+        close_block_after_quiet(&mut listener);
         assert!(
             drain_all(&mut rx)
                 .iter()
@@ -3098,12 +3180,16 @@ mod tests {
         let new_state =
             order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "2")])], 10, 0, BookMode::StatusPaired);
         listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+        listener.flush_l2_if_due();
+        listener.flush_allbbo_if_due();
+        assert!(drain_all(&mut rx).is_empty(), "the installed book publishes once its block closes");
 
+        close_block_after_quiet(&mut listener);
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
-        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
 
         listener.flush_l2_if_due();
         let msg = drain_latest_l2(&mut rx).expect("scheduled l2 refresh update");
@@ -3123,6 +3209,7 @@ mod tests {
 
         listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
 
+        close_block_after_quiet(&mut listener);
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
@@ -3143,6 +3230,7 @@ mod tests {
         listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
         assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
 
+        close_block_after_quiet(&mut listener);
         listener.flush_allbbo_if_due();
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
@@ -3164,6 +3252,7 @@ mod tests {
         listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("BTC applies");
         listener.process_data_hft(update_diff_line("ETH", 2, "1", "3"), EventSource::OrderDiffs).expect("ETH applies");
 
+        close_block_after_quiet(&mut listener);
         listener.flush_allbbo_if_due();
         assert!(drain_latest_allbbo(&mut rx).is_none(), "flush should respect the 50ms throttle");
         assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
@@ -3206,6 +3295,7 @@ mod tests {
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
         assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
 
+        close_block_after_quiet(&mut listener);
         listener.flush_l2_if_due();
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
@@ -3310,6 +3400,7 @@ mod tests {
         // The periodic L2 flush after the throttle window must recompute BTC even
         // if no additional file event arrives.
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        close_block_after_quiet(&mut listener);
         listener.flush_l2_if_due();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
@@ -3323,7 +3414,7 @@ mod tests {
     }
 
     #[test]
-    fn new_pair_broadcasts_bbo_immediately_and_l2_on_schedule() {
+    fn new_pair_broadcasts_bbo_when_its_block_closes_and_l2_on_schedule() {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid(tx);
         let user = "0x0000000000000000000000000000000000000001";
@@ -3335,8 +3426,9 @@ mod tests {
 
         let diff = parse_hft_event(new_diff_line("BTC", 2, "2"), EventSource::OrderDiffs).unwrap().unwrap();
         listener.apply_parsed_hft(diff);
-        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
+        close_block_after_quiet(&mut listener);
+        assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
 
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
         listener.flush_l2_if_due();
@@ -3572,6 +3664,7 @@ mod tests {
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
 
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        close_block_after_quiet(&mut listener);
         listener.flush_l2_if_due();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
@@ -3596,6 +3689,7 @@ mod tests {
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
         assert!(drain_latest_l2(&mut rx).is_none(), "event processing should not synchronously flush L2");
 
+        close_block_after_quiet(&mut listener);
         listener.flush_l2_if_due();
 
         let msg = drain_latest_l2(&mut rx).expect("scheduler flush should publish pending L2");
@@ -3702,5 +3796,208 @@ mod tests {
         assert!(listener.pending_l2_changed_coins.is_empty());
         assert!(listener.l2_snapshot_cache.is_empty());
         assert!(drain_latest_l2(&mut rx).is_none());
+    }
+
+    const BLOCK_10_TIME_MS: u64 = 1_705_314_600_010;
+    const BLOCK_11_TIME_MS: u64 = 1_705_314_600_011;
+
+    fn btc_bid_line_in_block(oid: u64, sz: &str, block_number: u64) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": format!("2024-01-15T10:30:00.{block_number:03}000000"),
+            "block_number": block_number,
+            "events": [{
+                "user": "0x0000000000000000000000000000000000000000",
+                "oid": oid,
+                "side": "B",
+                "px": "100",
+                "coin": "BTC",
+                "raw_book_diff": { "new": { "sz": sz } }
+            }]
+        })
+        .to_string()
+    }
+
+    fn listener_at_block_10(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
+        let mut listener = OrderBookListener::new(Some(tx), false, features);
+        let state = order_book_state_with_bids_and_time(
+            &[("BTC", &[(1, "100", "1")])],
+            10,
+            BLOCK_10_TIME_MS,
+            BookMode::DiffsOnly,
+        );
+        listener.replace_order_book_state(state, 10, 10, true);
+        listener.l2_subscription_registry.register_l2(default_l2_key("BTC"));
+        listener.allbbo_subscription_registry.register();
+        listener
+    }
+
+    fn apply_btc_bid(listener: &mut OrderBookListener, oid: u64, block_number: u64) {
+        listener.process_data_hft(btc_bid_line_in_block(oid, "1", block_number), EventSource::OrderDiffs).unwrap();
+    }
+
+    fn flush_l2_on_timer(listener: &mut OrderBookListener) {
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_l2_if_due();
+    }
+
+    fn flush_allbbo_on_timer(listener: &mut OrderBookListener) {
+        listener.last_allbbo_broadcast = Some(Instant::now() - Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_allbbo_if_due();
+    }
+
+    fn close_block_after_quiet(listener: &mut OrderBookListener) {
+        let now = Instant::now();
+        listener.mark_books_idle(now);
+        listener.close_quiet_block(now + block_gate::BLOCK_QUIET);
+    }
+
+    fn bid_summary(bid: Option<&(Px, Sz, u32)>) -> (String, String, u32) {
+        let (px, sz, n) = bid.expect("BTC bid");
+        (px.to_str(), sz.to_str(), *n)
+    }
+
+    /// The BTC best bid of every book-derived message, as (feed, time, px, sz, n).
+    fn published_btc_bids(rx: &mut Receiver<Arc<InternalMessage>>) -> Vec<(&'static str, u64, String, String, u32)> {
+        drain_all(rx)
+            .iter()
+            .filter_map(|msg| match msg.as_ref() {
+                InternalMessage::L2Update { l2_books } => {
+                    let payload = serde_json::to_value(l2_books.get(&default_l2_key("BTC"))?.payload()).unwrap();
+                    let level = &payload["levels"][0][0];
+                    Some((
+                        "l2",
+                        payload["time"].as_u64().unwrap(),
+                        level["px"].as_str().unwrap().to_string(),
+                        level["sz"].as_str().unwrap().to_string(),
+                        u32::try_from(level["n"].as_u64().unwrap()).unwrap(),
+                    ))
+                }
+                InternalMessage::BboUpdate { bbos, time } => {
+                    let (px, sz, n) = bid_summary(bbos.get(&Coin::new("BTC"))?.0.as_ref());
+                    Some(("bbo", *time, px, sz, n))
+                }
+                InternalMessage::AllBboUpdate { bbos, time } => {
+                    let (_, (bid, _)) = bbos.iter().find(|(coin, _)| *coin == Coin::new("BTC"))?;
+                    let (px, sz, n) = bid_summary(bid.as_ref());
+                    Some(("allbbo", *time, px, sz, n))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn block_11_messages_are_complete(published: &[(&'static str, u64, String, String, u32)]) -> bool {
+        published
+            .iter()
+            .filter(|(_, time, ..)| *time == BLOCK_11_TIME_MS)
+            .all(|(_, _, px, sz, n)| (px.as_str(), sz.as_str(), *n) == ("100", "3", 3))
+    }
+
+    #[test]
+    fn l2_does_not_publish_a_block_before_its_last_line() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("l2book"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        flush_l2_on_timer(&mut listener);
+        apply_btc_bid(&mut listener, 3, 11);
+        flush_l2_on_timer(&mut listener);
+
+        let published = published_btc_bids(&mut rx);
+        assert!(block_11_messages_are_complete(&published), "published {published:?}");
+    }
+
+    #[test]
+    fn l2_publishes_the_book_after_a_whole_block() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("l2book"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        flush_l2_on_timer(&mut listener);
+        apply_btc_bid(&mut listener, 3, 11);
+        apply_btc_bid(&mut listener, 4, 12);
+        flush_l2_on_timer(&mut listener);
+
+        assert_eq!(published_btc_bids(&mut rx), vec![("l2", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn bbo_does_not_publish_a_block_before_its_last_line() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        apply_btc_bid(&mut listener, 3, 11);
+
+        let published = published_btc_bids(&mut rx);
+        assert!(block_11_messages_are_complete(&published), "published {published:?}");
+    }
+
+    #[test]
+    fn bbo_publishes_the_book_after_a_whole_block() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        apply_btc_bid(&mut listener, 3, 11);
+        apply_btc_bid(&mut listener, 4, 12);
+
+        assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
+    }
+
+    #[test]
+    fn allbbo_does_not_publish_a_block_before_its_last_line() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("allbbo"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        flush_allbbo_on_timer(&mut listener);
+        apply_btc_bid(&mut listener, 3, 11);
+        flush_allbbo_on_timer(&mut listener);
+
+        let published = published_btc_bids(&mut rx);
+        assert!(block_11_messages_are_complete(&published), "published {published:?}");
+    }
+
+    #[test]
+    fn allbbo_publishes_the_book_after_a_whole_block() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("allbbo"));
+
+        apply_btc_bid(&mut listener, 2, 11);
+        flush_allbbo_on_timer(&mut listener);
+        apply_btc_bid(&mut listener, 3, 11);
+        apply_btc_bid(&mut listener, 4, 12);
+        flush_allbbo_on_timer(&mut listener);
+
+        assert_eq!(
+            published_btc_bids(&mut rx),
+            vec![("allbbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]
+        );
+    }
+
+    #[test]
+    fn a_block_publishes_once_book_streams_stay_idle_for_the_quiet_window() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo,l2book"));
+        apply_btc_bid(&mut listener, 2, 11);
+        apply_btc_bid(&mut listener, 3, 11);
+
+        let idle_at = Instant::now();
+        listener.mark_books_idle(idle_at);
+        listener.close_quiet_block(idle_at + Duration::from_millis(1));
+        flush_l2_on_timer(&mut listener);
+        assert_eq!(published_btc_bids(&mut rx), vec![]);
+
+        listener.close_quiet_block(idle_at + Duration::from_millis(2));
+        flush_l2_on_timer(&mut listener);
+        assert_eq!(
+            published_btc_bids(&mut rx),
+            vec![
+                ("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3),
+                ("l2", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3),
+            ]
+        );
     }
 }
