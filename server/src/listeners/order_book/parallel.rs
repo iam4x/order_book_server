@@ -6,7 +6,7 @@ use reader::{FileContinuity, FileRead, FileReader, ReadProgress};
 
 use std::{
     future::poll_fn,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
@@ -17,12 +17,12 @@ use std::{
 };
 
 use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
 use sonic_rs::JsonValueTrait;
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 
 use crate::{
-    FeatureSet,
+    FeatureSet, StreamWatch,
     metrics::{
         EVENTS_PROCESSED_TOTAL, FILE_BACKPRESSURE_SECONDS_TOTAL, FILE_EVENTS_TOTAL, FILE_LINES_PARSED_TOTAL,
         FILE_QUEUE_BYTES, FILE_READ_BYTES_TOTAL, FILE_READ_CALLS_TOTAL, FILE_READ_DURATION, FILE_UNREAD_BYTES,
@@ -412,7 +412,7 @@ fn submit_available(sink: &FileLineSink, read: FileRead, caught_up: &mut bool) -
 const NOTIFY_DATA: u8 = 1;
 const NOTIFY_RESCAN: u8 = 2;
 const NOTIFY_ERROR: u8 = 4;
-const FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const INOTIFY_FALLBACK_INTERVAL: Duration = Duration::from_millis(10);
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 struct WatcherSignal {
@@ -447,6 +447,63 @@ fn notification_flags(event: &Result<Event, notify::Error>) -> u8 {
     }
 }
 
+enum Wakeup {
+    Notify,
+    Poll,
+}
+
+enum StreamWaker {
+    Poll(Duration),
+    Inotify { signal: Arc<WatcherSignal>, rx: std::sync::mpsc::Receiver<()>, _watcher: RecommendedWatcher },
+}
+
+impl StreamWaker {
+    fn start(mode: StreamWatch, dir: &Path) -> notify::Result<Self> {
+        match mode {
+            StreamWatch::Poll { interval } => {
+                // A wrong --data-dir must fail startup here, as the inotify watch does.
+                std::fs::metadata(dir).map_err(notify::Error::io)?;
+                Ok(Self::Poll(interval))
+            }
+            StreamWatch::Inotify => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let signal = Arc::new(WatcherSignal { flags: AtomicU8::new(0), tx });
+                let callback_signal = Arc::clone(&signal);
+                let mut watcher = recommended_watcher(move |event: Result<Event, _>| {
+                    let flags = notification_flags(&event);
+                    if flags != 0 {
+                        callback_signal.notify(flags);
+                    }
+                })?;
+                watcher.watch(dir, RecursiveMode::Recursive)?;
+                Ok(Self::Inotify { signal, rx, _watcher: watcher })
+            }
+        }
+    }
+
+    fn take_flags(&self) -> u8 {
+        match self {
+            Self::Poll(_) => 0,
+            Self::Inotify { signal, .. } => signal.take(),
+        }
+    }
+
+    /// Returns `None` once the inotify watcher has shut down.
+    fn wait(&self) -> Option<Wakeup> {
+        match self {
+            Self::Poll(interval) => {
+                thread::sleep(*interval);
+                Some(Wakeup::Poll)
+            }
+            Self::Inotify { rx, .. } => match rx.recv_timeout(INOTIFY_FALLBACK_INTERVAL) {
+                Ok(()) => Some(Wakeup::Notify),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(Wakeup::Poll),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            },
+        }
+    }
+}
+
 fn read_available(reader: &mut FileReader, rescan: bool) -> FileRead {
     if rescan && let Some(path) = reader.check_for_newer_file() {
         return reader.on_create(&path);
@@ -457,31 +514,20 @@ fn read_available(reader: &mut FileReader, rescan: bool) -> FileRead {
 fn spawn_file_watcher(
     dir: PathBuf,
     sink: FileLineSink,
+    mode: StreamWatch,
 ) -> (thread::JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let source = sink.source();
     let source_label = super::source_label(source);
     let handle = thread::spawn(move || {
-        info!("{source} watcher thread started for {}", dir.display());
-        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(1);
-        let signal = Arc::new(WatcherSignal { flags: AtomicU8::new(0), tx: event_tx });
-        let callback_signal = Arc::clone(&signal);
-        let mut watcher = match recommended_watcher(move |event: Result<Event, _>| {
-            let flags = notification_flags(&event);
-            if flags != 0 {
-                callback_signal.notify(flags);
-            }
-        }) {
-            Ok(watcher) => watcher,
+        info!("{source} watcher thread started for {} ({mode:?})", dir.display());
+        let waker = match StreamWaker::start(mode, &dir) {
+            Ok(waker) => waker,
             Err(err) => {
-                error!("{source} watcher failed to create: {err}");
+                error!("{source} watcher failed to start: {err}");
                 return;
             }
         };
-        if let Err(err) = watcher.watch(&dir, RecursiveMode::Recursive) {
-            error!("{source} watcher failed to start: {err}");
-            return;
-        }
 
         let mut reader = match FileReader::attach(dir) {
             Ok(reader) => reader,
@@ -512,7 +558,7 @@ fn spawn_file_watcher(
             if tx.tx.is_closed() {
                 return;
             }
-            let flags = signal.take();
+            let flags = waker.take_flags();
             if flags & NOTIFY_ERROR != 0 {
                 error!("{source} watcher reported an error; reconciling stream files");
             }
@@ -537,10 +583,10 @@ fn spawn_file_watcher(
             if progress == ReadProgress::Data {
                 continue;
             }
-            match event_rx.recv_timeout(FALLBACK_POLL_INTERVAL) {
-                Ok(()) => notify_wakes.inc(),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => poll_wakes.inc(),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            match waker.wait() {
+                Some(Wakeup::Notify) => notify_wakes.inc(),
+                Some(Wakeup::Poll) => poll_wakes.inc(),
+                None => return,
             }
         }
     });
@@ -574,6 +620,7 @@ pub(crate) async fn start_parallel_file_watchers(
     data_dir: PathBuf,
     features: FeatureSet,
     order_sync_recorder: Option<OrderSyncRecorder>,
+    stream_watch: StreamWatch,
 ) -> crate::prelude::Result<(FileEventReceiver, Vec<thread::JoinHandle<()>>)> {
     // Full queues park the readers and leave the remaining file backlog on disk.
     let sources = enabled_event_sources(features);
@@ -586,7 +633,7 @@ pub(crate) async fn start_parallel_file_watchers(
         info!("{source} dir: {}", dir.display());
         let sink = file_line_sink(source, features, tx, order_sync_recorder.clone())
             .ok_or("Order-sync fill watcher could not start without a recorder")?;
-        let (handle, ready) = spawn_file_watcher(dir, sink);
+        let (handle, ready) = spawn_file_watcher(dir, sink, stream_watch);
         handles.push(handle);
         pending.push(async move {
             ready.await.map_err(|_| -> crate::prelude::Error {

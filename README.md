@@ -40,7 +40,7 @@ The server runs co-located with a Hyperliquid node and is memory-light relative 
 
 Other requirements:
 
-- **OS:** Linux with inotify (kernel ≥ 2.6.13). Tested on Ubuntu 22.04 / 24.04.
+- **OS:** Linux. Tested on Ubuntu 22.04 / 24.04. The opt-in `--stream-watch inotify` mode also needs inotify (kernel ≥ 2.6.13).
 - **Architecture:** x86_64 or aarch64.
 - **File descriptors:** raise `LimitNOFILE` in your service unit (the included one sets `1048576`). Each WebSocket client uses one fd.
 - **Disk:** the binary is ~10 MB. While a snapshot is being generated, stream replay is journaled under the system temporary directory instead of being duplicated in RAM. Allow up to 8 GB of temporary headroom for startup replay (4 GB for a background refresh); set `TMPDIR` to a disk-backed directory with sufficient space if `/tmp` is a small `tmpfs`. The journal is deleted after snapshot installation. The Hyperliquid node's `*_streaming/` directories also grow with traffic and should be sized per the node's documentation.
@@ -113,7 +113,7 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
 **`direct`** - Use when your node runs directly on the host via systemctl or bare metal. The server calls the binary configured by `--hlnode-binary` on the host. Its path must not contain the literal `hl-node`; see the direct-mode example above.
 
-After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify. Events arriving while a snapshot is generated are captured in a bounded temporary disk journal and replayed before the new state is installed, keeping startup memory bounded even on busy nodes. By default the server also refreshes the in-memory order book from a fresh background snapshot every 4 hours to bound long-running drift without disconnecting clients. Snapshot output with an embedded height uses that height as the replay cutoff; current bare snapshot output is paired with `visor_abci_state.json`. If the visor height changes while generating a bare snapshot, the server uses the lower observed visor height as a conservative replay cutoff, replays stream batches above that height, and keeps queued batches above that height eligible after the swap. Set `--snapshot-refresh-hours 0` to disable recurring refreshes.
+After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates. By default each reader polls its file (see [Stream Watching](#stream-watching)). Events arriving while a snapshot is generated are captured in a bounded temporary disk journal and replayed before the new state is installed, keeping startup memory bounded even on busy nodes. By default the server also refreshes the in-memory order book from a fresh background snapshot every 4 hours to bound long-running drift without disconnecting clients. Snapshot output with an embedded height uses that height as the replay cutoff; current bare snapshot output is paired with `visor_abci_state.json`. If the visor height changes while generating a bare snapshot, the server uses the lower observed visor height as a conservative replay cutoff, replays stream batches above that height, and keeps queued batches above that height eligible after the swap. Set `--snapshot-refresh-hours 0` to disable recurring refreshes.
 
 ### Feature Selection
 
@@ -175,9 +175,26 @@ The `--markets` flag accepts comma-delimited market names. The `all` value remai
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
+| `--stream-watch` | `poll` | How readers wait for new stream data: `poll` or `inotify`. See [Stream Watching](#stream-watching) |
+| `--poll-interval-us` | `1000` | Microseconds a reader sleeps at EOF before reading again. Must be at least 1. Ignored with `--stream-watch inotify` |
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--allbbo-heartbeat-ms` | `0` | If > 0, resend the last `allbbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
+
+### Stream Watching
+
+hl-node writes each `*_streaming` record in many small `write()` calls on the same thread that applies blocks. With `--stream-with-block-info`, a record is a whole block, and the server can parse it only after its last byte is written.
+
+- `poll` (default) reads each stream file to EOF, then sleeps for `--poll-interval-us` (1 ms by default). It adds no work to hl-node's writes. A complete block waits at most one interval before it is read.
+- `inotify` puts a recursive inotify watch on each `*_streaming` directory and wakes on every write. Each of hl-node's writes then also runs fsnotify on its block-apply thread. At about 80k writes/s we measured about 9% of that thread's time in this path, and the reader made about one to two small `read()` calls per write.
+
+```bash
+# Poll every 500 µs instead of 1 ms
+./target/release/orderbook_server --poll-interval-us 500
+
+# Use inotify wakeups
+./target/release/orderbook_server --stream-watch inotify
+```
 
 ### Heartbeats
 
@@ -374,7 +391,7 @@ Enable the node output flags required by your selected features:
 │   (Docker/Direct)    │     │                                             │
 │                      │     │  ┌──────────────────────────────┐           │
 │  writes to:          │     │  │ Parallel File Watchers       │           │
-│  - fills_streaming/  │─────▶  │ (enabled inotify threads)    │           │
+│  - fills_streaming/  │─────▶  │ (one thread per source)      │           │
 │  - order_statuses_   │     │  │  - order diffs (BBO-critical)│           │
 │    streaming/        │     │  │  - order statuses            │           │
 │  - book_diffs_       │     │  │  - fills                     │           │
@@ -402,7 +419,7 @@ Enable the node output flags required by your selected features:
 **Data flow:**
 
 1. The Hyperliquid node writes real-time events to `*_streaming/` directories as newline-delimited JSON
-2. One inotify watcher thread runs for each event source required by `--features`
+2. One watcher thread runs for each event source required by `--features`. It polls its stream file by default, or wakes on inotify with `--stream-watch inotify`
 3. Watchers read through an open descriptor in 256 KiB chunks and send owned line batches through per-source queues, with a 32 MiB allocation budget per source. The receiver merges book streams by height, prefers statuses at each new height, and then alternates book sources at that height. Fills receive separate alternating turns so their backlog cannot starve book updates. With `ordersync` but without `trades` or `stats`, the fill watcher records only the maximum fill timestamp on its own thread and bypasses the shared event queue and the orderbook mutex.
 4. The OrderBook State applies diffs/statuses independently (no block-level batching) for lowest latency
 5. Background snapshot refreshes rebuild a new book off the hot path, replay captured stream lines above the replay cutoff, then swap state atomically
@@ -410,9 +427,9 @@ Enable the node output flags required by your selected features:
 
 ### File readers and node resource use
 
-Snapshot scheduling starts only after every enabled watcher has registered notifications and attached to its initial stream position. Existing complete records are skipped, an incomplete trailing record is retained, and files first discovered afterward are read from the beginning. Startup attachment failures stop initialization.
+Snapshot scheduling starts only after every enabled watcher has started (registering its inotify watch in inotify mode) and attached to its initial stream position. Existing complete records are skipped, an incomplete trailing record is retained, and files first discovered afterward are read from the beginning. Startup attachment failures stop initialization.
 
-Notifications coalesce into one pending wakeup per watcher. Normal reads reuse the open file descriptor. A 10 ms fallback checks for missed writes; a one-second reconciliation checks file identity and discovers rotations. A replacement or hourly successor drains the previous descriptor before switching; an unreadable predecessor reports continuity loss and permits recovery. Partial records, UTF-8 splits, and detected continuity loss retain their recovery paths.
+In the default poll mode, a reader reads to EOF, then sleeps for `--poll-interval-us` before the next pass. In inotify mode, notifications coalesce into one pending wakeup per watcher and a 10 ms fallback checks for missed writes. Normal reads reuse the open file descriptor. In both modes a one-second reconciliation checks file identity and discovers rotations and new hourly files. A replacement or hourly successor drains the previous descriptor before switching; an unreadable predecessor reports continuity loss and permits recovery. Partial records, UTF-8 splits, and detected continuity loss retain their recovery paths.
 
 When a queue fills, its reader waits and leaves the remaining backlog in the node's files. Readers open those files read-only and take no file locks. The 32 MiB budget covers queued batches and the merge cursor, including string/vector capacities. Reader buffers and the processor's current batch are separate: reads are capped at 256 KiB, records at 16 MiB, and each receive turn stops after 256 KiB or the record that crosses that threshold. These limits do not cap total server RSS.
 
@@ -481,7 +498,7 @@ curl http://localhost:9090/metrics
 | | `order_stream_unread_bytes{source}` | Unread bytes in the current file at the last read; excludes later files |
 | | `order_stream_queue_bytes{source}` | Allocations reserved for queued batches and the merge cursor |
 | | `order_stream_backpressure_seconds_total{source}` | Time the reader waits for queue capacity |
-| | `order_stream_watcher_wakeups_total{source,reason}` | Notification/poll wakeups and reconciliation passes |
+| | `order_stream_watcher_wakeups_total{source,reason}` | Wakeups by `reason`: `poll` (poll interval, or the inotify fallback timeout), `notify` (inotify only), and `rescan` (reconciliation passes) |
 | **Errors** | `parse_errors_total{type}` | JSON parse errors by source |
 | | `orderbook_repair_requests_total{reason}` | Snapshot repair requests after pending-pair or stream data loss |
 | | `ws_send_errors_total` | WebSocket send errors |
@@ -613,7 +630,7 @@ This fork processes every order diff, status, and fill **the instant it arrives*
 
 The original uses a single file watcher thread that handles all three event sources (order statuses, book diffs, fills) sequentially.
 
-This fork spawns dedicated inotify threads for the event sources required by `--features`. They send directly into one bounded tokio channel, so a sustained processing stall back-pressures the file readers instead of growing an unbounded queue.
+This fork spawns a dedicated watcher thread for each event source required by `--features`. Each polls its stream file by default; `--stream-watch inotify` switches them to inotify wakeups. They send directly into one bounded tokio channel, so a sustained processing stall back-pressures the file readers instead of growing an unbounded queue.
 
 ### New Subscription Types
 
