@@ -121,15 +121,17 @@ The `--features` flag controls both the WebSocket channels the server accepts an
 
 | Feature | WebSocket type | Requires snapshot/orderbook state | Watched node stream |
 |---------|----------------|------------------------------------|---------------------|
-| `bbo` | `bbo` | Yes | order diffs + order statuses |
-| `allbbo` | `allbbo` | Yes | order diffs + order statuses |
-| `l2book` | `l2Book` | Yes | order diffs + order statuses |
+| `bbo` | `bbo` | Yes | order diffs |
+| `allbbo` | `allbbo` | Yes | order diffs |
+| `l2book` | `l2Book` | Yes | order diffs |
 | `l4book` | `l4Book` | Yes | order diffs + order statuses |
 | `trades` | `trades` | No | fills |
 | `bookdiffs` | `bookDiffs` | No | order diffs |
 | `orderupdates` | `orderUpdates` | No | order statuses |
 | `stats` | `stats` | No | fills + order diffs |
 | `ordersync` | `orderSync` | No | fills |
+
+Without `l4book`, the server builds the book from order diffs alone. Order statuses only carry L4 fields such as `tif`, trigger details, and `cloid`, which L2 and BBO do not use.
 
 Examples:
 
@@ -378,7 +380,7 @@ Response:
 Enable the node output flags required by your selected features:
 
 - `--write-fills` for `trades`, `stats`, or `ordersync`
-- `--write-order-statuses` for `bbo`, `allbbo`, `l2book`, `l4book`, or `orderupdates`
+- `--write-order-statuses` for `l4book` or `orderupdates`
 - `--write-raw-book-diffs` for `bbo`, `allbbo`, `l2book`, `l4book`, `bookdiffs`, or `stats`
 - `--stream-with-block-info` for every feature because the server reads only `*_streaming` directories
 - `--disable-output-file-buffering` to flush updates without extra buffering latency
@@ -477,7 +479,7 @@ curl http://localhost:9090/metrics
 | | `messages_sent_total` | Total WebSocket messages sent |
 | | `bbo_changes_total{coin}` | BBO changes per coin |
 | **Health** | `orderbook_height` | Current block height |
-| | `order_status_height` | Latest processed order-status block height |
+| | `order_status_height` | Latest processed order-status block height (reported only with `l4book`) |
 | | `order_diff_height` | Latest processed order-diff block height |
 | | `orderbook_time_ms` | Orderbook timestamp |
 | | `orderbook_orders_total` | Total orders in the book |
