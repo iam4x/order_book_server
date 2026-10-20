@@ -37,19 +37,21 @@ async fn merge_waits_for_a_readers_next_batch_without_losing_heads_on_cancellati
     senders[1].try_send(status_at(10)).unwrap();
     assert!(senders[1].send(SourceMessage::CaughtUp));
     assert!(senders[0].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 3);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 2, books_idle: true, closed: false });
     assert!(matches!(&ready[0], FileEvent::OrderStatus(_)));
     assert!(matches!(&ready[1], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[2], FileEvent::BooksCaughtUp));
 
     ready.clear();
     senders[0].try_send(diff_at(21)).unwrap();
     assert!(senders[0].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2, "a quiet status stream must not stall diffs");
+    assert_eq!(
+        rx.recv_many(&mut ready, 8).await,
+        Received { events: 1, books_idle: true, closed: false },
+        "a quiet status stream must not stall diffs"
+    );
     assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[1], FileEvent::BooksCaughtUp));
     drop(senders);
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 0);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 0, books_idle: false, closed: true });
 }
 
 #[tokio::test]
@@ -63,7 +65,7 @@ async fn merge_preserves_source_order_and_alternates_equal_height_lines() {
     }
     drop(senders);
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 16).await, 6);
+    assert_eq!(rx.recv_many(&mut ready, 16).await.events, 6);
     assert!(matches!(&ready[0], FileEvent::OrderStatus(_)));
     assert!(matches!(&ready[1], FileEvent::OrderDiff(_)));
     assert!(matches!(&ready[2], FileEvent::OrderStatus(_)));
@@ -80,7 +82,7 @@ async fn merge_checks_for_new_backlog_after_an_eof_marker() {
     senders[1].try_send(status_at(20)).unwrap();
     drop(senders);
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.recv_many(&mut ready, 8).await.events, 2);
     assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
     assert!(matches!(&ready[1], FileEvent::OrderStatus(_)));
 }
@@ -93,7 +95,7 @@ async fn merge_keeps_gaps_and_malformed_lines_for_the_repair_path() {
     senders[0].try_send(diff_at(10)).unwrap();
     drop(senders);
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 3);
+    assert_eq!(rx.recv_many(&mut ready, 8).await.events, 3);
     assert!(matches!(&ready[0], FileEvent::ContinuityLost(EventSource::OrderDiffs)));
     assert!(matches!(&ready[1], FileEvent::OrderDiff(line) if line == "malformed"));
     assert!(matches!(&ready[2], FileEvent::OrderDiff(line) if line.contains("10")));
@@ -105,16 +107,15 @@ async fn fills_do_not_wait_for_book_readers_and_do_not_hold_up_book_events() {
         file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);
     senders[2].try_send(FileEvent::Fill(r#"{"block_number":10}"#.to_string())).unwrap();
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 1);
+    assert_eq!(rx.recv_many(&mut ready, 8).await.events, 1);
     assert!(matches!(&ready[0], FileEvent::Fill(_)));
 
     ready.clear();
     senders[0].try_send(diff_at(11)).unwrap();
     assert!(senders[0].send(SourceMessage::CaughtUp));
     assert!(senders[1].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 1, books_idle: true, closed: false });
     assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[1], FileEvent::BooksCaughtUp));
 }
 
 #[tokio::test]
@@ -127,13 +128,13 @@ async fn queued_book_lines_counts_undelivered_book_lines_but_not_fills() {
     assert_eq!(rx.queued_book_lines(), 2);
 
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 1, "the status reader has not reached EOF");
+    assert_eq!(rx.recv_many(&mut ready, 8).await.events, 1, "the status reader has not reached EOF");
     assert!(matches!(&ready[0], FileEvent::Fill(_)));
     assert_eq!(rx.queued_book_lines(), 2, "a diff held as the merge head is still queued");
 
     ready.clear();
     assert!(senders[1].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.recv_many(&mut ready, 8).await.events, 2);
     assert_eq!(rx.queued_book_lines(), 0);
 }
 
@@ -147,11 +148,11 @@ async fn books_caught_up_is_reported_ahead_of_a_fill_backlog() {
         senders[2].try_send(FileEvent::Fill(format!(r#"{{"block_number":{height}}}"#))).unwrap();
     }
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 3);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 2, books_idle: true, closed: false });
     assert!(
         matches!(
             ready.as_slice(),
-            [FileEvent::BooksCaughtUp, FileEvent::Fill(first), FileEvent::Fill(second)]
+            [FileEvent::Fill(first), FileEvent::Fill(second)]
                 if first.contains("10") && second.contains("11")
         ),
         "{ready:?}"
@@ -166,18 +167,25 @@ async fn books_caught_up_is_reported_once_until_the_next_book_event() {
     senders[1].try_send(status_at(10)).unwrap();
     assert!(senders[0].send(SourceMessage::CaughtUp));
     let mut ready = Vec::new();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 1, "the status reader has not reached EOF");
+    assert_eq!(
+        rx.recv_many(&mut ready, 8).await,
+        Received { events: 1, books_idle: false, closed: false },
+        "the status reader has not reached EOF"
+    );
     assert!(matches!(&ready[0], FileEvent::OrderStatus(_)));
 
     ready.clear();
     assert!(senders[1].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 1, books_idle: true, closed: false });
     assert!(matches!(&ready[0], FileEvent::OrderDiff(_)));
-    assert!(matches!(&ready[1], FileEvent::BooksCaughtUp));
 
     ready.clear();
     senders[2].try_send(FileEvent::Fill(r#"{"block_number":10}"#.to_string())).unwrap();
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 1);
+    assert_eq!(
+        rx.recv_many(&mut ready, 8).await,
+        Received { events: 1, books_idle: false, closed: false },
+        "a fill does not report idle again"
+    );
     assert!(matches!(&ready[0], FileEvent::Fill(_)));
     ready.clear();
     assert!(
@@ -187,9 +195,8 @@ async fn books_caught_up_is_reported_once_until_the_next_book_event() {
 
     senders[0].try_send(diff_at(11)).unwrap();
     assert!(senders[0].send(SourceMessage::CaughtUp));
-    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.recv_many(&mut ready, 8).await, Received { events: 1, books_idle: true, closed: false });
     assert!(matches!(&ready[0], FileEvent::OrderDiff(line) if line.contains("11")));
-    assert!(matches!(&ready[1], FileEvent::BooksCaughtUp));
 }
 
 #[test]
@@ -388,9 +395,12 @@ async fn byte_budget_stalls_reader_while_appends_continue_and_releases_after_dra
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
     assert!(budget.state.lock().unwrap().used <= 200);
     let mut ready = Vec::new();
-    assert_eq!(receiver.recv_many(&mut ready, 1).await, 1);
+    assert_eq!(receiver.recv_many(&mut ready, 1).await.events, 1);
     assert!(done_rx.try_recv().is_err(), "the receiver still owns the batch lease");
-    assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver.recv_many(&mut ready, 8)).await.unwrap(), 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv_many(&mut ready, 8)).await.unwrap().events,
+        1
+    );
     assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
     producer.join().unwrap();
     assert_eq!(ready.len(), 2);
@@ -423,13 +433,13 @@ async fn batches_preserve_height_order_and_receive_turns_bound_bytes() {
     assert!(senders[1].send_lines(vec![line(2), line(4)]));
     drop(senders);
     let mut ready = Vec::new();
-    assert_eq!(receiver.recv_many(&mut ready, 100).await, 2);
+    assert_eq!(receiver.recv_many(&mut ready, 100).await.events, 2);
     assert!(matches!(&ready[0], FileEvent::OrderDiff(line) if line.starts_with("{\"block_number\":1,")));
     assert!(matches!(&ready[1], FileEvent::OrderStatus(line) if line.starts_with("{\"block_number\":2,")));
-    assert_eq!(receiver.recv_many(&mut ready, 100).await, 2);
+    assert_eq!(receiver.recv_many(&mut ready, 100).await.events, 2);
     assert!(matches!(&ready[2], FileEvent::OrderDiff(line) if line.starts_with("{\"block_number\":3,")));
     assert!(matches!(&ready[3], FileEvent::OrderStatus(line) if line.starts_with("{\"block_number\":4,")));
-    assert_eq!(receiver.recv_many(&mut ready, 100).await, 0);
+    assert_eq!(receiver.recv_many(&mut ready, 100).await, Received { events: 0, books_idle: false, closed: true });
 }
 #[tokio::test]
 async fn poll_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
@@ -466,8 +476,8 @@ async fn drains_bursts_and_rotation_after_consumer_stalls(name: &str, mode: Stre
         let mut ready = Vec::new();
         while expected <= 2000 {
             ready.clear();
-            assert!(receiver.recv_many(&mut ready, 128).await > 0);
-            for event in ready.iter().filter(|event| !matches!(event, FileEvent::BooksCaughtUp)) {
+            assert!(!receiver.recv_many(&mut ready, 128).await.closed);
+            for event in &ready {
                 assert!(
                     matches!(event, FileEvent::OrderDiff(actual) if actual == &line(expected)),
                     "unexpected event: {event:?}"
@@ -599,8 +609,7 @@ async fn attaches_all_sources_before_returning(name: &str, mode: StreamWatch) {
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         let mut ready = Vec::new();
         while ready.len() < 2 {
-            assert!(receiver.recv_many(&mut ready, 2).await > 0);
-            ready.retain(|event| !matches!(event, FileEvent::BooksCaughtUp));
+            assert!(!receiver.recv_many(&mut ready, 2).await.closed);
         }
         for event in ready {
             match event {
@@ -644,7 +653,7 @@ async fn historical_fill_backlog_cannot_starve_ready_book_events() {
     }
     drop(senders);
     let mut ready = Vec::new();
-    assert_eq!(receiver.recv_many(&mut ready, 2).await, 2);
+    assert_eq!(receiver.recv_many(&mut ready, 2).await.events, 2);
     assert!(
         ready.iter().any(|event| matches!(event, FileEvent::OrderStatus(_))),
         "book progress must not wait for the unrelated fill backlog"

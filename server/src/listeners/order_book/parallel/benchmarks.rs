@@ -117,11 +117,11 @@ async fn drain_order_diffs(receiver: &mut FileEventReceiver) -> u64 {
     let mut batch = Vec::with_capacity(4096);
     loop {
         batch.clear();
-        let count = receiver.recv_many(&mut batch, 4096).await;
-        if count == 0 {
+        let batch_info = receiver.recv_many(&mut batch, 4096).await;
+        if batch_info.closed && batch_info.events == 0 {
             break;
         }
-        for event in batch.iter().filter(|event| !matches!(event, FileEvent::BooksCaughtUp)) {
+        for event in &batch {
             let FileEvent::OrderDiff(line) = event else {
                 panic!("benchmark received an unexpected event: {event:?}");
             };

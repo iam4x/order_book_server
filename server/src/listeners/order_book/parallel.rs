@@ -43,7 +43,30 @@ pub(crate) enum FileEvent {
     OrderDiff(String),
     Fill(String),
     ContinuityLost(EventSource),
-    /// Every book stream reached EOF and its delivered lines ran out.
+}
+
+impl FileEvent {
+    fn is_book_event(&self) -> bool {
+        match self {
+            Self::OrderStatus(_) | Self::OrderDiff(_) => true,
+            Self::Fill(_) => false,
+            Self::ContinuityLost(source) => *source != EventSource::Fills,
+        }
+    }
+}
+
+/// What one `recv_many` call delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Received {
+    pub(crate) events: usize,
+    /// Every book stream reached EOF after the batch's last book event.
+    pub(crate) books_idle: bool,
+    /// Every stream ended.
+    pub(crate) closed: bool,
+}
+
+enum Delivery {
+    Event(FileEvent),
     BooksCaughtUp,
 }
 
@@ -168,7 +191,6 @@ impl SourceSender {
                 self.batch(vec![line], false).ok_or("byte budget exhausted or closed")?
             }
             FileEvent::ContinuityLost(_) => SourceMessage::ContinuityLost,
-            FileEvent::BooksCaughtUp => return Err("receiver-only event"),
         };
         self.tx.try_send(message).map_err(|_| "batch queue full or closed")
     }
@@ -224,7 +246,7 @@ impl Drop for SourceQueue {
 /// the other streams keep moving when a source has no more events available.
 /// Start each block with statuses, then alternate book sources within that block.
 /// Fills use alternating delivery turns rather than participating in book height order.
-/// Once the book streams run dry it reports `BooksCaughtUp`, then waits for the next book event to re-arm.
+/// Once the book streams run dry it reports them idle, then waits for the next book event to re-arm.
 pub(crate) struct FileEventReceiver {
     sources: Vec<SourceQueue>,
     last_book_event: Option<(EventSource, u64)>,
@@ -248,7 +270,7 @@ impl FileEventReceiver {
             .sum()
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<FileEvent>> {
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Delivery>> {
         for source in &mut self.sources {
             source.poll_head(cx);
         }
@@ -262,7 +284,7 @@ impl FileEventReceiver {
             && book_sources.all(|source| source.head.is_none() && (source.caught_up || source.closed));
         if books_caught_up && !self.books_caught_up_reported {
             self.books_caught_up_reported = true;
-            return Poll::Ready(Some(FileEvent::BooksCaughtUp));
+            return Poll::Ready(Some(Delivery::BooksCaughtUp));
         }
         let waiting_for_book = self.sources.iter().any(|source| {
             source.source != EventSource::Fills && source.head.is_none() && !source.caught_up && !source.closed
@@ -291,29 +313,35 @@ impl FileEventReceiver {
                 self.last_book_event = Some((source.source, height));
                 self.books_caught_up_reported = false;
             }
-            return Poll::Ready(source.head.take().map(|(_, event)| event));
+            return Poll::Ready(source.head.take().map(|(_, event)| Delivery::Event(event)));
         }
         Poll::Pending
     }
 
-    pub(super) async fn recv_many(&mut self, buffer: &mut Vec<FileEvent>, limit: usize) -> usize {
+    pub(super) async fn recv_many(&mut self, buffer: &mut Vec<FileEvent>, limit: usize) -> Received {
         poll_fn(|cx| {
-            let mut received = 0;
+            let mut received = Received { events: 0, books_idle: false, closed: false };
             let mut bytes = 0;
-            while received < limit && bytes < RECEIVE_BYTES_PER_TURN {
+            while received.events < limit && bytes < RECEIVE_BYTES_PER_TURN {
                 match self.poll_recv(cx) {
-                    Poll::Ready(Some(event)) => {
+                    Poll::Ready(Some(Delivery::Event(event))) => {
                         bytes += match &event {
                             FileEvent::OrderStatus(line) | FileEvent::OrderDiff(line) | FileEvent::Fill(line) => {
                                 line.len()
                             }
-                            FileEvent::ContinuityLost(_) | FileEvent::BooksCaughtUp => 0,
+                            FileEvent::ContinuityLost(_) => 0,
                         };
+                        received.books_idle &= !event.is_book_event();
                         buffer.push(event);
-                        received += 1;
+                        received.events += 1;
                     }
-                    Poll::Pending if received == 0 => return Poll::Pending,
-                    Poll::Ready(None) | Poll::Pending => break,
+                    Poll::Ready(Some(Delivery::BooksCaughtUp)) => received.books_idle = true,
+                    Poll::Ready(None) => {
+                        received.closed = true;
+                        break;
+                    }
+                    Poll::Pending if received.events == 0 && !received.books_idle => return Poll::Pending,
+                    Poll::Pending => break,
                 }
             }
             Poll::Ready(received)
