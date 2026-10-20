@@ -12,7 +12,7 @@ fn append_to_file(path: &PathBuf, contents: &str) {
     std::io::Write::write_all(&mut file, contents.as_bytes()).expect("test stream file should append");
 }
 
-const WATCH_MODES: [StreamWatch; 2] = [StreamWatch::Poll { interval: Duration::from_millis(1) }, StreamWatch::Inotify];
+const POLL: StreamWatch = StreamWatch::Poll { interval: Duration::from_millis(1) };
 
 fn features(value: &str) -> FeatureSet {
     value.parse().expect("valid features")
@@ -344,10 +344,13 @@ async fn batches_preserve_height_order_and_receive_turns_bound_bytes() {
     assert_eq!(receiver.recv_many(&mut ready, 100).await, 0);
 }
 #[tokio::test]
-async fn real_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
-    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
-        drains_bursts_and_rotation_after_consumer_stalls(&format!("watcher-burst-{index}"), mode).await;
-    }
+async fn poll_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
+    drains_bursts_and_rotation_after_consumer_stalls("watcher-burst-poll", POLL).await;
+}
+
+#[tokio::test]
+async fn inotify_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
+    drains_bursts_and_rotation_after_consumer_stalls("watcher-burst-inotify", StreamWatch::Inotify).await;
 }
 
 async fn drains_bursts_and_rotation_after_consumer_stalls(name: &str, mode: StreamWatch) {
@@ -405,8 +408,7 @@ async fn poll_watcher_yields_a_record_written_in_pieces_once_and_discovers_the_n
     std::fs::write(&path, "").unwrap();
     let (mut senders, mut receiver) = file_event_channels(&[EventSource::OrderDiffs], 4);
     let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: senders.remove(0) };
-    let mode = StreamWatch::Poll { interval: Duration::from_millis(1) };
-    let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink, mode);
+    let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink, POLL);
     ready.await.unwrap();
     let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
     for (index, piece) in format!("{FIRST}\n").as_bytes().chunks(3).enumerate() {
@@ -455,24 +457,33 @@ fn first_file_after_watcher_start_is_read_from_the_beginning() {
 }
 
 #[tokio::test]
-async fn startup_failure_is_returned_instead_of_serving_an_incomplete_book() {
-    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
-        let base = stream_test_dir(&format!("startup-failure-{index}"));
-        let result = start_parallel_file_watchers(base.clone(), features("orderupdates"), None, mode).await;
-        assert_eq!(
-            result.err().map(|err| err.to_string()).as_deref(),
-            Some("OrderStatuses watcher failed before stream attachment"),
-            "{mode:?}"
-        );
-        std::fs::remove_dir_all(base).unwrap();
-    }
+async fn poll_startup_failure_is_returned_instead_of_serving_an_incomplete_book() {
+    startup_failure_is_returned("startup-failure-poll", POLL).await;
 }
 
 #[tokio::test]
-async fn startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler() {
-    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
-        attaches_all_sources_before_returning(&format!("startup-barrier-{index}"), mode).await;
-    }
+async fn inotify_startup_failure_is_returned_instead_of_serving_an_incomplete_book() {
+    startup_failure_is_returned("startup-failure-inotify", StreamWatch::Inotify).await;
+}
+
+async fn startup_failure_is_returned(name: &str, mode: StreamWatch) {
+    let base = stream_test_dir(name);
+    let result = start_parallel_file_watchers(base.clone(), features("orderupdates"), None, mode).await;
+    assert_eq!(
+        result.err().map(|err| err.to_string()).as_deref(),
+        Some("OrderStatuses watcher failed before stream attachment")
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn poll_startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler() {
+    attaches_all_sources_before_returning("startup-barrier-poll", POLL).await;
+}
+
+#[tokio::test]
+async fn inotify_startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler() {
+    attaches_all_sources_before_returning("startup-barrier-inotify", StreamWatch::Inotify).await;
 }
 
 async fn attaches_all_sources_before_returning(name: &str, mode: StreamWatch) {
