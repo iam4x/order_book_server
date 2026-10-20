@@ -647,7 +647,7 @@ mod tests {
         (Px::parse_from_str(px).unwrap(), Sz::parse_from_str(sz).unwrap(), n)
     }
 
-    fn l2_levels(state: &OrderBookState, coin: &str) -> Option<[Vec<(Px, Sz, usize)>; 2]> {
+    fn l2_levels(state: &OrderBookState, coin: &str) -> [Vec<(Px, Sz, u32)>; 2] {
         let coin = Coin::new(coin);
         let params = L2SnapshotParams::new(None, None);
         let (_time, snapshots) = state.l2_snapshots_incremental(
@@ -655,8 +655,11 @@ mod tests {
             &HashSet::from([params]),
             &mut HashMap::new(),
         );
-        let snapshot = snapshots.as_ref().get(&coin)?.get(&params)?.clone();
-        Some(snapshot.as_ref().clone().map(|levels| levels.into_iter().map(|l| (l.px, l.sz, l.n)).collect()))
+        let snapshot = snapshots.as_ref().get(&coin).expect("coin L2").get(&params).expect("default L2 params").clone();
+        snapshot
+            .as_ref()
+            .clone()
+            .map(|levels| levels.into_iter().map(|l| (l.px, l.sz, u32::try_from(l.n).unwrap())).collect())
     }
 
     fn make_l4_order_at(coin: &str, oid: u64, side: Side, px: &str) -> L4Order {
@@ -697,15 +700,7 @@ mod tests {
     }
 
     fn make_order_diff(coin: &str, oid: u64, diff: OrderDiff) -> NodeDataOrderDiff {
-        serde_json::from_value(serde_json::json!({
-            "user": "0x0000000000000000000000000000000000000000",
-            "oid": oid,
-            "side": "B",
-            "px": "100.0",
-            "coin": coin,
-            "raw_book_diff": diff
-        }))
-        .unwrap()
+        make_order_diff_at(coin, oid, Side::Bid, "100.0", diff)
     }
 
     fn make_status_batch(statuses: Vec<NodeDataOrderStatus>) -> Batch<NodeDataOrderStatus> {
@@ -1778,8 +1773,9 @@ mod tests {
             assert_eq!(l2_levels(&diffs_only, coin), l2_levels(&paired, coin), "{coin} L2");
             assert_eq!(bbo(&diffs_only, coin), bbo(&paired, coin), "{coin} BBO");
         }
+        assert_eq!(l2_levels(&diffs_only, "BTC"), [vec![level("100.0", "1.5", 2)], vec![level("101.0", "1.25", 1)]]);
+        assert_eq!(l2_levels(&diffs_only, "ETH"), [vec![level("1999.5", "4.0", 1)], Vec::new()]);
         assert_eq!(bbo(&diffs_only, "BTC"), (Some(level("100.0", "1.5", 2)), Some(level("101.0", "1.25", 1))));
-        assert_eq!(bbo(&diffs_only, "ETH"), (Some(level("1999.5", "4.0", 1)), None));
         assert_eq!(paired.pending_order_statuses_count(), 0);
         assert_eq!(paired.pending_new_diffs_count(), 0);
         assert_eq!(diffs_only.order_count(), 4);
