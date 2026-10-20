@@ -1759,6 +1759,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             stream_gaps.push(source);
                             continue;
                         }
+                        parallel::FileEvent::BooksCaughtUp => continue,
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
@@ -3541,7 +3542,7 @@ mod tests {
                 let (line, source) = match event {
                     parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
                     parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
-                    parallel::FileEvent::Fill(_) => continue,
+                    parallel::FileEvent::Fill(_) | parallel::FileEvent::BooksCaughtUp => continue,
                     event @ parallel::FileEvent::ContinuityLost(_) => panic!("unexpected event: {event:?}"),
                 };
                 listener.apply_parsed_hft(parse_hft_event(line, source).unwrap().unwrap());
