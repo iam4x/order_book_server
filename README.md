@@ -176,7 +176,7 @@ The `--markets` flag accepts comma-delimited market names. The `all` value remai
 |------|---------|-------------|
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
 | `--stream-watch` | `poll` | How readers wait for new stream data: `poll` or `inotify`. See [Stream Watching](#stream-watching) |
-| `--poll-interval-us` | `1000` | Microseconds a reader sleeps at EOF before reading again. Must be at least 1. Ignored with `--stream-watch inotify` |
+| `--poll-interval-us` | `1000` | Microseconds a reader sleeps at EOF before reading again, from 1 to 1000000. A longer sleep would delay the one-second scan for new hourly files. Ignored with `--stream-watch inotify` |
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--allbbo-heartbeat-ms` | `0` | If > 0, resend the last `allbbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
