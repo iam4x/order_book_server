@@ -60,7 +60,7 @@ pub(in crate::listeners::order_book) struct StreamKey {
 }
 
 impl StreamKey {
-    pub(in crate::listeners::order_book) fn from_path(path: &Path) -> Option<Self> {
+    fn from_path(path: &Path) -> Option<Self> {
         let hour = path.file_name()?.to_str()?.parse::<u8>().ok()?;
         if hour > 23 {
             return None;
@@ -84,6 +84,35 @@ impl StreamKey {
     fn path(self, base_dir: &Path) -> PathBuf {
         base_dir.join("hourly").join(self.day.format("%Y%m%d").to_string()).join(self.hour.to_string())
     }
+}
+
+/// The hourly stream files under `base_dir/hourly` from `minimum_day` on, in stream order.
+pub(in crate::listeners::order_book) fn hourly_stream_files(
+    base_dir: &Path,
+    minimum_day: NaiveDate,
+) -> Vec<(StreamKey, PathBuf)> {
+    let Ok(days) = std::fs::read_dir(base_dir.join("hourly")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = days
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| NaiveDate::parse_from_str(name, "%Y%m%d").ok())
+                .is_some_and(|day| day >= minimum_day)
+        })
+        .flat_map(|entry| std::fs::read_dir(entry.path()).into_iter().flatten().flatten())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            StreamKey::from_path(&path).map(|key| (key, path))
+        })
+        .collect();
+    files.sort_unstable_by_key(|(key, _)| *key);
+    files
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,12 +316,7 @@ impl FileReader {
 
     pub(super) fn check_for_newer_file(&mut self) -> Option<PathBuf> {
         let Some(current_path) = self.tracked.as_ref().map(|tracked| tracked.opened.path.clone()) else {
-            return self
-                .stream_files(NaiveDate::MIN)
-                .into_iter()
-                .filter_map(|path| StreamKey::from_path(&path).map(|key| (key, path)))
-                .min_by_key(|(key, _)| *key)
-                .map(|(_, path)| path);
+            return hourly_stream_files(&self.base_dir, NaiveDate::MIN).into_iter().next().map(|(_, path)| path);
         };
         match OpenedStream::open(&current_path) {
             Ok(Some(opened))
@@ -307,12 +331,8 @@ impl FileReader {
         }
 
         let current_key = self.tracked.as_ref()?.opened.key;
-        let discovered = self
-            .stream_files(current_key.day)
-            .into_iter()
-            .filter_map(|path| StreamKey::from_path(&path).map(|key| (key, path)))
-            .filter(|(key, _)| *key > current_key)
-            .min_by_key(|(key, _)| *key);
+        let discovered =
+            hourly_stream_files(&self.base_dir, current_key.day).into_iter().find(|(key, _)| *key > current_key);
         match (self.pending.as_ref(), discovered) {
             (Some(pending), Some((key, path))) if key < pending.key => Some(path),
             (Some(pending), _) => Some(pending.path.clone()),
@@ -494,25 +514,6 @@ impl FileReader {
             }
         }
         Ok(None)
-    }
-
-    fn stream_files(&self, minimum_day: NaiveDate) -> Vec<PathBuf> {
-        let Ok(days) = std::fs::read_dir(self.base_dir.join("hourly")) else {
-            return Vec::new();
-        };
-        days.flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| NaiveDate::parse_from_str(name, "%Y%m%d").ok())
-                    .is_some_and(|day| day >= minimum_day)
-            })
-            .flat_map(|entry| std::fs::read_dir(entry.path()).into_iter().flatten().flatten())
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .map(|entry| entry.path())
-            .collect()
     }
 
     const fn mark_path_missing(&mut self) {

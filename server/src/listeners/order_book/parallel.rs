@@ -2,7 +2,7 @@
 mod benchmarks;
 mod reader;
 
-pub(super) use reader::StreamKey;
+pub(super) use reader::hourly_stream_files;
 use reader::{FileContinuity, FileRead, FileReader, ReadProgress};
 
 use std::{

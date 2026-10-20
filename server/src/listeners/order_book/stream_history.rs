@@ -4,10 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use chrono::NaiveDate;
 use log::warn;
 use sonic_rs::JsonValueTrait;
 
-use super::{SnapshotReplayOutcome, parallel::StreamKey, state::OrderBookState};
+use super::{SnapshotReplayOutcome, parallel::hourly_stream_files, state::OrderBookState};
 use crate::{prelude::*, types::node_data::EventSource};
 
 /// Replay the stream lines hl-node keeps on disk for blocks in
@@ -67,7 +68,7 @@ impl SourceCursor {
         clean: &mut bool,
     ) -> Result<Self> {
         let dir = source.event_source_dir_streaming(data_dir);
-        let files = hourly_files(&dir)?;
+        let files: Vec<PathBuf> = hourly_stream_files(&dir, NaiveDate::MIN).into_iter().map(|(_, path)| path).collect();
         let mut start = None;
         for (index, path) in files.iter().enumerate() {
             if first_block(path)?.is_some_and(|block| block <= after_height) {
@@ -130,25 +131,6 @@ impl SourceCursor {
             }
         }
     }
-}
-
-fn hourly_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let hourly_dir = dir.join("hourly");
-    let mut files = Vec::new();
-    for day in fs::read_dir(&hourly_dir).map_err(|err| format!("Failed to list {}: {err}", hourly_dir.display()))? {
-        let day = day?;
-        if !day.file_type()?.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(day.path())? {
-            let path = entry?.path();
-            if let Some(key) = StreamKey::from_path(&path) {
-                files.push((key, path));
-            }
-        }
-    }
-    files.sort_unstable_by_key(|(key, _)| *key);
-    Ok(files.into_iter().map(|(_, path)| path).collect())
 }
 
 fn first_block(path: &Path) -> Result<Option<u64>> {
