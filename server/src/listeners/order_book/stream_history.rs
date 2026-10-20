@@ -130,8 +130,6 @@ impl SourceCursor {
         Ok(cursor)
     }
 
-    /// Load the next line inside the replay window into `head`, or leave it empty
-    /// once the source reaches a block past `through_height`.
     fn advance(&mut self, clean: &mut bool) -> Result<()> {
         loop {
             let mut line = Vec::new();
