@@ -29,12 +29,19 @@ pub(super) fn replay_stream_history(
         .iter()
         .map(|&source| SourceCursor::open(source, data_dir, after_height, through_height, &mut outcome.clean))
         .collect::<Result<Vec<_>>>()?;
-    while let Some((_, index)) = cursors
+    let count = cursors.len();
+    let mut last = count.saturating_sub(1);
+    // Within a block, rotate between sources line by line like the live receiver,
+    // so a large block cannot overflow one side's pending cache before the other arrives.
+    while let Some((_, _, index)) = cursors
         .iter()
         .enumerate()
-        .filter_map(|(index, cursor)| cursor.head.as_ref().map(|(block, _)| (*block, index)))
+        .filter_map(|(index, cursor)| {
+            cursor.head.as_ref().map(|(block, _)| (*block, (index + count - last - 1) % count, index))
+        })
         .min()
     {
+        last = index;
         let cursor = &mut cursors[index];
         if let Some((_, line)) = cursor.head.take() {
             apply_history_line(state, cursor.source, &line, replay_guard_height, &mut outcome);
@@ -398,6 +405,37 @@ mod tests {
             &[EventSource::OrderDiffs, EventSource::OrderStatuses],
             0,
             10_001,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.replayed_lines, 20_002);
+        assert!(outcome.clean);
+        assert_eq!(state.order_count(), 10_001);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert!(state.take_repair_reasons().is_empty());
+    }
+
+    #[test]
+    fn history_replay_interleaves_sources_within_a_block() {
+        let data_dir = history_test_dir("same-block");
+        let oids = 1..=10_001;
+        let mut diffs = vec![new_bid_line(0, 0)];
+        diffs.extend(oids.clone().map(|oid| new_bid_line(oid, 1)));
+        diffs.push(new_bid_line(0, 2));
+        write_hour(&data_dir, EventSource::OrderDiffs, "20261020", 0, &diffs, "");
+        let mut statuses = vec![open_status_line(0, 0)];
+        statuses.extend(oids.map(|oid| open_status_line(oid, 1)));
+        statuses.push(open_status_line(0, 2));
+        write_hour(&data_dir, EventSource::OrderStatuses, "20261020", 0, &statuses, "");
+        let mut state = empty_state(0, BookMode::StatusPaired);
+
+        let outcome = replay_stream_history(
+            &mut state,
+            &data_dir,
+            &[EventSource::OrderDiffs, EventSource::OrderStatuses],
+            0,
+            1,
             0,
         )
         .unwrap();
