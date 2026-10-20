@@ -397,7 +397,7 @@ async fn drains_bursts_and_rotation_after_consumer_stalls(name: &str, mode: Stre
 }
 
 #[tokio::test]
-async fn poll_watcher_holds_a_partial_record_until_complete_and_discovers_the_next_hour() {
+async fn poll_watcher_holds_a_partial_record_until_complete_and_switches_to_the_next_hour_promptly() {
     const FIRST: &str = "{\"block_number\":7,\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}";
     const SECOND: &str = "{\"block_number\":8}";
     let base_dir = stream_test_dir("poll-partial");
@@ -418,26 +418,23 @@ async fn poll_watcher_holds_a_partial_record_until_complete_and_discovers_the_ne
     append_to_file(&path, head);
     assert!(caught_up(&mut receiver).await, "read the partial record to EOF without emitting a line");
     append_to_file(&path, &format!("{tail}\n"));
-    std::fs::write(day_dir.join("20"), format!("{SECOND}\n")).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(3), async {
+    let next_line = async |receiver: &mut FileEventReceiver, within| {
         let mut ready = Vec::new();
-        while ready.len() < 2 {
-            assert!(receiver.recv_many(&mut ready, 8).await > 0);
+        tokio::time::timeout(within, receiver.recv_many(&mut ready, 1)).await.unwrap();
+        match ready.pop() {
+            Some(FileEvent::OrderDiff(line)) => line,
+            other => panic!("unexpected event: {other:?}"),
         }
-        ready
-    })
-    .await;
+    };
+    assert_eq!(next_line(&mut receiver, Duration::from_secs(5)).await, FIRST);
+    std::fs::write(day_dir.join("20"), format!("{SECOND}\n")).unwrap();
+    assert_eq!(
+        next_line(&mut receiver, DISCOVERY_INTERVAL / 2).await,
+        SECOND,
+        "next hour read before the discovery rescan"
+    );
     drop(receiver);
     watcher.join().unwrap();
-    let lines: Vec<_> = result
-        .unwrap()
-        .into_iter()
-        .map(|event| match event {
-            FileEvent::OrderDiff(line) => line,
-            other => panic!("unexpected event: {other:?}"),
-        })
-        .collect();
-    assert_eq!(lines, [FIRST, SECOND]);
     std::fs::remove_dir_all(base_dir).unwrap();
 }
 
