@@ -460,11 +460,7 @@ enum StreamWaker {
 impl StreamWaker {
     fn start(mode: StreamWatch, dir: &Path) -> notify::Result<Self> {
         match mode {
-            StreamWatch::Poll { interval } => {
-                // A wrong --data-dir must fail startup here, as the inotify watch does.
-                std::fs::metadata(dir).map_err(notify::Error::io)?;
-                Ok(Self::Poll(interval))
-            }
+            StreamWatch::Poll { interval } => Ok(Self::Poll(interval)),
             StreamWatch::Inotify => {
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 let signal = Arc::new(WatcherSignal { flags: AtomicU8::new(0), tx });
