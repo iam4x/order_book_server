@@ -8,10 +8,7 @@ use log::warn;
 use sonic_rs::JsonValueTrait;
 
 use super::{SnapshotReplayOutcome, parallel::StreamKey, state::OrderBookState};
-use crate::{
-    prelude::*,
-    types::node_data::{Batch, EventSource, NodeDataOrderDiff, NodeDataOrderStatus},
-};
+use crate::{prelude::*, types::node_data::EventSource};
 
 /// Replay the stream lines hl-node keeps on disk for blocks in
 /// `(after_height, through_height]`. Sources are merged by block number so the
@@ -23,7 +20,7 @@ pub(super) fn replay_stream_history(
     through_height: u64,
     replay_guard_height: u64,
 ) -> Result<SnapshotReplayOutcome> {
-    let mut outcome = SnapshotReplayOutcome { replayed_lines: 0, clean: true };
+    let mut outcome = SnapshotReplayOutcome::new();
     let mut cursors = state
         .book_mode()
         .sources()
@@ -45,40 +42,11 @@ pub(super) fn replay_stream_history(
         last = index;
         let cursor = &mut cursors[index];
         if let Some((_, line)) = cursor.head.take() {
-            apply_history_line(state, cursor.source, &line, replay_guard_height, &mut outcome);
+            outcome.apply_line(state, cursor.source, &line, after_height, replay_guard_height);
         }
         cursor.advance(&mut outcome.clean)?;
     }
     Ok(outcome)
-}
-
-fn apply_history_line(
-    state: &mut OrderBookState,
-    source: EventSource,
-    line: &[u8],
-    replay_guard_height: u64,
-    outcome: &mut SnapshotReplayOutcome,
-) {
-    let applied = match source {
-        EventSource::OrderDiffs => sonic_rs::from_slice::<Batch<NodeDataOrderDiff>>(line)
-            .map(|batch| state.apply_order_diffs_after_snapshot(batch, replay_guard_height)),
-        EventSource::OrderStatuses => {
-            sonic_rs::from_slice::<Batch<NodeDataOrderStatus>>(line).map(|batch| state.apply_order_statuses_hft(batch))
-        }
-        EventSource::Fills => return,
-    };
-    match applied {
-        Ok(Ok(_)) => outcome.replayed_lines += 1,
-        Ok(Err(err)) => {
-            warn!("Skipping {source} history line that failed to apply: {err}");
-            outcome.replayed_lines += 1;
-            outcome.clean = false;
-        }
-        Err(err) => {
-            warn!("Skipping unparsable {source} history line: {err}");
-            outcome.clean = false;
-        }
-    }
 }
 
 struct SourceCursor {

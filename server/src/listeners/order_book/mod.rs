@@ -566,71 +566,81 @@ struct SnapshotReplayOutcome {
     clean: bool,
 }
 
+impl SnapshotReplayOutcome {
+    const fn new() -> Self {
+        Self { replayed_lines: 0, clean: true }
+    }
+
+    /// Apply one replayed stream line with a block above `after_height` to `state`.
+    /// Diffs at or below `replay_guard_height` use replay semantics.
+    fn apply_line(
+        &mut self,
+        state: &mut OrderBookState,
+        source: EventSource,
+        json: &[u8],
+        after_height: u64,
+        replay_guard_height: u64,
+    ) {
+        let applied = match source {
+            EventSource::OrderDiffs => sonic_rs::from_slice::<Batch<NodeDataOrderDiff>>(json).map(|batch| {
+                (batch.block_number() > after_height)
+                    .then(|| state.apply_order_diffs_after_snapshot(batch, replay_guard_height))
+            }),
+            EventSource::OrderStatuses => sonic_rs::from_slice::<Batch<NodeDataOrderStatus>>(json)
+                .map(|batch| (batch.block_number() > after_height).then(|| state.apply_order_statuses_hft(batch))),
+            EventSource::Fills => return,
+        };
+        match applied {
+            Ok(None) => {}
+            Ok(Some(Ok(_))) => self.replayed_lines += 1,
+            Ok(Some(Err(err))) => {
+                warn!("Skipping {source} replay line above block {after_height} that failed to apply: {err}");
+                self.replayed_lines += 1;
+                self.clean = false;
+            }
+            Err(err) => {
+                warn!("Skipping unparsable {source} replay line: {err}");
+                self.clean = false;
+            }
+        }
+    }
+}
+
 fn replay_snapshot_cache(
     state: &mut OrderBookState,
     replay_cutoff_height: u64,
-    snapshot_height: u64,
+    replay_guard_height: u64,
     mut replay_cache: SnapshotReplayCache,
 ) -> Result<SnapshotReplayOutcome> {
     let Some(writer) = replay_cache.writer.take() else {
         if replay_cache.line_count == 0 {
-            return Ok(SnapshotReplayOutcome { replayed_lines: 0, clean: true });
+            return Ok(SnapshotReplayOutcome::new());
         }
         return Err("Snapshot replay journal was unavailable".into());
     };
     let mut file = writer.into_inner().map_err(std::io::IntoInnerError::into_error)?;
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut replayed_lines = 0;
-    let mut clean = true;
+    let mut line = Vec::new();
+    let mut outcome = SnapshotReplayOutcome::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let Some((tag, json)) = line.as_bytes().split_first() else { continue };
-        let json = std::str::from_utf8(json)?.trim_end_matches(['\r', '\n']);
-        match tag {
-            b'S' => match sonic_rs::from_str::<Batch<NodeDataOrderStatus>>(json) {
-                Ok(batch) => {
-                    if batch.block_number() <= replay_cutoff_height {
-                        continue;
-                    }
-                    if let Err(err) = state.apply_order_statuses_hft(batch) {
-                        warn!("Skipping cached order-status replay line above cutoff {replay_cutoff_height}: {err}");
-                        clean = false;
-                    }
-                    replayed_lines += 1;
-                }
-                Err(err) => {
-                    warn!("Skipping unparsable cached order-status replay line: {err}");
-                    clean = false;
-                }
-            },
-            b'D' => match sonic_rs::from_str::<Batch<NodeDataOrderDiff>>(json) {
-                Ok(batch) => {
-                    if batch.block_number() <= replay_cutoff_height {
-                        continue;
-                    }
-                    if let Err(err) = state.apply_order_diffs_after_snapshot(batch, snapshot_height) {
-                        warn!("Skipping cached order-diff replay line above cutoff {replay_cutoff_height}: {err}");
-                        clean = false;
-                    }
-                    replayed_lines += 1;
-                }
-                Err(err) => {
-                    warn!("Skipping unparsable cached order-diff replay line: {err}");
-                    clean = false;
-                }
-            },
+        let Some((tag, json)) = line.split_first() else { continue };
+        let source = match tag {
+            b'S' => EventSource::OrderStatuses,
+            b'D' => EventSource::OrderDiffs,
             _ => {
                 warn!("Skipping replay journal line with unknown source tag {tag}");
-                clean = false;
+                outcome.clean = false;
+                continue;
             }
-        }
+        };
+        outcome.apply_line(state, source, json, replay_cutoff_height, replay_guard_height);
     }
-    Ok(SnapshotReplayOutcome { replayed_lines, clean })
+    Ok(outcome)
 }
 
 pub(crate) struct OrderBookListener {
