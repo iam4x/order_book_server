@@ -25,6 +25,10 @@ impl BlockGate {
         Self::Open { block, idle_since: None }
     }
 
+    pub(super) const fn idle(block: u64, since: Instant) -> Self {
+        Self::Open { block, idle_since: Some(since) }
+    }
+
     const fn block(self) -> u64 {
         match self {
             Self::Complete { block } | Self::Open { block, .. } => block,
