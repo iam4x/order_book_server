@@ -43,6 +43,8 @@ pub(crate) enum FileEvent {
     OrderDiff(String),
     Fill(String),
     ContinuityLost(EventSource),
+    /// Every book stream reached EOF and its delivered lines ran out.
+    BooksCaughtUp,
 }
 
 #[derive(Default)]
@@ -166,6 +168,7 @@ impl SourceSender {
                 self.batch(vec![line], false).ok_or("byte budget exhausted or closed")?
             }
             FileEvent::ContinuityLost(_) => SourceMessage::ContinuityLost,
+            FileEvent::BooksCaughtUp => return Err("receiver-only event"),
         };
         self.tx.try_send(message).map_err(|_| "batch queue full or closed")
     }
@@ -221,10 +224,12 @@ impl Drop for SourceQueue {
 /// the other streams keep moving when a source has no more events available.
 /// Start each block with statuses, then alternate book sources within that block.
 /// Fills use alternating delivery turns rather than participating in book height order.
+/// Once the book streams run dry it reports `BooksCaughtUp`, then waits for the next book event to re-arm.
 pub(crate) struct FileEventReceiver {
     sources: Vec<SourceQueue>,
     last_book_event: Option<(EventSource, u64)>,
     last_delivery: Option<EventSource>,
+    books_caught_up_reported: bool,
 }
 
 impl FileEventReceiver {
@@ -264,14 +269,21 @@ impl FileEventReceiver {
             self.last_delivery = Some(source.source);
             if source.source != EventSource::Fills {
                 self.last_book_event = Some((source.source, height));
+                self.books_caught_up_reported = false;
             }
             return Poll::Ready(source.head.take().map(|(_, event)| event));
         }
         if self.sources.iter().all(|source| source.closed && source.head.is_none()) {
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+            return Poll::Ready(None);
         }
+        let mut book_sources = self.sources.iter().filter(|source| source.source != EventSource::Fills).peekable();
+        let books_caught_up = book_sources.peek().is_some()
+            && book_sources.all(|source| source.head.is_none() && (source.caught_up || source.closed));
+        if books_caught_up && !self.books_caught_up_reported {
+            self.books_caught_up_reported = true;
+            return Poll::Ready(Some(FileEvent::BooksCaughtUp));
+        }
+        Poll::Pending
     }
 
     pub(super) async fn recv_many(&mut self, buffer: &mut Vec<FileEvent>, limit: usize) -> usize {
@@ -285,7 +297,7 @@ impl FileEventReceiver {
                             FileEvent::OrderStatus(line) | FileEvent::OrderDiff(line) | FileEvent::Fill(line) => {
                                 line.len()
                             }
-                            FileEvent::ContinuityLost(_) => 0,
+                            FileEvent::ContinuityLost(_) | FileEvent::BooksCaughtUp => 0,
                         };
                         buffer.push(event);
                         received += 1;
@@ -613,7 +625,10 @@ pub(super) fn file_event_channels(sources: &[EventSource], capacity: usize) -> (
             )
         })
         .unzip();
-    (senders, FileEventReceiver { sources, last_book_event: None, last_delivery: None })
+    (
+        senders,
+        FileEventReceiver { sources, last_book_event: None, last_delivery: None, books_caught_up_reported: false },
+    )
 }
 
 /// Uses *_streaming directories (for --stream-with-block-info mode)

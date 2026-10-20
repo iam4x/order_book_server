@@ -121,7 +121,7 @@ async fn drain_order_diffs(receiver: &mut FileEventReceiver) -> u64 {
         if count == 0 {
             break;
         }
-        for event in &batch {
+        for event in batch.iter().filter(|event| !matches!(event, FileEvent::BooksCaughtUp)) {
             let FileEvent::OrderDiff(line) = event else {
                 panic!("benchmark received an unexpected event: {event:?}");
             };
