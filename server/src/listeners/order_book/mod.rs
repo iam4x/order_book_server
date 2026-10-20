@@ -25,7 +25,7 @@ use tokio::{
 use utils::{EventBatch, SnapshotConfig, abci_state_height, get_abci_state_path, get_visor_path, process_rmp_file};
 
 use crate::{
-    FeatureSet,
+    BookMode, FeatureSet,
     listeners::order_book::state::{OrderBookState, PendingRepairReason},
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
@@ -426,7 +426,7 @@ fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<SnapshotTaskResult>,
     ignore_spot: bool,
-    features: FeatureSet,
+    book_mode: BookMode,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -477,22 +477,12 @@ fn fetch_snapshot(
             // The block at each source's journal start may straddle the start of
             // capture, so every block through the latest start comes from disk.
             let replay_cutoff_height = state_height.max(journal_start_height);
-            let sources: Vec<EventSource> = [EventSource::OrderDiffs, EventSource::OrderStatuses]
-                .into_iter()
-                .filter(|source| features.feeds_book(*source))
-                .collect();
-            let mut new_order_book = OrderBookState::from_snapshot(
-                loaded_snapshot.snapshots,
-                state_height,
-                0,
-                ignore_spot,
-                features.book_mode(),
-            );
+            let mut new_order_book =
+                OrderBookState::from_snapshot(loaded_snapshot.snapshots, state_height, 0, ignore_spot, book_mode);
             let (new_order_book, history) = tokio::task::spawn_blocking(move || {
                 replay_stream_history(
                     &mut new_order_book,
                     &data_dir,
-                    &sources,
                     state_height,
                     replay_cutoff_height,
                     replay_guard_height,
@@ -562,7 +552,7 @@ async fn start_snapshot_if_due(
         Arc::clone(listener),
         snapshot_fetch_task_tx.clone(),
         ignore_spot,
-        features,
+        features.book_mode(),
     );
     true
 }
@@ -1807,7 +1797,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        BookMode,
         order_book::{OrderBook, Side, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
@@ -2732,15 +2721,9 @@ mod tests {
             false,
             BookMode::DiffsOnly,
         );
-        let history = replay_stream_history(
-            &mut new_state,
-            &data_dir,
-            &[EventSource::OrderDiffs],
-            state_height,
-            replay_cutoff_height,
-            visor_height,
-        )
-        .expect("history covers the replay window");
+        let history =
+            replay_stream_history(&mut new_state, &data_dir, state_height, replay_cutoff_height, visor_height)
+                .expect("history covers the replay window");
         let outcome = listener
             .install_snapshot_state_with_replay_cutoff(
                 new_state,

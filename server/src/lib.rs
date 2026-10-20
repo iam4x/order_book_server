@@ -44,6 +44,16 @@ pub(crate) enum BookMode {
     DiffsOnly,
 }
 
+impl BookMode {
+    /// The streams that build resting orders in this mode.
+    pub(crate) const fn sources(self) -> &'static [EventSource] {
+        match self {
+            Self::StatusPaired => &[EventSource::OrderDiffs, EventSource::OrderStatuses],
+            Self::DiffsOnly => &[EventSource::OrderDiffs],
+        }
+    }
+}
+
 /// Optional WebSocket channels and the upstream work needed to serve them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureSet {
@@ -131,13 +141,8 @@ impl FeatureSet {
         if self.l4book { BookMode::StatusPaired } else { BookMode::DiffsOnly }
     }
 
-    pub(crate) const fn feeds_book(self, source: EventSource) -> bool {
-        self.requires_book_state()
-            && match source {
-                EventSource::OrderDiffs => true,
-                EventSource::OrderStatuses => matches!(self.book_mode(), BookMode::StatusPaired),
-                EventSource::Fills => false,
-            }
+    pub(crate) fn feeds_book(self, source: EventSource) -> bool {
+        self.requires_book_state() && self.book_mode().sources().contains(&source)
     }
 
     pub const fn watch_order_statuses(self) -> bool {
