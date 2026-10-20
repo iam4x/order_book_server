@@ -49,6 +49,7 @@ use crate::{
 
 mod parallel;
 mod state;
+mod stream_history;
 mod utils;
 
 const L2_BROADCAST_THROTTLE_MS: u64 = 50;
