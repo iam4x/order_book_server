@@ -343,7 +343,7 @@ fn snapshot_replay_cutoff_height(
 ) -> Result<(u64, Option<(u64, u64)>)> {
     match height_source {
         SnapshotHeightSource::Embedded => Ok((snapshot_height, None)),
-        SnapshotHeightSource::Visor => {
+        SnapshotHeightSource::StateFile => {
             let before = visor_height_before.map_err(|err| -> Error {
                 format!("Failed to read visor height before bare snapshot generation: {err}").into()
             })?;
@@ -2458,19 +2458,29 @@ mod tests {
     #[test]
     fn bare_snapshot_requires_visor_heights() {
         assert!(
-            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Err("missing before visor".into()), Ok(43),)
-                .is_err()
+            snapshot_replay_cutoff_height(
+                SnapshotHeightSource::StateFile,
+                42,
+                Err("missing before visor".into()),
+                Ok(43),
+            )
+            .is_err()
         );
         assert!(
-            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Ok(41), Err("missing after visor".into()),)
-                .is_err()
+            snapshot_replay_cutoff_height(
+                SnapshotHeightSource::StateFile,
+                42,
+                Ok(41),
+                Err("missing after visor".into()),
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn bare_snapshot_uses_lower_observed_visor_height_as_replay_cutoff() {
         let (replay_cutoff_height, visor_heights) =
-            snapshot_replay_cutoff_height(SnapshotHeightSource::Visor, 42, Ok(40), Ok(42))
+            snapshot_replay_cutoff_height(SnapshotHeightSource::StateFile, 42, Ok(40), Ok(42))
                 .expect("visor heights are available");
 
         assert_eq!(replay_cutoff_height, 40);

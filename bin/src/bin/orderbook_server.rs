@@ -154,7 +154,8 @@ struct Args {
     #[arg(long, default_value = "hl-node")]
     hlnode_binary: String,
 
-    /// Path to abci_state.rmp. Direct mode only.
+    /// Host path to abci_state.rmp. Direct mode passes it to hl-node; both modes
+    /// read it to resolve the height of a bare snapshot.
     /// Default: <data_dir>/../hyperliquid_data/abci_state.rmp.
     /// This directory is a sibling of --data-dir and also contains visor_abci_state.json.
     #[arg(long)]

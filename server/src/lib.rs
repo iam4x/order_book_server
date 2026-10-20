@@ -275,7 +275,7 @@ pub struct ServerConfig {
     pub docker_container: String,
     /// Path to hl-node binary (direct mode only)
     pub hlnode_binary: String,
-    /// Path to abci_state.rmp file (direct mode only, has default)
+    /// Host path to abci_state.rmp (has default; Docker mode uses it only to resolve the snapshot height)
     pub abci_state_path: Option<PathBuf>,
     /// Path where snapshot will be written (direct mode only, has default)
     pub snapshot_output_path: Option<PathBuf>,

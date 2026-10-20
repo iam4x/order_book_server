@@ -27,7 +27,7 @@ impl<O> Snapshots<O> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotHeightSource {
     Embedded,
-    Visor,
+    StateFile,
 }
 
 pub(crate) struct LoadedSnapshots<O> {
@@ -187,7 +187,7 @@ where
 
 /// Load snapshots from CLI-generated JSON. Some hl-node builds emit
 /// `[height, snapshot]`; older/current builds emit only the bare snapshot array,
-/// which the caller pairs with the current visor height.
+/// which the caller pairs with the height of the `abci_state.rmp` it was computed from.
 pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, fallback_height: u64) -> Result<LoadedSnapshots<O>>
 where
     O: TryFrom<R, Error = Error>,
@@ -206,7 +206,7 @@ where
     let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
     Ok(LoadedSnapshots {
         height: fallback_height,
-        height_source: SnapshotHeightSource::Visor,
+        height_source: SnapshotHeightSource::StateFile,
         snapshots: snapshots_from_cli_entries(snapshot)?,
     })
 }
@@ -378,12 +378,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_loader_marks_bare_snapshot_height_as_visor() -> Result<()> {
+    fn cli_loader_marks_bare_snapshot_height_as_state_file() -> Result<()> {
         let loaded =
             super::load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(r#"[["BTC",[[],[]]]]"#, 999)?;
 
         assert_eq!(loaded.height, 999);
-        assert_eq!(loaded.height_source, super::SnapshotHeightSource::Visor);
+        assert_eq!(loaded.height_source, super::SnapshotHeightSource::StateFile);
         Ok(())
     }
 
