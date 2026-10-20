@@ -1,5 +1,7 @@
 use tokio::time::{Duration, Instant};
 
+use crate::types::node_data::EventSource;
+
 /// hl-node writes a block's lines back to back, so book streams that stay at EOF
 /// this long mean the open block has no more lines coming.
 pub(super) const BLOCK_QUIET: Duration = Duration::from_millis(2);
@@ -35,21 +37,26 @@ impl BlockGate {
         }
     }
 
-    /// Call before applying an order-diff line. Returns true when the line closed the open block,
-    /// leaving the gate complete so the caller can publish it before opening `block`.
-    pub(super) const fn close_before_diff(&mut self, block: u64) -> bool {
+    /// Call before a book line applies. Returns true when the line closed the open block; the
+    /// gate then stays complete so the caller can publish that block before calling `open_for`.
+    pub(super) const fn closes_before(&mut self, source: EventSource, block: u64) -> bool {
         // Any other block closes it, not only a higher one: hl-node restarts rewrite older blocks.
         let Self::Open { block: open, .. } = *self else { return false };
-        if open == block {
+        if !matches!(source, EventSource::OrderDiffs) || open == block {
             return false;
         }
         *self = Self::Complete { block: open };
         true
     }
 
-    /// Status lines can run blocks ahead of diffs, so they keep the diff block open without moving it.
-    pub(super) const fn on_status_line(&mut self) {
-        *self = Self::open(self.block());
+    /// Call before a book line applies, after publishing any block it closed. Status lines can run
+    /// blocks ahead of diffs, so they keep the diff block open without moving it.
+    pub(super) const fn open_for(&mut self, source: EventSource, block: u64) {
+        *self = match source {
+            EventSource::OrderDiffs => Self::open(block),
+            EventSource::OrderStatuses => Self::open(self.block()),
+            EventSource::Fills => return,
+        };
     }
 
     pub(super) const fn on_books_idle(&mut self, now: Instant) {
@@ -83,21 +90,23 @@ mod tests {
     use super::*;
 
     const MS: Duration = Duration::from_millis(1);
+    const DIFFS: EventSource = EventSource::OrderDiffs;
+    const STATUSES: EventSource = EventSource::OrderStatuses;
 
     #[test]
     fn a_diff_line_for_another_block_closes_the_open_block() {
         let mut gate = BlockGate::default();
-        assert!(!gate.close_before_diff(11), "nothing was open");
-        assert_eq!(gate, BlockGate::Complete { block: 0 });
-
-        gate = BlockGate::open(11);
-        assert!(!gate.close_before_diff(11));
+        assert!(!gate.closes_before(DIFFS, 11), "nothing was open");
+        gate.open_for(DIFFS, 11);
+        assert!(!gate.closes_before(DIFFS, 11));
         assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
-        assert!(gate.close_before_diff(12));
-        assert_eq!(gate, BlockGate::Complete { block: 11 });
 
-        gate = BlockGate::open(12);
-        assert!(gate.close_before_diff(9), "a rewritten older block also closes the open one");
+        assert!(gate.closes_before(DIFFS, 12));
+        assert_eq!(gate, BlockGate::Complete { block: 11 });
+        gate.open_for(DIFFS, 12);
+        assert_eq!(gate, BlockGate::Open { block: 12, idle_since: None });
+
+        assert!(gate.closes_before(DIFFS, 9), "a rewritten older block also closes the open one");
         assert_eq!(gate, BlockGate::Complete { block: 12 });
     }
 
@@ -105,13 +114,15 @@ mod tests {
     fn a_status_line_reopens_the_last_diff_block_and_clears_idle() {
         let now = Instant::now();
         let mut gate = BlockGate::Complete { block: 11 };
-        gate.on_status_line();
+        assert!(!gate.closes_before(STATUSES, 25));
+        gate.open_for(STATUSES, 25);
         assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
 
         gate.on_books_idle(now);
-        gate.on_status_line();
+        assert!(!gate.closes_before(STATUSES, 25), "a status line never closes the diff block");
+        gate.open_for(STATUSES, 25);
         assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
-        assert!(!gate.close_before_diff(11), "the status line did not move the block");
+        assert!(!gate.closes_before(DIFFS, 11), "the status line did not move the block");
     }
 
     #[test]
@@ -140,8 +151,8 @@ mod tests {
         let now = Instant::now();
         let mut gate = BlockGate::open(11);
         gate.on_books_idle(now);
-        assert!(!gate.close_before_diff(11));
-        gate = BlockGate::open(11);
+        assert!(!gate.closes_before(DIFFS, 11));
+        gate.open_for(DIFFS, 11);
         assert_eq!(gate.quiet_deadline(), None);
         assert!(!gate.close_if_quiet(now + 2 * MS));
         assert!(!gate.is_complete());
