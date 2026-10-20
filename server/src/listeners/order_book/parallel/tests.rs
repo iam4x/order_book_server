@@ -118,6 +118,26 @@ async fn fills_do_not_wait_for_book_readers_and_do_not_hold_up_book_events() {
 }
 
 #[tokio::test]
+async fn queued_book_lines_counts_undelivered_book_lines_but_not_fills() {
+    let (senders, mut rx) =
+        file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);
+    senders[0].try_send(diff_at(10)).unwrap();
+    senders[0].try_send(diff_at(10)).unwrap();
+    senders[2].try_send(FileEvent::Fill(r#"{"block_number":10}"#.to_string())).unwrap();
+    assert_eq!(rx.queued_book_lines(), 2);
+
+    let mut ready = Vec::new();
+    assert_eq!(rx.recv_many(&mut ready, 8).await, 1, "the status reader has not reached EOF");
+    assert!(matches!(&ready[0], FileEvent::Fill(_)));
+    assert_eq!(rx.queued_book_lines(), 2, "a diff held as the merge head is still queued");
+
+    ready.clear();
+    assert!(senders[1].send(SourceMessage::CaughtUp));
+    assert_eq!(rx.recv_many(&mut ready, 8).await, 2);
+    assert_eq!(rx.queued_book_lines(), 0);
+}
+
+#[tokio::test]
 async fn books_caught_up_is_reported_once_until_the_next_book_event() {
     let (senders, mut rx) =
         file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);

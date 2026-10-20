@@ -240,6 +240,14 @@ impl FileEventReceiver {
             .sum()
     }
 
+    pub(super) fn queued_book_lines(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| source.source != EventSource::Fills)
+            .map(|source| source.budget.lines.load(AtomicOrdering::Relaxed) + usize::from(source.head.is_some()))
+            .sum()
+    }
+
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<FileEvent>> {
         for source in &mut self.sources {
             source.poll_head(cx);
