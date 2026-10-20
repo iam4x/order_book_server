@@ -178,6 +178,10 @@ impl OrderBookState {
         self.time
     }
 
+    pub(super) const fn book_mode(&self) -> BookMode {
+        self.book_mode
+    }
+
     pub(super) const fn order_status_height(&self) -> u64 {
         self.order_status_height
     }
