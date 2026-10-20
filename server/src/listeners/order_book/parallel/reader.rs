@@ -247,6 +247,7 @@ impl FileReader {
     }
 
     pub(super) fn attach(base_dir: PathBuf) -> std::io::Result<Self> {
+        std::fs::metadata(&base_dir)?;
         let mut reader = Self::new(base_dir);
         if let Some(path) = reader.latest_initial_file()? {
             let mut opened = OpenedStream::open(&path)?.ok_or_else(|| {

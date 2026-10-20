@@ -396,6 +396,15 @@ fn delayed_older_create_is_ignored() {
 }
 
 #[test]
+fn startup_rejects_a_missing_stream_directory_but_accepts_a_missing_hourly_directory() {
+    let base = stream_test_dir("attach-missing");
+    let missing = base.join("node_order_statuses_streaming");
+    assert_eq!(FileReader::attach(missing).err().map(|err| err.kind()), Some(std::io::ErrorKind::NotFound));
+    assert_eq!(FileReader::attach(base.clone()).unwrap().current_path(), None);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn startup_preserves_an_incomplete_record_and_ignores_complete_history() {
     let base = stream_test_dir("attach-partial");
     let file = hour_file(&base, 1);
