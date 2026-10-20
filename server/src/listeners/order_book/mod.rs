@@ -750,6 +750,7 @@ impl OrderBookListener {
         snapshot_height: u64,
         reset_l2_version: bool,
     ) {
+        debug_assert_eq!(new_order_book.book_mode(), self.features.book_mode());
         self.order_book_state = Some(new_order_book);
         self.stream_ignore_through_height = self.stream_ignore_through_height.max(replay_cutoff_height);
         self.stream_replay_guard_through_height = snapshot_height;
@@ -1915,22 +1916,16 @@ mod tests {
     }
 
     fn order_book_state_with_bids(books: &[(&str, &[(u64, &str, &str)])], height: u64) -> OrderBookState {
-        order_book_state_with_bids_and_time(books, height, 0)
+        order_book_state_with_bids_and_time(books, height, 0, BookMode::DiffsOnly)
     }
 
     fn order_book_state_with_bids_and_time(
         books: &[(&str, &[(u64, &str, &str)])],
         height: u64,
         time: u64,
+        book_mode: BookMode,
     ) -> OrderBookState {
-        OrderBookState::from_snapshot(
-            snapshots_from_coin_bids(books),
-            height,
-            time,
-            true,
-            false,
-            BookMode::StatusPaired,
-        )
+        OrderBookState::from_snapshot(snapshots_from_coin_bids(books), height, time, true, false, book_mode)
     }
 
     fn listener_without_snapshot(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
@@ -2841,7 +2836,7 @@ mod tests {
         let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
         let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
         listener.replace_order_book_state(
-            order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "1")])], 7, 123_456),
+            order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "1")])], 7, 123_456, BookMode::DiffsOnly),
             7,
             7,
             false,
@@ -2889,7 +2884,8 @@ mod tests {
         let mut listener = listener_with_btc_bid_for_features(tx, features("all"));
         listener.begin_snapshot_replay();
 
-        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let new_state =
+            order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "2")])], 10, 0, BookMode::StatusPaired);
         listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
         drop(drain_all(&mut rx));
 
@@ -2936,7 +2932,8 @@ mod tests {
         };
 
         listener.begin_snapshot_replay();
-        let new_state = order_book_state_with_bids(&[("BTC", &[(1, "100", "2")])], 10);
+        let new_state =
+            order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "2")])], 10, 0, BookMode::StatusPaired);
         listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
 
         let messages = drain_all(&mut rx);
