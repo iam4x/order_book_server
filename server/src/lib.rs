@@ -7,7 +7,7 @@ mod prelude;
 mod servers;
 mod types;
 
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{fmt, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::ValueEnum;
 pub use prelude::Result;
@@ -21,6 +21,16 @@ pub enum SnapshotMode {
     Docker,
     /// Call hl-node directly (for systemctl/bare metal setups)
     Direct,
+}
+
+/// How the stream readers learn that hl-node appended to a `*_streaming` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamWatch {
+    /// Read to EOF, then sleep for `interval` before the next pass.
+    Poll { interval: Duration },
+    /// Wake on a recursive inotify watch. Every hl-node `write()` then runs
+    /// fsnotify on hl-node's block-apply thread.
+    Inotify,
 }
 
 /// Optional WebSocket channels and the upstream work needed to serve them.
@@ -254,6 +264,8 @@ pub struct ServerConfig {
     pub metrics_port: u16,
     /// Enabled WebSocket features and the upstream processing required by them
     pub features: FeatureSet,
+    /// How stream readers wait for new data in the `*_streaming` directories
+    pub stream_watch: StreamWatch,
     /// Resend the last l2Book payload every N ms when nothing has changed.
     /// 0 = disabled (default). Provides a heartbeat for low-liquidity coins
     /// whose snapshot hash rarely changes, matching the official HL API behavior.

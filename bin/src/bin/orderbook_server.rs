@@ -1,7 +1,15 @@
-use std::{fmt, net::Ipv4Addr, path::PathBuf, str::FromStr};
+use std::{fmt, net::Ipv4Addr, path::PathBuf, str::FromStr, time::Duration};
 
-use clap::Parser;
-use server::{FeatureSet, Result, ServerConfig, SnapshotMode, run_websocket_server};
+use clap::{Parser, ValueEnum};
+use server::{FeatureSet, Result, ServerConfig, SnapshotMode, StreamWatch, run_websocket_server};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StreamWatchMode {
+    /// Read to EOF, then sleep for --poll-interval-us
+    Poll,
+    /// Wake on a recursive inotify watch of each *_streaming directory
+    Inotify,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Markets {
@@ -118,6 +126,17 @@ struct Args {
     #[arg(long, default_value = "all")]
     features: FeatureSet,
 
+    /// How to wait for new data in the *_streaming files: poll or inotify.
+    /// - poll: read to EOF, then sleep for --poll-interval-us (adds no work to hl-node's writes)
+    /// - inotify: wake on every write, which runs fsnotify on hl-node's block-apply thread
+    #[arg(long, value_enum, default_value = "poll")]
+    stream_watch: StreamWatchMode,
+
+    /// Microseconds to sleep at EOF before reading the stream files again.
+    /// Ignored with --stream-watch inotify.
+    #[arg(long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
+    poll_interval_us: u64,
+
     // ========== Snapshot Configuration ==========
     /// Snapshot fetching mode: docker or direct
     /// - docker: Use 'docker exec <container> hl-node ...' (for Docker users)
@@ -181,6 +200,15 @@ struct Args {
     log_level: String,
 }
 
+impl Args {
+    const fn stream_watch(&self) -> StreamWatch {
+        match self.stream_watch {
+            StreamWatchMode::Poll => StreamWatch::Poll { interval: Duration::from_micros(self.poll_interval_us) },
+            StreamWatchMode::Inotify => StreamWatch::Inotify,
+        }
+    }
+}
+
 /// Start the Prometheus metrics HTTP server
 async fn start_metrics_server(port: u16) {
     use axum::{Router, response::IntoResponse, routing::get};
@@ -221,6 +249,7 @@ async fn main() -> Result<()> {
     server::metrics::register_metrics();
 
     // Build config
+    let stream_watch = args.stream_watch();
     let config = ServerConfig {
         address: format!("{}:{}", args.address, args.port),
         compression_level: args.compression_level,
@@ -238,6 +267,7 @@ async fn main() -> Result<()> {
         snapshot_refresh_hours: args.snapshot_refresh_hours,
         metrics_port: args.metrics_port,
         features: args.features,
+        stream_watch,
         l2book_heartbeat_ms: args.l2book_heartbeat_ms,
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
         allbbo_heartbeat_ms: args.allbbo_heartbeat_ms,
@@ -247,6 +277,10 @@ async fn main() -> Result<()> {
     println!("  Address: {}", config.address);
     println!("  Markets: {}", args.markets);
     println!("  Features: {}", config.features);
+    match config.stream_watch {
+        StreamWatch::Poll { interval } => println!("  Stream watch: poll every {}us", interval.as_micros()),
+        StreamWatch::Inotify => println!("  Stream watch: inotify"),
+    }
     println!("  Snapshot mode: {:?}", config.snapshot_mode);
     match config.snapshot_mode {
         SnapshotMode::Docker => {
@@ -282,7 +316,7 @@ async fn main() -> Result<()> {
 
     // Spawn uptime counter
     tokio::spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
             server::metrics::UPTIME_SECONDS.inc();
@@ -312,7 +346,9 @@ async fn main() -> Result<()> {
 mod tests {
     use clap::Parser as _;
 
-    use super::{Args, FeatureSet, Markets};
+    use std::time::Duration;
+
+    use super::{Args, FeatureSet, Markets, StreamWatch};
 
     const ALL_MARKETS: Markets = Markets { include_perps: true, include_spot: true, include_hip3: true };
 
@@ -450,6 +486,40 @@ mod tests {
         assert!(Args::try_parse_from(["orderbook_server", "--features", "stats,stats"]).is_err());
         assert!(Args::try_parse_from(["orderbook_server", "--features", "ordersync,ordersync"]).is_err());
         assert!(Args::try_parse_from(["orderbook_server", "--features", "all,bbo"]).is_err());
+    }
+
+    fn parsed_stream_watch(args: &[&str]) -> Option<StreamWatch> {
+        Args::try_parse_from(std::iter::once("orderbook_server").chain(args.iter().copied()))
+            .ok()
+            .as_ref()
+            .map(Args::stream_watch)
+    }
+
+    #[test]
+    fn cli_stream_watch_defaults_to_polling_every_millisecond() {
+        assert_eq!(parsed_stream_watch(&[]), Some(StreamWatch::Poll { interval: Duration::from_micros(1000) }));
+    }
+
+    #[test]
+    fn cli_parses_poll_interval() {
+        assert_eq!(
+            parsed_stream_watch(&["--poll-interval-us", "500"]),
+            Some(StreamWatch::Poll { interval: Duration::from_micros(500) })
+        );
+    }
+
+    #[test]
+    fn cli_parses_inotify_stream_watch() {
+        assert_eq!(
+            parsed_stream_watch(&["--stream-watch", "inotify", "--poll-interval-us", "500"]),
+            Some(StreamWatch::Inotify)
+        );
+    }
+
+    #[test]
+    fn cli_rejects_invalid_stream_watch_values() {
+        assert_eq!(parsed_stream_watch(&["--poll-interval-us", "0"]), None);
+        assert_eq!(parsed_stream_watch(&["--stream-watch", "fanotify"]), None);
     }
 
     #[test]

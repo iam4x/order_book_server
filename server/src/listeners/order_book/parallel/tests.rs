@@ -12,6 +12,8 @@ fn append_to_file(path: &PathBuf, contents: &str) {
     std::io::Write::write_all(&mut file, contents.as_bytes()).expect("test stream file should append");
 }
 
+const WATCH_MODES: [StreamWatch; 2] = [StreamWatch::Poll { interval: Duration::from_millis(1) }, StreamWatch::Inotify];
+
 fn features(value: &str) -> FeatureSet {
     value.parse().expect("valid features")
 }
@@ -343,14 +345,20 @@ async fn batches_preserve_height_order_and_receive_turns_bound_bytes() {
 }
 #[tokio::test]
 async fn real_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
-    let base_dir = stream_test_dir("watcher-burst");
+    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
+        drains_bursts_and_rotation_after_consumer_stalls(&format!("watcher-burst-{index}"), mode).await;
+    }
+}
+
+async fn drains_bursts_and_rotation_after_consumer_stalls(name: &str, mode: StreamWatch) {
+    let base_dir = stream_test_dir(name);
     let day_dir = base_dir.join("hourly/20260916");
     std::fs::create_dir_all(&day_dir).unwrap();
     let path = day_dir.join("19");
     std::fs::write(&path, "").unwrap();
     let (mut senders, mut receiver) = file_event_channels(&[EventSource::OrderDiffs], 1);
     let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: senders.remove(0) };
-    let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink);
+    let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink, mode);
     ready.await.unwrap();
     let initial = tokio::time::timeout(Duration::from_secs(5), receiver.sources[0].rx.recv()).await.unwrap();
     assert!(matches!(initial, Some(SourceMessage::CaughtUp)));
@@ -385,6 +393,51 @@ async fn real_watcher_drains_bursts_and_rotation_after_consumer_stalls() {
     std::fs::remove_dir_all(base_dir).unwrap();
 }
 
+#[tokio::test]
+async fn poll_watcher_yields_a_record_written_in_pieces_once_and_discovers_the_next_hour() {
+    const FIRST: &str =
+        "{\"block_number\":7,\"payload\":\"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\"}";
+    const SECOND: &str = "{\"block_number\":8}";
+    let base_dir = stream_test_dir("poll-pieces");
+    let day_dir = base_dir.join("hourly/20260916");
+    std::fs::create_dir_all(&day_dir).unwrap();
+    let path = day_dir.join("19");
+    std::fs::write(&path, "").unwrap();
+    let (mut senders, mut receiver) = file_event_channels(&[EventSource::OrderDiffs], 4);
+    let sink = FileLineSink::Events { source: EventSource::OrderDiffs, tx: senders.remove(0) };
+    let mode = StreamWatch::Poll { interval: Duration::from_millis(1) };
+    let (watcher, ready) = spawn_file_watcher(base_dir.clone(), sink, mode);
+    ready.await.unwrap();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    for (index, piece) in format!("{FIRST}\n").as_bytes().chunks(3).enumerate() {
+        std::io::Write::write_all(&mut file, piece).unwrap();
+        if index % 4 == 0 {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    std::fs::write(day_dir.join("20"), format!("{SECOND}\n")).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut ready = Vec::new();
+        while ready.len() < 2 {
+            assert!(receiver.recv_many(&mut ready, 8).await > 0);
+        }
+        ready
+    })
+    .await;
+    drop(receiver);
+    watcher.join().unwrap();
+    let lines: Vec<_> = result
+        .unwrap()
+        .into_iter()
+        .map(|event| match event {
+            FileEvent::OrderDiff(line) => line,
+            other => panic!("unexpected event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(lines, [FIRST, SECOND]);
+    std::fs::remove_dir_all(base_dir).unwrap();
+}
+
 #[test]
 fn first_file_after_watcher_start_is_read_from_the_beginning() {
     let base_dir = stream_test_dir("late-first-file");
@@ -403,15 +456,27 @@ fn first_file_after_watcher_start_is_read_from_the_beginning() {
 
 #[tokio::test]
 async fn startup_failure_is_returned_instead_of_serving_an_incomplete_book() {
-    let base = stream_test_dir("startup-failure");
-    let result = start_parallel_file_watchers(base.clone(), features("bbo"), None).await;
-    assert!(result.is_err());
-    std::fs::remove_dir_all(base).unwrap();
+    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
+        let base = stream_test_dir(&format!("startup-failure-{index}"));
+        let result = start_parallel_file_watchers(base.clone(), features("orderupdates"), None, mode).await;
+        assert_eq!(
+            result.err().map(|err| err.to_string()).as_deref(),
+            Some("OrderStatuses watcher failed before stream attachment"),
+            "{mode:?}"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }
 
 #[tokio::test]
 async fn startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler() {
-    let base = stream_test_dir("startup-barrier");
+    for (index, mode) in WATCH_MODES.into_iter().enumerate() {
+        attaches_all_sources_before_returning(&format!("startup-barrier-{index}"), mode).await;
+    }
+}
+
+async fn attaches_all_sources_before_returning(name: &str, mode: StreamWatch) {
+    let base = stream_test_dir(name);
     let sources = [EventSource::OrderStatuses, EventSource::OrderDiffs];
     let paths: Vec<_> = sources
         .iter()
@@ -423,7 +488,8 @@ async fn startup_attaches_all_sources_before_returning_to_the_snapshot_scheduler
             path
         })
         .collect();
-    let (mut receiver, handles) = start_parallel_file_watchers(base.clone(), features("bbo"), None).await.unwrap();
+    let (mut receiver, handles) =
+        start_parallel_file_watchers(base.clone(), features("bbo"), None, mode).await.unwrap();
     for path in &paths {
         append_to_file(path, "{\"block_number\":42}\n");
     }
