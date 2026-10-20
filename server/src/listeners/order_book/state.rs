@@ -322,10 +322,12 @@ impl OrderBookState {
         let coin = order.coin();
         // Raw `new` diffs carry the size left after matching, and makers get their own
         // update or remove diffs, so matching again would consume liquidity twice.
-        let placement = if coin.is_spot() && is_statusless_system_user(order.user) {
-            self.order_book.add_order_before(order, insert_before)
-        } else {
+        // Status-paired books and statusless system spot orders keep local matching.
+        let statusless_system_order = coin.is_spot() && is_statusless_system_user(order.user);
+        let placement = if self.book_mode == BookMode::DiffsOnly && !statusless_system_order {
             self.order_book.rest_order_before(order, insert_before)
+        } else {
+            self.order_book.add_order_before(order, insert_before)
         };
         record_insert_before_placement(placement);
         if self.order_book.order_sz(&oid, &coin).is_none() {
@@ -1660,38 +1662,24 @@ mod tests {
     }
 
     #[test]
-    fn replayed_order_does_not_match_against_newer_snapshot_orders() {
-        for book_mode in [BookMode::StatusPaired, BookMode::DiffsOnly] {
-            let newer_ask = make_l4_order_at("BTC", 10, Side::Ask, "100.0");
-            let mut state = OrderBookState::from_snapshot(
-                cli_snapshots("BTC", Vec::new(), vec![newer_ask]),
-                22,
-                0,
-                false,
-                book_mode,
-            );
-            state
-                .apply_order_statuses_hft(make_status_batch_at(
-                    vec![make_order_status_at("BTC", 11, "open", Side::Bid, "100.0")],
+    fn diffs_only_replayed_order_does_not_match_against_newer_snapshot_orders() {
+        let newer_ask = make_l4_order_at("BTC", 10, Side::Ask, "100.0");
+        let mut state = diffs_only_state(cli_snapshots("BTC", Vec::new(), vec![newer_ask]), 22);
+
+        state
+            .apply_order_diffs_after_snapshot(
+                make_diff_batch_at(
+                    vec![
+                        new_diff("BTC", 11, Side::Bid, "100.0", "0.4"),
+                        make_order_diff_at("BTC", 11, Side::Bid, "100.0", OrderDiff::Remove),
+                    ],
                     21,
-                ))
-                .unwrap();
+                ),
+                22,
+            )
+            .unwrap();
 
-            state
-                .apply_order_diffs_after_snapshot(
-                    make_diff_batch_at(
-                        vec![
-                            new_diff("BTC", 11, Side::Bid, "100.0", "0.4"),
-                            make_order_diff_at("BTC", 11, Side::Bid, "100.0", OrderDiff::Remove),
-                        ],
-                        21,
-                    ),
-                    22,
-                )
-                .unwrap();
-
-            assert_eq!(bbo(&state, "BTC"), (None, Some(level("100.0", "1.0", 1))), "{book_mode:?}");
-        }
+        assert_eq!(bbo(&state, "BTC"), (None, Some(level("100.0", "1.0", 1))));
     }
 
     #[test]
