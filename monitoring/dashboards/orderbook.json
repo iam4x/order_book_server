@@ -919,7 +919,7 @@
                     "refId": "B"
                 },
                 {
-                    "expr": "abs(order_diff_height - order_status_height)",
+                    "expr": "abs(order_diff_height - order_status_height) and order_status_height > 0",
                     "legendFormat": "Height Skew (blocks)",
                     "refId": "C"
                 },
