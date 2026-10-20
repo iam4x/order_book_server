@@ -33,6 +33,15 @@ pub enum StreamWatch {
     Inotify,
 }
 
+/// Which upstream streams build resting orders in the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BookMode {
+    /// Pair each order status with its new-order diff so resting orders carry L4 fields.
+    StatusPaired,
+    /// Insert orders from new-order diffs alone; L2 and BBO only need coin, side, px, and sz.
+    DiffsOnly,
+}
+
 /// Optional WebSocket channels and the upstream work needed to serve them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureSet {
@@ -114,6 +123,10 @@ impl FeatureSet {
 
     pub const fn requires_book_state(self) -> bool {
         self.bbo || self.allbbo || self.l2book || self.l4book
+    }
+
+    pub(crate) const fn book_mode(self) -> BookMode {
+        if self.l4book { BookMode::StatusPaired } else { BookMode::DiffsOnly }
     }
 
     pub const fn watch_order_statuses(self) -> bool {

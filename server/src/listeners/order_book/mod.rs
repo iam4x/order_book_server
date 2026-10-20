@@ -24,7 +24,7 @@ use tokio::{
 use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file};
 
 use crate::{
-    FeatureSet,
+    BookMode, FeatureSet,
     listeners::order_book::state::{OrderBookState, PendingRepairReason},
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
@@ -389,6 +389,7 @@ fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<SnapshotTaskResult>,
     ignore_spot: bool,
+    book_mode: BookMode,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -433,7 +434,8 @@ fn fetch_snapshot(
             // around the snapshot read before we close replay capture.
             sleep(Duration::from_secs(1)).await;
 
-            let new_order_book = OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, true, ignore_spot);
+            let new_order_book =
+                OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, true, ignore_spot, book_mode);
             let outcome = listener.lock().await.install_snapshot_state_with_replay_cutoff(
                 new_order_book,
                 height,
@@ -478,7 +480,14 @@ async fn start_snapshot_if_due(
     ) else {
         return false;
     };
-    fetch_snapshot(kind, snapshot_config.clone(), Arc::clone(listener), snapshot_fetch_task_tx.clone(), ignore_spot);
+    fetch_snapshot(
+        kind,
+        snapshot_config.clone(),
+        Arc::clone(listener),
+        snapshot_fetch_task_tx.clone(),
+        ignore_spot,
+        features.book_mode(),
+    );
     true
 }
 
@@ -730,7 +739,8 @@ impl OrderBookListener {
     #[cfg(test)]
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
-        let new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        let new_order_book =
+            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.features.book_mode());
         self.replace_order_book_state(new_order_book, height, height, true);
         self.snapshot_replay_cache = None;
         info!("Order book ready at height {}", height);
@@ -1922,7 +1932,14 @@ mod tests {
         height: u64,
         time: u64,
     ) -> OrderBookState {
-        OrderBookState::from_snapshot(snapshots_from_coin_bids(books), height, time, true, false)
+        OrderBookState::from_snapshot(
+            snapshots_from_coin_bids(books),
+            height,
+            time,
+            true,
+            false,
+            BookMode::StatusPaired,
+        )
     }
 
     fn listener_without_snapshot(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
@@ -3279,7 +3296,14 @@ mod tests {
                 }
             }
             if startup {
-                let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false);
+                let state = OrderBookState::from_snapshot(
+                    Snapshots::new(HashMap::new()),
+                    0,
+                    0,
+                    true,
+                    false,
+                    BookMode::StatusPaired,
+                );
                 listener.install_snapshot_state(state, 0, SnapshotTaskKind::Initial).unwrap();
             }
             let state = listener.order_book_state.as_ref().unwrap();
@@ -3330,7 +3354,8 @@ mod tests {
                 listener.apply_parsed_hft(parse_hft_event(line, source).unwrap().unwrap());
             }
         }
-        let snapshot = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false);
+        let snapshot =
+            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false, BookMode::StatusPaired);
         listener.install_snapshot_state(snapshot, 0, SnapshotTaskKind::Initial).unwrap();
         let state = listener.order_book_state.as_ref().unwrap();
         assert_eq!(state.order_count(), usize::try_from(ORDERS).unwrap());
