@@ -151,7 +151,6 @@ impl OrderBookState {
         snapshot: Snapshots<InnerL4Order>,
         height: u64,
         time: u64,
-        ignore_triggers: bool,
         ignore_spot: bool,
         book_mode: BookMode,
     ) -> Self {
@@ -160,7 +159,7 @@ impl OrderBookState {
             book_mode,
             time,
             height,
-            order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
+            order_book: OrderBooks::from_snapshots(snapshot, true),
             pending_order_statuses: FxHashMap::default(),
             pending_new_diffs: FxHashMap::default(),
             resolved_order_tombstones: ResolvedOrderTombstones::default(),
@@ -605,11 +604,11 @@ mod tests {
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, 0, 0, true, false, BookMode::StatusPaired)
+        OrderBookState::from_snapshot(snapshots, 0, 0, false, BookMode::StatusPaired)
     }
 
     fn diffs_only_state(snapshots: Snapshots<InnerL4Order>, height: u64) -> OrderBookState {
-        OrderBookState::from_snapshot(snapshots, height, 0, true, false, BookMode::DiffsOnly)
+        OrderBookState::from_snapshot(snapshots, height, 0, false, BookMode::DiffsOnly)
     }
 
     fn cli_snapshots(coin: &str, bids: Vec<L4Order>, asks: Vec<L4Order>) -> Snapshots<InnerL4Order> {
@@ -1240,7 +1239,7 @@ mod tests {
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, BookMode::StatusPaired); // ignore_spot=true
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, BookMode::StatusPaired); // ignore_spot=true
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
@@ -1251,7 +1250,7 @@ mod tests {
     #[test]
     fn test_spot_status_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, true, BookMode::StatusPaired);
+        let mut state = OrderBookState::from_snapshot(snapshots, 0, 0, true, BookMode::StatusPaired);
         let status = make_order_status("@1", 1, "open");
 
         let changed = state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
@@ -1668,7 +1667,6 @@ mod tests {
                 cli_snapshots("BTC", Vec::new(), vec![newer_ask]),
                 22,
                 0,
-                true,
                 false,
                 book_mode,
             );
