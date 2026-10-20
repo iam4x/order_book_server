@@ -138,6 +138,27 @@ async fn queued_book_lines_counts_undelivered_book_lines_but_not_fills() {
 }
 
 #[tokio::test]
+async fn books_caught_up_is_reported_ahead_of_a_fill_backlog() {
+    let (senders, mut rx) =
+        file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);
+    assert!(senders[0].send(SourceMessage::CaughtUp));
+    assert!(senders[1].send(SourceMessage::CaughtUp));
+    for height in [10, 11] {
+        senders[2].try_send(FileEvent::Fill(format!(r#"{{"block_number":{height}}}"#))).unwrap();
+    }
+    let mut ready = Vec::new();
+    assert_eq!(rx.recv_many(&mut ready, 8).await, 3);
+    assert!(
+        matches!(
+            ready.as_slice(),
+            [FileEvent::BooksCaughtUp, FileEvent::Fill(first), FileEvent::Fill(second)]
+                if first.contains("10") && second.contains("11")
+        ),
+        "{ready:?}"
+    );
+}
+
+#[tokio::test]
 async fn books_caught_up_is_reported_once_until_the_next_book_event() {
     let (senders, mut rx) =
         file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses, EventSource::Fills], 12);
