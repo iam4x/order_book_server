@@ -1179,8 +1179,9 @@ impl OrderBookListener {
         self.block_gate.quiet_deadline()
     }
 
-    fn close_quiet_block(&mut self, now: Instant) {
-        if self.block_gate.close_if_quiet(now) {
+    /// A late timer can fire with lines already queued; applying them decides whether the block ended.
+    fn close_quiet_block(&mut self, now: Instant, file_events: &parallel::FileEventReceiver) {
+        if file_events.queued_book_lines() == 0 && self.block_gate.close_if_quiet(now) {
             self.publish_complete_block();
         }
     }
@@ -1687,7 +1688,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
             _ = sleep_until(quiet_deadline.unwrap_or_else(Instant::now)), if quiet_deadline.is_some() => {
                 quiet_deadline = None;
-                listener.lock().await.close_quiet_block(Instant::now());
+                listener.lock().await.close_quiet_block(Instant::now(), &file_events);
             }
 
             // Flush throttled book-derived batches on the scheduler, ahead of file
@@ -3846,10 +3847,14 @@ mod tests {
         listener.flush_allbbo_if_due();
     }
 
+    fn drained_file_events() -> parallel::FileEventReceiver {
+        parallel::file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 4).1
+    }
+
     fn close_block_after_quiet(listener: &mut OrderBookListener) {
         let now = Instant::now();
         listener.mark_books_idle(now);
-        listener.close_quiet_block(now + block_gate::BLOCK_QUIET);
+        listener.close_quiet_block(now + block_gate::BLOCK_QUIET, &drained_file_events());
     }
 
     fn bid_summary(bid: Option<&(Px, Sz, u32)>) -> (String, String, u32) {
@@ -3986,11 +3991,11 @@ mod tests {
 
         let idle_at = Instant::now();
         listener.mark_books_idle(idle_at);
-        listener.close_quiet_block(idle_at + Duration::from_millis(1));
+        listener.close_quiet_block(idle_at + Duration::from_millis(1), &drained_file_events());
         flush_l2_on_timer(&mut listener);
         assert_eq!(published_btc_bids(&mut rx), vec![]);
 
-        listener.close_quiet_block(idle_at + Duration::from_millis(2));
+        listener.close_quiet_block(idle_at + Duration::from_millis(2), &drained_file_events());
         flush_l2_on_timer(&mut listener);
         assert_eq!(
             published_btc_bids(&mut rx),
@@ -3999,5 +4004,28 @@ mod tests {
                 ("l2", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_quiet_timer_leaves_a_block_open_while_book_lines_are_queued() {
+        let (tx, mut rx) = channel(64);
+        let mut listener = listener_at_block_10(tx, features("bbo"));
+        apply_btc_bid(&mut listener, 2, 11);
+        let (senders, mut file_events) =
+            parallel::file_event_channels(&[EventSource::OrderDiffs, EventSource::OrderStatuses], 4);
+        senders[0].try_send(parallel::FileEvent::OrderDiff(btc_bid_line_in_block(3, "1", 11))).unwrap();
+
+        let idle_at = Instant::now();
+        listener.mark_books_idle(idle_at);
+        listener.close_quiet_block(idle_at + block_gate::BLOCK_QUIET, &file_events);
+        assert_eq!(published_btc_bids(&mut rx), vec![], "the queued block 11 line has not applied");
+
+        drop(senders);
+        let mut ready = Vec::new();
+        assert_eq!(file_events.recv_many(&mut ready, 8).await, 1);
+        let Some(parallel::FileEvent::OrderDiff(line)) = ready.pop() else { panic!("expected the queued diff") };
+        listener.apply_parsed_hft(parse_hft_event(line, EventSource::OrderDiffs).unwrap().unwrap());
+        close_block_after_quiet(&mut listener);
+        assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
     }
 }
