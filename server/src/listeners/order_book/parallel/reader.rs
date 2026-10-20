@@ -54,13 +54,13 @@ impl FileRead {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct StreamKey {
+pub(in crate::listeners::order_book) struct StreamKey {
     day: NaiveDate,
     hour: u8,
 }
 
 impl StreamKey {
-    fn from_path(path: &Path) -> Option<Self> {
+    pub(in crate::listeners::order_book) fn from_path(path: &Path) -> Option<Self> {
         let hour = path.file_name()?.to_str()?.parse::<u8>().ok()?;
         if hour > 23 {
             return None;
