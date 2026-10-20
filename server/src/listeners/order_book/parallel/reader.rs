@@ -69,12 +69,20 @@ impl StreamKey {
         Some(Self { day, hour })
     }
 
-    fn is_immediate_successor_of(self, previous: Self) -> bool {
-        if previous.hour < 23 {
-            self.day == previous.day && self.hour == previous.hour + 1
+    fn successor(self) -> Option<Self> {
+        if self.hour < 23 {
+            Some(Self { hour: self.hour + 1, ..self })
         } else {
-            self.hour == 0 && previous.day.succ_opt() == Some(self.day)
+            Some(Self { day: self.day.succ_opt()?, hour: 0 })
         }
+    }
+
+    fn is_immediate_successor_of(self, previous: Self) -> bool {
+        previous.successor() == Some(self)
+    }
+
+    fn path(self, base_dir: &Path) -> PathBuf {
+        base_dir.join("hourly").join(self.day.format("%Y%m%d").to_string()).join(self.hour.to_string())
     }
 }
 
@@ -319,6 +327,20 @@ impl FileReader {
             self.stage(candidate);
         }
         self.read_tracked()
+    }
+
+    /// Stages the next hour's file if it exists, without a directory scan.
+    /// Open failures stay silent here; the periodic rescan reports them.
+    pub(super) fn stage_next_hour(&mut self) -> bool {
+        let Some(next) = self.tracked.as_ref().and_then(|tracked| tracked.opened.key.successor()) else {
+            return false;
+        };
+        let Ok(Some(candidate)) = OpenedStream::open(&next.path(&self.base_dir)) else {
+            return false;
+        };
+        self.reconcile_current_identity();
+        self.stage(candidate);
+        self.pending.is_some()
     }
 
     #[cfg(test)]

@@ -193,6 +193,26 @@ fn finish_switch(reader: &mut FileReader, successor: &Path) -> FileRead {
 }
 
 #[test]
+fn next_hour_is_staged_without_a_rescan_across_a_day_boundary() {
+    let base = stream_test_dir("next-hour");
+    let last = base.join("hourly/20260826/23");
+    std::fs::create_dir_all(last.parent().unwrap()).unwrap();
+    std::fs::write(&last, b"history\n").unwrap();
+    let mut reader = FileReader::new(base.clone());
+    reader.start_tracking(&last);
+    assert!(!reader.stage_next_hour());
+    let next = base.join("hourly/20260827/0");
+    std::fs::create_dir_all(next.parent().unwrap()).unwrap();
+    std::fs::write(&next, b"{\"block_number\":1}\n").unwrap();
+    assert!(reader.stage_next_hour());
+    let switched = reader.read_tracked();
+    assert_eq!((switched.continuity, switched.progress), (FileContinuity::Preserved, ReadProgress::Data));
+    assert_eq!(reader.current_path(), Some(next.as_path()));
+    assert_eq!(reader.read_tracked().lines, ["{\"block_number\":1}"]);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn repeated_read_failure_reports_one_loss_until_healthy() {
     let base = stream_test_dir("failure-latch");
     let file = hour_file(&base, 1);

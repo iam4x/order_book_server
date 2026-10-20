@@ -504,7 +504,11 @@ fn read_available(reader: &mut FileReader, rescan: bool) -> FileRead {
     if rescan && let Some(path) = reader.check_for_newer_file() {
         return reader.on_create(&path);
     }
-    reader.read_tracked()
+    let read = reader.read_tracked();
+    if read.progress == ReadProgress::Idle && reader.stage_next_hour() {
+        return reader.read_tracked();
+    }
+    read
 }
 
 fn spawn_file_watcher(
