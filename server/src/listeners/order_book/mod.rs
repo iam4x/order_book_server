@@ -1191,11 +1191,6 @@ impl OrderBookListener {
     }
 }
 
-enum ReadyEvent {
-    Parsed(ParsedHftEvent),
-    BooksCaughtUp,
-}
-
 struct ParsedHftEvent {
     line: String,
     event_source: EventSource,
@@ -1795,11 +1790,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
             }
 
-            ready_count = file_events.recv_many(&mut ready_events, 64) => {
-                if ready_count == 0 {
+            received = file_events.recv_many(&mut ready_events, 64) => {
+                if received.closed && received.events == 0 {
                     return Err("File event channel closed".into());
                 }
-                let mut events = Vec::with_capacity(ready_count);
+                let mut parsed_events = Vec::with_capacity(received.events);
                 let mut parse_repair_count = 0usize;
                 let mut stream_gaps = Vec::new();
                 for event in ready_events.drain(..) {
@@ -1811,14 +1806,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             stream_gaps.push(source);
                             continue;
                         }
-                        parallel::FileEvent::BooksCaughtUp => {
-                            events.push(ReadyEvent::BooksCaughtUp);
-                            continue;
-                        }
                     };
                     let line_len = line.len();
                     match parse_hft_event(line, event_source) {
-                        Ok(Some(parsed)) => events.push(ReadyEvent::Parsed(parsed)),
+                        Ok(Some(parsed)) => parsed_events.push(parsed),
                         Ok(None) => {}
                         Err(err) => {
                             record_hft_parse_error(event_source, line_len, &err);
@@ -1835,11 +1826,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 for _ in 0..parse_repair_count {
                     listener.request_repair("parse_error");
                 }
-                for event in events {
-                    match event {
-                        ReadyEvent::Parsed(parsed) => listener.apply_parsed_hft(parsed),
-                        ReadyEvent::BooksCaughtUp => listener.block_gate.on_books_idle(Instant::now()),
-                    }
+                for parsed in parsed_events {
+                    listener.apply_parsed_hft(parsed);
+                }
+                if received.books_idle {
+                    listener.block_gate.on_books_idle(Instant::now());
                 }
                 quiet_deadline = listener.block_gate.quiet_deadline();
             }
@@ -3467,7 +3458,8 @@ mod tests {
         let mut slowest_drain = Duration::ZERO;
         loop {
             let mut ready = Vec::with_capacity(64);
-            if file_events.recv_many(&mut ready, 64).await == 0 {
+            let received = file_events.recv_many(&mut ready, 64).await;
+            if received.closed && received.events == 0 {
                 break;
             }
             let drain_started = Instant::now();
@@ -3556,7 +3548,8 @@ mod tests {
 
             loop {
                 let mut ready = Vec::with_capacity(64);
-                if events.recv_many(&mut ready, 64).await == 0 {
+                let received = events.recv_many(&mut ready, 64).await;
+                if received.closed && received.events == 0 {
                     break;
                 }
                 for event in ready {
@@ -3608,14 +3601,15 @@ mod tests {
         drop(senders);
         loop {
             let mut ready = Vec::new();
-            if events.recv_many(&mut ready, 64).await == 0 {
+            let received = events.recv_many(&mut ready, 64).await;
+            if received.closed && received.events == 0 {
                 break;
             }
             for event in ready {
                 let (line, source) = match event {
                     parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses),
                     parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs),
-                    parallel::FileEvent::Fill(_) | parallel::FileEvent::BooksCaughtUp => continue,
+                    parallel::FileEvent::Fill(_) => continue,
                     event @ parallel::FileEvent::ContinuityLost(_) => panic!("unexpected event: {event:?}"),
                 };
                 listener.apply_parsed_hft(parse_hft_event(line, source).unwrap().unwrap());
@@ -4002,7 +3996,7 @@ mod tests {
 
         drop(senders);
         let mut ready = Vec::new();
-        assert_eq!(file_events.recv_many(&mut ready, 8).await, 1);
+        assert_eq!(file_events.recv_many(&mut ready, 8).await.events, 1);
         let Some(parallel::FileEvent::OrderDiff(line)) = ready.pop() else { panic!("expected the queued diff") };
         listener.apply_parsed_hft(parse_hft_event(line, EventSource::OrderDiffs).unwrap().unwrap());
         close_block_after_quiet(&mut listener);
