@@ -13,6 +13,8 @@ use clap::ValueEnum;
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 
+use crate::types::node_data::EventSource;
+
 /// Snapshot fetching mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum SnapshotMode {
@@ -129,8 +131,17 @@ impl FeatureSet {
         if self.l4book { BookMode::StatusPaired } else { BookMode::DiffsOnly }
     }
 
+    pub(crate) const fn feeds_book(self, source: EventSource) -> bool {
+        self.requires_book_state()
+            && match source {
+                EventSource::OrderDiffs => true,
+                EventSource::OrderStatuses => matches!(self.book_mode(), BookMode::StatusPaired),
+                EventSource::Fills => false,
+            }
+    }
+
     pub const fn watch_order_statuses(self) -> bool {
-        self.requires_book_state() || self.orderupdates
+        self.l4book || self.orderupdates
     }
 
     pub const fn watch_order_diffs(self) -> bool {
