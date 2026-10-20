@@ -146,7 +146,6 @@ pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
     })
 }
 
-/// Resolve the host path of `abci_state.rmp` from the override or `parent/hyperliquid_data/`.
 pub(super) fn get_abci_state_path(config: &SnapshotConfig) -> PathBuf {
     config.abci_state_path.clone().unwrap_or_else(|| {
         let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
