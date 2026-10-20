@@ -435,7 +435,7 @@ fn fetch_snapshot(
             sleep(Duration::from_secs(1)).await;
 
             let new_order_book =
-                OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, true, ignore_spot, book_mode);
+                OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, ignore_spot, book_mode);
             let outcome = listener.lock().await.install_snapshot_state_with_replay_cutoff(
                 new_order_book,
                 height,
@@ -737,7 +737,7 @@ impl OrderBookListener {
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
         let new_order_book =
-            OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot, self.features.book_mode());
+            OrderBookState::from_snapshot(snapshot, height, 0, self.ignore_spot, self.features.book_mode());
         self.replace_order_book_state(new_order_book, height, height, true);
         self.snapshot_replay_cache = None;
         info!("Order book ready at height {}", height);
@@ -1925,7 +1925,7 @@ mod tests {
         time: u64,
         book_mode: BookMode,
     ) -> OrderBookState {
-        OrderBookState::from_snapshot(snapshots_from_coin_bids(books), height, time, true, false, book_mode)
+        OrderBookState::from_snapshot(snapshots_from_coin_bids(books), height, time, false, book_mode)
     }
 
     fn listener_without_snapshot(tx: Sender<Arc<InternalMessage>>, features: FeatureSet) -> OrderBookListener {
@@ -3333,14 +3333,8 @@ mod tests {
                 }
             }
             if startup {
-                let state = OrderBookState::from_snapshot(
-                    Snapshots::new(HashMap::new()),
-                    0,
-                    0,
-                    true,
-                    false,
-                    BookMode::StatusPaired,
-                );
+                let state =
+                    OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, false, BookMode::StatusPaired);
                 listener.install_snapshot_state(state, 0, SnapshotTaskKind::Initial).unwrap();
             }
             let state = listener.order_book_state.as_ref().unwrap();
@@ -3392,7 +3386,7 @@ mod tests {
             }
         }
         let snapshot =
-            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, true, false, BookMode::StatusPaired);
+            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 0, 0, false, BookMode::StatusPaired);
         listener.install_snapshot_state(snapshot, 0, SnapshotTaskKind::Initial).unwrap();
         let state = listener.order_book_state.as_ref().unwrap();
         assert_eq!(state.order_count(), usize::try_from(ORDERS).unwrap());
