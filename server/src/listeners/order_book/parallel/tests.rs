@@ -136,9 +136,17 @@ fn readers_report_eof_after_submitting_available_lines() {
 }
 
 #[test]
-fn enabled_sources_for_bbo_need_book_state_inputs() {
-    assert_eq!(enabled_event_sources(features("bbo")), vec![EventSource::OrderStatuses, EventSource::OrderDiffs]);
-    assert_eq!(enabled_event_sources(features("allbbo")), vec![EventSource::OrderStatuses, EventSource::OrderDiffs]);
+fn enabled_sources_for_bbo_need_only_order_diffs() {
+    assert_eq!(enabled_event_sources(features("bbo")), vec![EventSource::OrderDiffs]);
+    assert_eq!(enabled_event_sources(features("allbbo")), vec![EventSource::OrderDiffs]);
+}
+
+#[test]
+fn only_l4book_or_orderupdates_watch_order_statuses() {
+    assert!(!features("bbo,allbbo,l2book,stats,ordersync").watch_order_statuses());
+    assert!(features("l4book").watch_order_statuses());
+    assert!(features("l2book,orderupdates").watch_order_statuses());
+    assert_eq!(enabled_event_sources(features("l4book")), vec![EventSource::OrderStatuses, EventSource::OrderDiffs]);
 }
 
 #[test]
@@ -498,7 +506,7 @@ async fn attaches_all_sources_before_returning(name: &str, mode: StreamWatch) {
         })
         .collect();
     let (mut receiver, handles) =
-        start_parallel_file_watchers(base.clone(), features("bbo"), None, mode).await.unwrap();
+        start_parallel_file_watchers(base.clone(), features("l4book"), None, mode).await.unwrap();
     for path in &paths {
         append_to_file(path, "{\"block_number\":42}\n");
     }

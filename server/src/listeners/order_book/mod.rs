@@ -674,10 +674,6 @@ impl OrderBookListener {
     }
 
     fn record_snapshot_replay_line(&mut self, event_source: EventSource, line: &str) {
-        if !matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
-            return;
-        }
-
         let failure = self.snapshot_replay_cache.as_mut().and_then(|cache| {
             cache.push(event_source, line).map(|reason| (cache.line_count, cache.total_bytes, reason))
         });
@@ -696,8 +692,7 @@ impl OrderBookListener {
     }
 
     fn report_stream_gap(&mut self, source: EventSource) {
-        if self.features.requires_book_state() && matches!(source, EventSource::OrderStatuses | EventSource::OrderDiffs)
-        {
+        if self.features.feeds_book(source) {
             warn!("{source} stream continuity lost; requesting order-book snapshot repair");
             self.request_repair("stream_gap");
         }
@@ -718,7 +713,9 @@ impl OrderBookListener {
         state.cleanup_stale_pending();
 
         ORDERBOOK_HEIGHT.set(state.height() as i64);
-        ORDER_STATUS_HEIGHT.set(state.order_status_height() as i64);
+        if self.features.feeds_book(EventSource::OrderStatuses) {
+            ORDER_STATUS_HEIGHT.set(state.order_status_height() as i64);
+        }
         ORDER_DIFF_HEIGHT.set(state.order_diff_height() as i64);
         ORDERBOOK_TIME_MS.set(state.time() as i64);
         PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
@@ -848,12 +845,6 @@ impl OrderBookListener {
             replay_outcome.replayed_lines
         );
         Ok(SnapshotInstallOutcome::Installed { replayed_lines: replay_outcome.replayed_lines })
-    }
-
-    fn should_ignore_stream_batch(&self, event_source: EventSource, height: u64) -> bool {
-        matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs)
-            && self.features.requires_book_state()
-            && height <= self.stream_ignore_through_height
     }
 
     // forcibly grab current snapshot
@@ -1159,7 +1150,7 @@ impl OrderBookListener {
             Ok(None) => Ok(()),
             Err(err) => {
                 record_hft_parse_error(event_source, line_len, &err);
-                if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                if self.features.feeds_book(event_source) {
                     self.request_repair("parse_error");
                 }
                 Ok(())
@@ -1170,8 +1161,8 @@ impl OrderBookListener {
     fn apply_parsed_hft(&mut self, parsed: ParsedHftEvent) {
         let ParsedHftEvent { line, event_source, height, event_batch } = parsed;
         let source_label = source_label(event_source);
-        let ignore_for_book_state = self.should_ignore_stream_batch(event_source, height);
-        if !ignore_for_book_state {
+        let apply_to_book = self.features.feeds_book(event_source) && height > self.stream_ignore_through_height;
+        if apply_to_book {
             self.record_snapshot_replay_line(event_source, &line);
         }
         if self.features.stats() {
@@ -1197,7 +1188,7 @@ impl OrderBookListener {
                     }
                 }
                 EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
-                if self.features.requires_book_state() && !ignore_for_book_state {
+                if apply_to_book {
                     self.order_book_state
                         .as_mut()
                         .map_or_else(|| Ok(HashSet::new()), |state| state.apply_order_statuses_hft(batch))
@@ -1223,7 +1214,7 @@ impl OrderBookListener {
                     }
                 }
                 EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
-                if self.features.requires_book_state() && !ignore_for_book_state {
+                if apply_to_book {
                     self.order_book_state.as_mut().map_or_else(
                         || Ok(HashSet::new()),
                         |state| state.apply_order_diffs_after_snapshot(batch, self.stream_replay_guard_through_height),
@@ -1259,7 +1250,7 @@ impl OrderBookListener {
                     height,
                     source_label
                 );
-                if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                if self.features.feeds_book(event_source) {
                     self.request_repair("apply_error");
                 }
                 HashSet::new()
@@ -1707,7 +1698,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         Ok(None) => {}
                         Err(err) => {
                             record_hft_parse_error(event_source, line_len, &err);
-                            if matches!(event_source, EventSource::OrderStatuses | EventSource::OrderDiffs) {
+                            if config.features.feeds_book(event_source) {
                                 parse_repair_count += 1;
                             }
                         }
@@ -2175,7 +2166,7 @@ mod tests {
     fn status_and_diff_continuity_loss_request_refresh_without_a_periodic_deadline() {
         for source in [EventSource::OrderStatuses, EventSource::OrderDiffs] {
             let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
-            let mut listener = listener_with_btc_bid_for_features(tx, features("bbo"));
+            let mut listener = listener_with_btc_bid_for_features(tx, features("l4book"));
 
             listener.report_stream_gap(source);
 
@@ -2184,7 +2175,7 @@ mod tests {
             let now = Instant::now();
             assert_eq!(
                 next_snapshot_trigger(
-                    features("bbo"),
+                    features("l4book"),
                     listener.is_ready(),
                     false,
                     None,
@@ -2309,6 +2300,55 @@ mod tests {
 
         assert!(listener.repair_pending());
         assert_eq!(listener.repair_requested_epoch, 1);
+    }
+
+    #[test]
+    fn diffs_only_status_stream_faults_do_not_request_snapshot_repair() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("l2book,orderupdates"));
+
+        listener.process_data_hft("{".to_string(), EventSource::OrderStatuses).unwrap();
+        listener.report_stream_gap(EventSource::OrderStatuses);
+        assert!(!listener.repair_pending());
+
+        listener.report_stream_gap(EventSource::OrderDiffs);
+        assert!(listener.repair_pending());
+    }
+
+    #[test]
+    fn diffs_only_book_ignores_statuses_but_still_broadcasts_them() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid_for_features(tx, features("l2book,orderupdates"));
+        let user = "0x0000000000000000000000000000000000000001";
+        listener.begin_snapshot_replay();
+        drop(drain_all(&mut rx));
+
+        listener
+            .process_data_hft(order_status_line("BTC", 2, user), EventSource::OrderStatuses)
+            .expect("status parses");
+
+        let messages = drain_all(&mut rx);
+        assert_eq!(
+            messages.iter().filter(|msg| matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. })).count(),
+            1
+        );
+        let state = listener.order_book_state.as_ref().expect("state initialized");
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(listener.snapshot_replay_cache.as_ref().expect("replay cache").line_count, 0);
+
+        listener.process_data_hft(new_diff_line("BTC", 2, "2"), EventSource::OrderDiffs).expect("diff parses");
+
+        let state = listener.order_book_state.as_ref().expect("state initialized");
+        let (_time, bbos) = state.get_bbos_for_coins(&HashSet::from([Coin::new("BTC")]));
+        assert_eq!(
+            bbos[&Coin::new("BTC")].0,
+            Some((Px::parse_from_str("100").unwrap(), Sz::parse_from_str("3").unwrap(), 2))
+        );
+        assert_eq!(state.order_count(), 2);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(listener.snapshot_replay_cache.as_ref().expect("replay cache").line_count, 1);
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
     }
 
     #[test]
@@ -3251,7 +3291,7 @@ mod tests {
 
         for startup in [true, false] {
             let (tx, _rx) = channel(16);
-            let mut listener = listener_without_snapshot(tx, features("bbo"));
+            let mut listener = listener_without_snapshot(tx, features("l4book"));
             if startup {
                 listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial).unwrap();
             } else {
@@ -3330,9 +3370,9 @@ mod tests {
             diffs["events"].as_array_mut().unwrap().push(diff);
         }
         let (tx, _rx) = channel(16);
-        let mut listener = listener_without_snapshot(tx, features("bbo,stats"));
+        let mut listener = listener_without_snapshot(tx, features("l4book,stats"));
         listener.begin_snapshot_replay_for(SnapshotTaskKind::Initial).unwrap();
-        let sources = parallel::enabled_event_sources(features("bbo,stats"));
+        let sources = parallel::enabled_event_sources(features("l4book,stats"));
         assert_eq!(sources, [EventSource::OrderStatuses, EventSource::Fills, EventSource::OrderDiffs]);
         let (senders, mut events) = parallel::file_event_channels(&sources, 9);
         senders[0].try_send(parallel::FileEvent::OrderStatus(statuses.to_string())).unwrap();
