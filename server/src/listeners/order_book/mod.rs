@@ -13,6 +13,7 @@ use std::{
 
 use alloy::primitives::Address;
 use log::{error, info, warn};
+use stream_history::replay_stream_history;
 use tokio::{
     sync::{
         Mutex,
@@ -21,10 +22,10 @@ use tokio::{
     },
     time::{Instant, sleep},
 };
-use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file};
+use utils::{EventBatch, SnapshotConfig, abci_state_height, get_abci_state_path, get_visor_path, process_rmp_file};
 
 use crate::{
-    BookMode, FeatureSet,
+    FeatureSet,
     listeners::order_book::state::{OrderBookState, PendingRepairReason},
     metrics::{
         BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
@@ -145,6 +146,7 @@ struct SnapshotReplayCache {
     started_book_height: u64,
     repair_epoch: u64,
     limits: SnapshotReplayLimits,
+    first_journaled_blocks: Vec<(EventSource, u64)>,
 }
 
 impl SnapshotReplayCache {
@@ -160,10 +162,17 @@ impl SnapshotReplayCache {
             started_book_height,
             repair_epoch,
             limits: SnapshotReplayLimits::for_kind(kind),
+            first_journaled_blocks: Vec::new(),
         })
     }
 
-    fn push(&mut self, event_source: EventSource, line: &str) -> Option<String> {
+    /// The highest of each source's first journaled block. Lines before it may
+    /// predate replay capture, so they must come from the stream files on disk.
+    fn journal_start_height(&self) -> Option<u64> {
+        self.first_journaled_blocks.iter().map(|(_, block)| *block).max()
+    }
+
+    fn push(&mut self, event_source: EventSource, block_number: u64, line: &str) -> Option<String> {
         if self.overflowed {
             return None;
         }
@@ -201,6 +210,9 @@ impl SnapshotReplayCache {
 
         self.line_count = next_lines;
         self.total_bytes = next_bytes;
+        if !self.first_journaled_blocks.iter().any(|(source, _)| *source == event_source) {
+            self.first_journaled_blocks.push((event_source, block_number));
+        }
         None
     }
 }
@@ -336,22 +348,46 @@ fn next_snapshot_trigger(
     None
 }
 
-fn snapshot_replay_cutoff_height(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotHeights {
+    /// The block the snapshot state reflects; history replay starts after it.
+    state_height: u64,
+    /// Replayed diffs at or below this block use replay semantics, so a stale
+    /// update cannot roll back a state that may already contain it.
+    replay_guard_height: u64,
+}
+
+fn snapshot_heights(
     height_source: SnapshotHeightSource,
-    snapshot_height: u64,
-    visor_height_before: Result<u64>,
+    loaded_height: u64,
+    state_height_before: Result<u64>,
+    state_height_after: Result<u64>,
     visor_height_after: Result<u64>,
-) -> Result<(u64, Option<(u64, u64)>)> {
+) -> Result<SnapshotHeights> {
     match height_source {
-        SnapshotHeightSource::Embedded => Ok((snapshot_height, None)),
+        SnapshotHeightSource::Embedded => {
+            Ok(SnapshotHeights { state_height: loaded_height, replay_guard_height: loaded_height })
+        }
         SnapshotHeightSource::StateFile => {
-            let before = visor_height_before.map_err(|err| -> Error {
-                format!("Failed to read visor height before bare snapshot generation: {err}").into()
+            let before = state_height_before.map_err(|err| -> Error {
+                format!("Failed to resolve abci state height before bare snapshot generation: {err}").into()
             })?;
-            let after = visor_height_after.map_err(|err| -> Error {
+            let after = state_height_after.map_err(|err| -> Error {
+                format!("Failed to resolve abci state height after bare snapshot generation: {err}").into()
+            })?;
+            if before != after {
+                return Err(format!(
+                    "abci state moved from height {before} to {after} while hl-node generated the snapshot"
+                )
+                .into());
+            }
+            let visor = visor_height_after.map_err(|err| -> Error {
                 format!("Failed to read visor height after bare snapshot generation: {err}").into()
             })?;
-            Ok((before.min(after), Some((before, after))))
+            if after > visor {
+                return Err(format!("abci state height {after} is above visor height {visor}").into());
+            }
+            Ok(SnapshotHeights { state_height: after, replay_guard_height: visor })
         }
     }
 }
@@ -390,7 +426,7 @@ fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<SnapshotTaskResult>,
     ignore_spot: bool,
-    book_mode: BookMode,
+    features: FeatureSet,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -400,49 +436,88 @@ fn fetch_snapshot(
             let started_book_height = listener.lock().await.begin_snapshot_replay_for(kind)?;
 
             let visor_path = get_visor_path(&snapshot_config);
-            // Keep the error rather than returning early: embedded-height output
-            // remains safe and does not depend on visor availability.
+            let abci_state_path = get_abci_state_path(&snapshot_config);
+            let data_dir = snapshot_config.data_dir.clone();
+            // Keep the errors rather than returning early: embedded-height output
+            // remains safe and depends on neither the visor nor the state file.
             let visor_height_before =
                 read_visor_height_at_replay_floor(started_book_height, SNAPSHOT_VISOR_CATCHUP_TIMEOUT, || {
                     let visor_path = visor_path.clone();
                     async move { read_visor_height(&visor_path).await }
                 })
                 .await;
+            let state_height_before = abci_state_height(&abci_state_path, &data_dir);
             let output_fln = process_rmp_file(&snapshot_config).await?;
             let visor_height_after = read_visor_height(&visor_path).await;
-            let fallback_height =
-                visor_height_after.as_ref().or(visor_height_before.as_ref()).copied().unwrap_or_default();
+            let state_height_after = abci_state_height(&abci_state_path, &data_dir);
+            let fallback_height = state_height_after.as_ref().copied().unwrap_or_default();
             let loaded_snapshot = load_snapshots_from_cli_json_at_height::<InnerL4Order, (Address, L4Order)>(
                 &output_fln,
                 fallback_height,
             )
             .await?;
             let height_source = loaded_snapshot.height_source;
-            let height = loaded_snapshot.height;
-            let (replay_cutoff_height, visor_heights) =
-                snapshot_replay_cutoff_height(height_source, height, visor_height_before, visor_height_after)?;
-            if let Some((visor_height_before, visor_height_after)) =
-                visor_heights.filter(|(before, after)| before != after)
-            {
-                warn!(
-                    "Bare snapshot output used visor height, and visor changed from {visor_height_before} to \
-                     {visor_height_after} while hl-node generated the snapshot; using {replay_cutoff_height} as \
-                     conservative replay cutoff"
-                );
-            }
-            info!("Snapshot fetched at height {height} ({height_source:?}); replay cutoff {replay_cutoff_height}");
+            let visor_heights = (visor_height_before.ok(), visor_height_after.as_ref().ok().copied());
+            let SnapshotHeights { state_height, replay_guard_height } = snapshot_heights(
+                height_source,
+                loaded_snapshot.height,
+                state_height_before,
+                state_height_after,
+                visor_height_after,
+            )?;
             // Give file watchers a short window to deliver any writes that landed
             // around the snapshot read before we close replay capture.
             sleep(Duration::from_secs(1)).await;
 
-            let new_order_book =
-                OrderBookState::from_snapshot(loaded_snapshot.snapshots, height, 0, ignore_spot, book_mode);
-            let outcome = listener.lock().await.install_snapshot_state_with_replay_cutoff(
+            let journal_start_height = listener
+                .lock()
+                .await
+                .snapshot_replay_journal_start_height()
+                .ok_or("Snapshot replay journal captured no book stream lines")?;
+            // The block at each source's journal start may straddle the start of
+            // capture, so every block through the latest start comes from disk.
+            let replay_cutoff_height = state_height.max(journal_start_height);
+            let sources: Vec<EventSource> = [EventSource::OrderDiffs, EventSource::OrderStatuses]
+                .into_iter()
+                .filter(|source| features.feeds_book(*source))
+                .collect();
+            let mut new_order_book = OrderBookState::from_snapshot(
+                loaded_snapshot.snapshots,
+                state_height,
+                0,
+                ignore_spot,
+                features.book_mode(),
+            );
+            let (new_order_book, history) = tokio::task::spawn_blocking(move || {
+                replay_stream_history(
+                    &mut new_order_book,
+                    &data_dir,
+                    &sources,
+                    state_height,
+                    replay_cutoff_height,
+                    replay_guard_height,
+                )
+                .map(|history| (new_order_book, history))
+            })
+            .await??;
+            info!(
+                "Snapshot at state height {state_height} ({height_source:?}); visor height {:?} before and {:?} \
+                 after generation; journal starts at block {journal_start_height}; replayed {} stream history \
+                 lines from disk through replay cutoff {replay_cutoff_height}",
+                visor_heights.0, visor_heights.1, history.replayed_lines
+            );
+
+            let mut listener = listener.lock().await;
+            let outcome = listener.install_snapshot_state_with_replay_cutoff(
                 new_order_book,
-                height,
+                replay_guard_height,
                 replay_cutoff_height,
                 kind,
             )?;
+            if !history.clean && matches!(outcome, SnapshotInstallOutcome::Installed { .. }) {
+                listener.request_repair("replay_apply");
+            }
+            drop(listener);
             Ok(outcome)
         }
         .await;
@@ -487,7 +562,7 @@ async fn start_snapshot_if_due(
         Arc::clone(listener),
         snapshot_fetch_task_tx.clone(),
         ignore_spot,
-        features.book_mode(),
+        features,
     );
     true
 }
@@ -670,13 +745,17 @@ impl OrderBookListener {
         Ok(started_book_height)
     }
 
+    fn snapshot_replay_journal_start_height(&self) -> Option<u64> {
+        self.snapshot_replay_cache.as_ref().and_then(SnapshotReplayCache::journal_start_height)
+    }
+
     fn clear_snapshot_replay(&mut self) {
         self.snapshot_replay_cache = None;
     }
 
-    fn record_snapshot_replay_line(&mut self, event_source: EventSource, line: &str) {
+    fn record_snapshot_replay_line(&mut self, event_source: EventSource, block_number: u64, line: &str) {
         let failure = self.snapshot_replay_cache.as_mut().and_then(|cache| {
-            cache.push(event_source, line).map(|reason| (cache.line_count, cache.total_bytes, reason))
+            cache.push(event_source, block_number, line).map(|reason| (cache.line_count, cache.total_bytes, reason))
         });
         if let Some((line_count, total_bytes, reason)) = failure {
             warn!(
@@ -1165,7 +1244,7 @@ impl OrderBookListener {
         let source_label = source_label(event_source);
         let apply_to_book = self.features.feeds_book(event_source) && height > self.stream_ignore_through_height;
         if apply_to_book {
-            self.record_snapshot_replay_line(event_source, &line);
+            self.record_snapshot_replay_line(event_source, height, &line);
         }
         if self.features.stats() {
             self.stats.record(&event_batch, height);
@@ -1728,6 +1807,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        BookMode,
         order_book::{OrderBook, Side, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
@@ -1982,6 +2062,56 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    fn diff_line_at_block(
+        coin: &str,
+        oid: u64,
+        side: &str,
+        px: &str,
+        diff: serde_json::Value,
+        block_number: u64,
+    ) -> String {
+        serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": block_number,
+            "events": [{
+                "user": "0x0000000000000000000000000000000000000000",
+                "oid": oid,
+                "side": side,
+                "px": px,
+                "coin": coin,
+                "raw_book_diff": diff
+            }]
+        })
+        .to_string()
+    }
+
+    fn snapshots_from_btc_orders(orders: &[(u64, Side, &str, &str)]) -> Snapshots<InnerL4Order> {
+        let mut book = OrderBook::new();
+        for (oid, side, px, sz) in orders {
+            book.add_order(inner_order(*oid, "BTC", *side, px, sz));
+        }
+        Snapshots::new(HashMap::from([(Coin::new("BTC"), book.to_snapshot())]))
+    }
+
+    fn btc_orders(listener: &mut OrderBookListener) -> Vec<(u64, Side, String, String)> {
+        let snapshot = listener.compute_snapshot().expect("state initialized").snapshot.value();
+        let mut orders: Vec<_> = snapshot[&Coin::new("BTC")]
+            .as_ref()
+            .iter()
+            .flatten()
+            .map(|order| (order.oid, order.side, order.limit_px.to_str(), order.sz.to_str()))
+            .collect();
+        orders.sort_unstable_by_key(|(oid, ..)| *oid);
+        orders
+    }
+
+    fn btc_bbo_px(listener: &OrderBookListener) -> (String, String) {
+        let (_time, bbos) = listener.all_bbos().expect("state initialized");
+        let (_coin, (bid, ask)) = bbos.into_iter().find(|(coin, _)| *coin == Coin::new("BTC")).expect("BTC bbo");
+        (bid.expect("bid").0.to_str(), ask.expect("ask").0.to_str())
     }
 
     fn order_status_line(coin: &str, oid: u64, user: &str) -> String {
@@ -2367,8 +2497,8 @@ mod tests {
         let mut cache = SnapshotReplayCache::new(0, SnapshotTaskKind::Initial, 0).expect("replay journal should open");
         cache.limits = SnapshotReplayLimits { max_lines: 1, max_bytes: usize::MAX };
 
-        assert_eq!(cache.push(EventSource::OrderDiffs, "{}"), None);
-        let failure = cache.push(EventSource::OrderDiffs, "{}").expect("second line should exceed the limit");
+        assert_eq!(cache.push(EventSource::OrderDiffs, 1, "{}"), None);
+        let failure = cache.push(EventSource::OrderDiffs, 1, "{}").expect("second line should exceed the limit");
 
         assert!(cache.overflowed);
         assert_eq!(cache.line_count, 1);
@@ -2417,7 +2547,7 @@ mod tests {
         listener.begin_snapshot_replay();
         listener.snapshot_replay_cache.as_mut().unwrap().limits =
             SnapshotReplayLimits { max_lines: 0, max_bytes: usize::MAX };
-        listener.record_snapshot_replay_line(EventSource::OrderDiffs, "{}");
+        listener.record_snapshot_replay_line(EventSource::OrderDiffs, 1, "{}");
 
         let overflow = listener
             .install_snapshot_state(
@@ -2443,49 +2573,47 @@ mod tests {
     }
 
     #[test]
-    fn embedded_height_snapshot_does_not_require_visor_height() {
-        let (replay_cutoff_height, visor_heights) = snapshot_replay_cutoff_height(
+    fn embedded_height_snapshot_does_not_require_state_or_visor_heights() {
+        let heights = snapshot_heights(
             SnapshotHeightSource::Embedded,
             42,
-            Err("missing before visor".into()),
-            Err("missing after visor".into()),
+            Err("missing state before".into()),
+            Err("missing state after".into()),
+            Err("missing visor".into()),
         )
-        .expect("embedded height does not need visor fallback");
+        .expect("embedded height needs no fallback");
 
-        assert_eq!(replay_cutoff_height, 42);
-        assert_eq!(visor_heights, None);
+        assert_eq!(heights, SnapshotHeights { state_height: 42, replay_guard_height: 42 });
     }
 
     #[test]
-    fn bare_snapshot_requires_visor_heights() {
-        assert!(
-            snapshot_replay_cutoff_height(
-                SnapshotHeightSource::StateFile,
-                42,
-                Err("missing before visor".into()),
-                Ok(43),
-            )
-            .is_err()
-        );
-        assert!(
-            snapshot_replay_cutoff_height(
-                SnapshotHeightSource::StateFile,
-                42,
-                Ok(41),
-                Err("missing after visor".into()),
-            )
-            .is_err()
-        );
+    fn bare_snapshot_uses_state_height_and_guards_through_visor_height() {
+        let heights = snapshot_heights(SnapshotHeightSource::StateFile, 10, Ok(10), Ok(10), Ok(22))
+            .expect("state and visor heights are consistent");
+
+        assert_eq!(heights, SnapshotHeights { state_height: 10, replay_guard_height: 22 });
     }
 
     #[test]
-    fn bare_snapshot_uses_lower_observed_visor_height_as_replay_cutoff() {
-        let (replay_cutoff_height, visor_heights) =
-            snapshot_replay_cutoff_height(SnapshotHeightSource::StateFile, 42, Ok(40), Ok(42))
-                .expect("visor heights are available");
+    fn bare_snapshot_rejects_unresolved_moved_or_future_state_heights() {
+        let error = |result: Result<SnapshotHeights>| result.expect_err("heights are rejected").to_string();
 
-        assert_eq!(replay_cutoff_height, 40);
-        assert_eq!(visor_heights, Some((40, 42)));
+        assert_eq!(
+            error(snapshot_heights(SnapshotHeightSource::StateFile, 0, Err("no link".into()), Ok(10), Ok(22))),
+            "Failed to resolve abci state height before bare snapshot generation: no link"
+        );
+        assert_eq!(
+            error(snapshot_heights(SnapshotHeightSource::StateFile, 20, Ok(10), Ok(20), Ok(22))),
+            "abci state moved from height 10 to 20 while hl-node generated the snapshot"
+        );
+        assert_eq!(
+            error(snapshot_heights(SnapshotHeightSource::StateFile, 10, Ok(10), Ok(10), Err("no visor".into()))),
+            "Failed to read visor height after bare snapshot generation: no visor"
+        );
+        assert_eq!(
+            error(snapshot_heights(SnapshotHeightSource::StateFile, 30, Ok(30), Ok(30), Ok(22))),
+            "abci state height 30 is above visor height 22"
+        );
     }
 
     #[test]
@@ -2559,6 +2687,81 @@ mod tests {
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 1 });
         assert_eq!(current_bid_sz(&listener, "BTC"), "4");
         assert!(listener.snapshot_replay_cache.is_none());
+    }
+
+    #[test]
+    fn changes_after_the_state_height_survive_a_snapshot_install() {
+        let (tx, _rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_without_snapshot(tx, features("l2book"));
+        let book_at_block_10 = [(1, Side::Bid, "100", "1"), (2, Side::Ask, "101", "1")];
+        listener.init_from_snapshot(snapshots_from_btc_orders(&book_at_block_10), 10);
+        let lines = [
+            diff_line_at_block("BTC", 2, "A", "101", serde_json::json!({ "new": { "sz": "1" } }), 10),
+            diff_line_at_block("BTC", 2, "A", "101", serde_json::json!("remove"), 12),
+            diff_line_at_block("BTC", 3, "A", "102", serde_json::json!({ "new": { "sz": "1" } }), 15),
+            diff_line_at_block("BTC", 4, "B", "101.5", serde_json::json!({ "new": { "sz": "1" } }), 18),
+            diff_line_at_block(
+                "BTC",
+                3,
+                "A",
+                "102",
+                serde_json::json!({ "update": { "origSz": "1", "newSz": "0.5" } }),
+                21,
+            ),
+            diff_line_at_block("BTC", 5, "B", "99", serde_json::json!({ "new": { "sz": "1" } }), 22),
+        ];
+        let data_dir = std::env::temp_dir().join(format!("orderbook-state-height-{}", std::process::id()));
+        drop(fs::remove_dir_all(&data_dir));
+        let hour_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir).join("hourly/20261020");
+        fs::create_dir_all(&hour_dir).expect("hourly dir");
+        fs::write(hour_dir.join("15"), format!("{}\n", lines.join("\n"))).expect("hourly diffs file");
+        for line in &lines[1..4] {
+            listener.process_data_hft(line.clone(), EventSource::OrderDiffs).expect("live diff applies");
+        }
+        listener.begin_snapshot_replay();
+        listener.process_data_hft(lines[4].clone(), EventSource::OrderDiffs).expect("journaled diff applies");
+
+        let state_height = 10;
+        let visor_height = 22;
+        let journal_start_height = listener.snapshot_replay_journal_start_height().expect("journal has lines");
+        let replay_cutoff_height = state_height.max(journal_start_height);
+        let mut new_state = OrderBookState::from_snapshot(
+            snapshots_from_btc_orders(&book_at_block_10),
+            state_height,
+            0,
+            false,
+            BookMode::DiffsOnly,
+        );
+        let history = replay_stream_history(
+            &mut new_state,
+            &data_dir,
+            &[EventSource::OrderDiffs],
+            state_height,
+            replay_cutoff_height,
+            visor_height,
+        )
+        .expect("history covers the replay window");
+        let outcome = listener
+            .install_snapshot_state_with_replay_cutoff(
+                new_state,
+                visor_height,
+                replay_cutoff_height,
+                SnapshotTaskKind::Refresh,
+            )
+            .expect("refresh installs");
+
+        assert_eq!(journal_start_height, 21);
+        assert_eq!(history.replayed_lines, 4);
+        assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 0 });
+        assert_eq!(
+            btc_orders(&mut listener),
+            vec![
+                (1, Side::Bid, "100".to_string(), "1".to_string()),
+                (3, Side::Ask, "102".to_string(), "0.5".to_string()),
+                (4, Side::Bid, "101.5".to_string(), "1".to_string()),
+            ]
+        );
+        assert_eq!(btc_bbo_px(&listener), ("101.5".to_string(), "102".to_string()));
     }
 
     #[test]
