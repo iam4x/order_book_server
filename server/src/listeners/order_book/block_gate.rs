@@ -35,12 +35,16 @@ impl BlockGate {
         }
     }
 
-    /// Call before applying an order-diff line. Returns true when the line closed the open block.
-    pub(super) const fn on_diff_line(&mut self, block: u64) -> bool {
+    /// Call before applying an order-diff line. Returns true when the line closed the open block,
+    /// leaving the gate complete so the caller can publish it before opening `block`.
+    pub(super) const fn close_before_diff(&mut self, block: u64) -> bool {
         // Any other block closes it, not only a higher one: hl-node restarts rewrite older blocks.
-        let closed = matches!(*self, Self::Open { block: open, .. } if open != block);
-        *self = Self::open(block);
-        closed
+        let Self::Open { block: open, .. } = *self else { return false };
+        if open == block {
+            return false;
+        }
+        *self = Self::Complete { block: open };
+        true
     }
 
     /// Status lines can run blocks ahead of diffs, so they keep the diff block open without moving it.
@@ -83,14 +87,18 @@ mod tests {
     #[test]
     fn a_diff_line_for_another_block_closes_the_open_block() {
         let mut gate = BlockGate::default();
-        assert!(!gate.on_diff_line(11), "nothing was open");
+        assert!(!gate.close_before_diff(11), "nothing was open");
+        assert_eq!(gate, BlockGate::Complete { block: 0 });
+
+        gate = BlockGate::open(11);
+        assert!(!gate.close_before_diff(11));
         assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
-        assert!(!gate.on_diff_line(11));
-        assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
-        assert!(gate.on_diff_line(12));
-        assert_eq!(gate, BlockGate::Open { block: 12, idle_since: None });
-        assert!(gate.on_diff_line(9), "a rewritten older block also closes the open one");
-        assert_eq!(gate, BlockGate::Open { block: 9, idle_since: None });
+        assert!(gate.close_before_diff(12));
+        assert_eq!(gate, BlockGate::Complete { block: 11 });
+
+        gate = BlockGate::open(12);
+        assert!(gate.close_before_diff(9), "a rewritten older block also closes the open one");
+        assert_eq!(gate, BlockGate::Complete { block: 12 });
     }
 
     #[test]
@@ -103,7 +111,7 @@ mod tests {
         gate.on_books_idle(now);
         gate.on_status_line();
         assert_eq!(gate, BlockGate::Open { block: 11, idle_since: None });
-        assert!(!gate.on_diff_line(11), "the status line did not move the block");
+        assert!(!gate.close_before_diff(11), "the status line did not move the block");
     }
 
     #[test]
@@ -132,7 +140,8 @@ mod tests {
         let now = Instant::now();
         let mut gate = BlockGate::open(11);
         gate.on_books_idle(now);
-        assert!(!gate.on_diff_line(11));
+        assert!(!gate.close_before_diff(11));
+        gate = BlockGate::open(11);
         assert_eq!(gate.quiet_deadline(), None);
         assert!(!gate.close_if_quiet(now + 2 * MS));
         assert!(!gate.is_complete());

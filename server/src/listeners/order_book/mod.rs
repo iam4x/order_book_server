@@ -1005,24 +1005,14 @@ impl OrderBookListener {
     }
 
     #[cfg(test)]
-    fn flush_l2_if_due(&mut self) {
-        if let Some(job) = self.take_l2_flush_job_if_due() {
+    fn flush_due_publications(&mut self) {
+        if let Some(job) = self.take_due_publications() {
             let prepared = job.prepare();
             self.finish_l2_flush(prepared);
         }
     }
 
     fn take_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
-        if let Some(job) = self.ready_l2_job.take() {
-            return Some(job);
-        }
-        if !self.block_gate.is_complete() {
-            return None;
-        }
-        self.build_l2_flush_job_if_due()
-    }
-
-    fn build_l2_flush_job_if_due(&mut self) -> Option<L2FlushJob> {
         if !self.features.l2book() {
             return None;
         }
@@ -1103,21 +1093,7 @@ impl OrderBookListener {
         L2_BROADCAST_LATENCY.observe(prepared.started_at.elapsed().as_secs_f64());
     }
 
-    fn flush_allbbo_if_due(&mut self) {
-        if self.block_gate.is_complete() {
-            self.publish_allbbo_if_due();
-        }
-    }
-
-    fn publish_allbbo_if_due(&mut self) {
-        if let Some(msg) = self.build_allbbo_update_if_due() {
-            if let Some(tx) = &self.internal_message_tx {
-                drop(tx.send(Arc::new(msg)));
-            }
-        }
-    }
-
-    fn build_allbbo_update_if_due(&mut self) -> Option<InternalMessage> {
+    fn take_allbbo_update_if_due(&mut self) -> Option<InternalMessage> {
         if !self.features.allbbo() || self.pending_allbbo_changed_coins.is_empty() {
             return None;
         }
@@ -1164,13 +1140,29 @@ impl OrderBookListener {
         BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
     }
 
-    /// Publish what the previous block changed, before any line of the next block applies.
+    /// Publish what the closed block left behind: its BBO changes, plus allBBO and L2 when
+    /// their throttles allow. Nothing goes out while a block is still open.
     fn publish_complete_block(&mut self) {
-        self.publish_pending_bbos();
-        self.publish_allbbo_if_due();
-        if self.ready_l2_job.is_none() {
-            self.ready_l2_job = self.build_l2_flush_job_if_due();
+        if !self.block_gate.is_complete() {
+            return;
         }
+        self.publish_pending_bbos();
+        if let Some(msg) = self.take_allbbo_update_if_due() {
+            if let Some(tx) = &self.internal_message_tx {
+                drop(tx.send(Arc::new(msg)));
+            }
+        }
+        // A parked job holds `l2_prepared_hashes` until the tick prepares it, so build one at a time.
+        if self.ready_l2_job.is_none() {
+            self.ready_l2_job = self.take_l2_flush_job_if_due();
+        }
+    }
+
+    /// The flush tick: publish what a complete block allows, then hand back the parked L2 job
+    /// so it is prepared outside the listener lock.
+    fn take_due_publications(&mut self) -> Option<L2FlushJob> {
+        self.publish_complete_block();
+        self.ready_l2_job.take()
     }
 
     fn mark_books_idle(&mut self, now: Instant) {
@@ -1313,9 +1305,10 @@ impl OrderBookListener {
         if apply_to_book {
             match event_source {
                 EventSource::OrderDiffs => {
-                    if self.block_gate.on_diff_line(height) {
+                    if self.block_gate.close_before_diff(height) {
                         self.publish_complete_block();
                     }
+                    self.block_gate = BlockGate::open(height);
                 }
                 EventSource::OrderStatuses => self.block_gate.on_status_line(),
                 EventSource::Fills => {}
@@ -1695,16 +1688,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
             // Flush throttled book-derived batches on the scheduler, ahead of file
             // events in this biased select, so a full file-event queue cannot starve them.
-            _ = l2_flush_ticker.tick() => {
-                if config.features.allbbo() {
-                    listener.lock().await.flush_allbbo_if_due();
-                }
-                if config.features.l2book() {
-                    let job = listener.lock().await.take_l2_flush_job_if_due();
-                    if let Some(job) = job {
-                        let prepared = job.prepare();
-                        listener.lock().await.finish_l2_flush(prepared);
-                    }
+            _ = l2_flush_ticker.tick(), if config.features.requires_book_state() => {
+                let job = listener.lock().await.take_due_publications();
+                if let Some(job) = job {
+                    let prepared = job.prepare();
+                    listener.lock().await.finish_l2_flush(prepared);
                 }
             }
 
@@ -3174,7 +3162,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
         let first_l2 = drain_latest_l2(&mut rx).expect("first l2 update");
         let first_version = match first_l2.as_ref() {
             InternalMessage::L2Update { l2_books } => {
@@ -3188,8 +3176,8 @@ mod tests {
             order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "2")])], 10, 0, BookMode::StatusPaired);
         listener.install_snapshot_state(new_state, 10, SnapshotTaskKind::Refresh).expect("refresh installs");
         assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")));
-        listener.flush_l2_if_due();
-        listener.flush_allbbo_if_due();
+        listener.flush_due_publications();
+        listener.flush_due_publications();
         assert!(drain_all(&mut rx).is_empty(), "the installed book publishes once its block closes");
 
         close_block_after_quiet(&mut listener);
@@ -3198,7 +3186,7 @@ mod tests {
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
 
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
         let msg = drain_latest_l2(&mut rx).expect("scheduled l2 refresh update");
         let l2_books = match msg.as_ref() {
             InternalMessage::L2Update { l2_books } => l2_books,
@@ -3238,7 +3226,7 @@ mod tests {
         assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
 
         close_block_after_quiet(&mut listener);
-        listener.flush_allbbo_if_due();
+        listener.flush_due_publications();
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::AllBboUpdate { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
@@ -3260,13 +3248,13 @@ mod tests {
         listener.process_data_hft(update_diff_line("ETH", 2, "1", "3"), EventSource::OrderDiffs).expect("ETH applies");
 
         close_block_after_quiet(&mut listener);
-        listener.flush_allbbo_if_due();
+        listener.flush_due_publications();
         assert!(drain_latest_allbbo(&mut rx).is_none(), "flush should respect the 50ms throttle");
         assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("BTC")));
         assert!(listener.pending_allbbo_changed_coins.contains(&Coin::new("ETH")));
 
         listener.last_allbbo_broadcast = Some(Instant::now() - Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_allbbo_if_due();
+        listener.flush_due_publications();
         let msg = drain_latest_allbbo(&mut rx).expect("pending allbbo changes should publish");
         match msg.as_ref() {
             InternalMessage::AllBboUpdate { bbos, .. } => {
@@ -3303,7 +3291,7 @@ mod tests {
         assert!(!drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
 
         close_block_after_quiet(&mut listener);
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
         let messages = drain_all(&mut rx);
         assert!(messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::L2Update { .. })));
         assert!(!messages.iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
@@ -3408,7 +3396,7 @@ mod tests {
         // if no additional file event arrives.
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
         close_block_after_quiet(&mut listener);
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
@@ -3438,7 +3426,7 @@ mod tests {
         assert!(drain_all(&mut rx).iter().any(|msg| matches!(msg.as_ref(), InternalMessage::BboUpdate { .. })));
 
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
         assert!(drain_latest_l2(&mut rx).is_some());
     }
 
@@ -3672,7 +3660,7 @@ mod tests {
 
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
         close_block_after_quiet(&mut listener);
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 snapshot");
         match msg.as_ref() {
@@ -3697,7 +3685,7 @@ mod tests {
         assert!(drain_latest_l2(&mut rx).is_none(), "event processing should not synchronously flush L2");
 
         close_block_after_quiet(&mut listener);
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         let msg = drain_latest_l2(&mut rx).expect("scheduler flush should publish pending L2");
         match msg.as_ref() {
@@ -3717,7 +3705,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         let msg = drain_latest_l2(&mut rx).expect("pending BTC change should force an L2 update");
         match msg.as_ref() {
@@ -3740,7 +3728,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         let msg = drain_latest_l2(&mut rx).expect("first dirty flush should publish the prepared book");
         let first_version = match msg.as_ref() {
@@ -3753,7 +3741,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         assert!(drain_latest_l2(&mut rx).is_none(), "unchanged prepared book should be filtered before broadcast");
     }
@@ -3765,7 +3753,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("BTC"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        let job = listener.take_l2_flush_job_if_due().expect("flush job");
+        let job = listener.take_due_publications().expect("flush job");
         let prepared = job.prepare();
 
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 1);
@@ -3782,7 +3770,7 @@ mod tests {
 
         listener.pending_l2_changed_coins.insert(Coin::new("ETH"));
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         assert!(listener.pending_l2_changed_coins.is_empty());
         assert!(Arc::ptr_eq(&eth_before, listener.l2_snapshot_cache.get(&Coin::new("ETH")).expect("ETH cache")));
@@ -3798,7 +3786,7 @@ mod tests {
         assert!(!listener.l2_snapshot_cache.is_empty(), "test setup should seed cache");
 
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
 
         assert!(listener.pending_l2_changed_coins.is_empty());
         assert!(listener.l2_snapshot_cache.is_empty());
@@ -3845,12 +3833,12 @@ mod tests {
 
     fn flush_l2_on_timer(listener: &mut OrderBookListener) {
         listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_l2_if_due();
+        listener.flush_due_publications();
     }
 
     fn flush_allbbo_on_timer(listener: &mut OrderBookListener) {
         listener.last_allbbo_broadcast = Some(Instant::now() - Duration::from_millis(ALLBBO_BROADCAST_THROTTLE_MS + 1));
-        listener.flush_allbbo_if_due();
+        listener.flush_due_publications();
     }
 
     fn drained_file_events() -> parallel::FileEventReceiver {
