@@ -4,8 +4,8 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
-        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
     },
     time::Duration,
 };
@@ -15,11 +15,7 @@ use block_gate::BlockGate;
 use log::{error, info, warn};
 use stream_history::replay_stream_history;
 use tokio::{
-    sync::{
-        Mutex,
-        broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
-    },
+    sync::{broadcast::Sender, mpsc, oneshot, watch},
     time::{Instant, sleep, sleep_until},
 };
 use utils::{EventBatch, SnapshotConfig, abci_state_height, get_abci_state_path, get_visor_path, process_rmp_file};
@@ -36,7 +32,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, RawBbo, Snapshot, Sz,
-        multi_book::{SnapshotHeightSource, Snapshots, load_snapshots_from_cli_json_at_height, read_visor_height},
+        multi_book::{SnapshotHeightSource, load_snapshots_from_cli_json_at_height, read_visor_height},
     },
     order_sync::OrderSyncRecorder,
     prelude::*,
@@ -47,6 +43,9 @@ use crate::{
         subscription::DEFAULT_LEVELS,
     },
 };
+
+#[cfg(test)]
+use crate::order_book::multi_book::Snapshots;
 
 mod block_gate;
 mod parallel;
@@ -74,7 +73,78 @@ enum SnapshotTaskKind {
 
 struct SnapshotTaskResult {
     kind: SnapshotTaskKind,
-    result: Result<SnapshotInstallOutcome>,
+    result: Result<PreparedSnapshot>,
+}
+
+/// Bound on queued requests for the listener actor. Websocket callers use `try_send`
+/// and fail the request when it is full instead of piling up waiting tasks.
+pub(crate) const LISTENER_MAILBOX_CAPACITY: usize = 256;
+
+/// Listener state that connections and `/health` read without a mailbox round trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ListenerStatus {
+    pub(crate) ready: bool,
+    pub(crate) universe: Arc<HashSet<Coin>>,
+}
+
+/// Requests served by the listener actor between batches. It owns the book, so each reply
+/// sees whole batches only.
+pub(crate) enum ListenerCommand {
+    SnapshotReplayJournalStartHeight { reply: oneshot::Sender<Option<u64>> },
+    L4Snapshot { coin: Coin, reply: oneshot::Sender<Option<L4CoinSnapshot>> },
+    AllBbos { reply: oneshot::Sender<Option<AllBbosSnapshot>> },
+}
+
+/// `(time, bbo per coin)` for every coin in the book.
+pub(crate) type AllBbosSnapshot = (u64, Vec<(Coin, RawBbo)>);
+
+/// One coin's L4 book, taken at a block boundary. Book updates at or below the cutoffs are
+/// already reflected in it, so a subscriber must not apply them on top.
+pub(crate) struct L4CoinSnapshot {
+    pub(crate) time: u64,
+    pub(crate) height: u64,
+    /// The last diff block the book holds.
+    pub(crate) diffs_through_height: u64,
+    /// Statuses run ahead of diffs, and a status above the diff block is still needed to pair
+    /// its later diff, so status updates only drop through the lower of both heights.
+    pub(crate) statuses_through_height: u64,
+    pub(crate) snapshot: Snapshot<InnerL4Order>,
+}
+
+/// The websocket side of the listener actor.
+#[derive(Clone)]
+pub(crate) struct ListenerClient {
+    commands: mpsc::Sender<ListenerCommand>,
+    status: watch::Receiver<ListenerStatus>,
+}
+
+impl ListenerClient {
+    pub(crate) const fn new(commands: mpsc::Sender<ListenerCommand>, status: watch::Receiver<ListenerStatus>) -> Self {
+        Self { commands, status }
+    }
+
+    pub(crate) fn status(&self) -> ListenerStatus {
+        self.status.borrow().clone()
+    }
+
+    async fn request<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> ListenerCommand) -> Result<T> {
+        let (reply, response) = oneshot::channel();
+        self.commands.try_send(command(reply)).map_err(|err| -> Error {
+            match err {
+                mpsc::error::TrySendError::Full(_) => "order book listener is busy; retry".into(),
+                mpsc::error::TrySendError::Closed(_) => "order book listener stopped".into(),
+            }
+        })?;
+        response.await.map_err(|_| "order book listener dropped the request".into())
+    }
+
+    pub(crate) async fn l4_snapshot(&self, coin: Coin) -> Result<Option<L4CoinSnapshot>> {
+        self.request(|reply| ListenerCommand::L4Snapshot { coin, reply }).await
+    }
+
+    pub(crate) async fn all_bbos(&self) -> Result<Option<AllBbosSnapshot>> {
+        self.request(|reply| ListenerCommand::AllBbos { reply }).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +302,7 @@ impl Drop for SnapshotReplayCache {
 }
 
 fn create_replay_journal() -> std::io::Result<(File, Option<PathBuf>)> {
-    static NEXT_REPLAY_JOURNAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static NEXT_REPLAY_JOURNAL_ID: AtomicU64 = AtomicU64::new(0);
 
     for _ in 0..100 {
         let id = NEXT_REPLAY_JOURNAL_ID.fetch_add(1, AtomicOrdering::Relaxed);
@@ -297,6 +367,9 @@ impl AllBboSubscriptionRegistry {
 #[derive(Default)]
 pub(crate) struct L2SubscriptionRegistry {
     keys: StdMutex<HashMap<L2SubscriptionKey, usize>>,
+    // Bumped after the set of active keys changes, so the listener re-reads the keys only
+    // after a subscription shape appears or disappears.
+    generation: AtomicU64,
 }
 
 impl L2SubscriptionRegistry {
@@ -305,21 +378,70 @@ impl L2SubscriptionRegistry {
     }
 
     pub(crate) fn register_l2(&self, key: L2SubscriptionKey) {
-        *self.keys().entry(key).or_insert(0) += 1;
+        let mut counts = self.keys();
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        let added = *count == 1;
+        drop(counts);
+        if added {
+            self.key_set_changed();
+        }
     }
 
     pub(crate) fn unregister_l2(&self, key: &L2SubscriptionKey) {
-        let mut counts = self.keys();
-        if let Some(count) = counts.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(key);
-            }
+        let removed = {
+            let mut counts = self.keys();
+            counts.get_mut(key).is_some_and(|count| {
+                *count -= 1;
+                *count == 0
+            }) && counts.remove(key).is_some()
+        };
+        if removed {
+            self.key_set_changed();
         }
+    }
+
+    /// Bump after the change is visible under the lock: a reader that sees the new generation
+    /// then reads the new keys, and one that read the old generation reads them again next time.
+    fn key_set_changed(&self) {
+        self.generation.fetch_add(1, AtomicOrdering::Release);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(AtomicOrdering::Acquire)
     }
 
     pub(crate) fn active_keys(&self) -> HashSet<L2SubscriptionKey> {
         self.keys().keys().cloned().collect()
+    }
+}
+
+/// Demanded L2 aggregation params per coin.
+pub(crate) type L2Demand = HashMap<Coin, HashSet<L2SnapshotParams>>;
+
+/// The listener's copy of the active L2 subscriptions, refreshed only when the registry
+/// generation moves.
+#[derive(Default)]
+struct ActiveL2Subscriptions {
+    generation: Option<u64>,
+    keys: Arc<HashSet<L2SubscriptionKey>>,
+    demand: L2Demand,
+}
+
+impl ActiveL2Subscriptions {
+    fn refresh(&mut self, registry: &L2SubscriptionRegistry) {
+        // Read the generation before the keys: a change that lands in between is picked up
+        // now and read again next time, never missed.
+        let generation = registry.generation();
+        if self.generation == Some(generation) {
+            return;
+        }
+        let keys = registry.active_keys();
+        let mut demand = L2Demand::new();
+        for key in &keys {
+            demand.entry(key.coin.clone()).or_default().insert(key.params);
+        }
+        *self = Self { generation: Some(generation), keys: Arc::new(keys), demand };
     }
 }
 
@@ -395,20 +517,23 @@ fn snapshot_heights(
     }
 }
 
+/// Build a snapshot off the listener actor. `replay_started` is the result of opening the
+/// replay journal, which the actor does before spawning so capture precedes generation.
+/// The prepared state goes back to the actor through `tx` and is installed between batches.
 fn fetch_snapshot(
     kind: SnapshotTaskKind,
     snapshot_config: SnapshotConfig,
-    listener: Arc<Mutex<OrderBookListener>>,
-    tx: UnboundedSender<SnapshotTaskResult>,
+    replay_started: Result<()>,
+    commands: mpsc::Sender<ListenerCommand>,
+    tx: mpsc::Sender<SnapshotTaskResult>,
     ignore_spot: bool,
     book_mode: BookMode,
 ) {
-    let tx = tx.clone();
     tokio::spawn(async move {
-        let res: Result<SnapshotInstallOutcome> = async {
-            // Start replay capture before generating the snapshot so the new state can
+        let res: Result<PreparedSnapshot> = async {
+            // Replay capture started before generating the snapshot so the new state can
             // catch up to events written while hl-node is reading abci_state.rmp.
-            listener.lock().await.begin_snapshot_replay_for(kind)?;
+            replay_started?;
 
             let visor_path = get_visor_path(&snapshot_config);
             let abci_state_path = get_abci_state_path(&snapshot_config);
@@ -437,10 +562,14 @@ fn fetch_snapshot(
             // around the snapshot read before we close replay capture.
             sleep(Duration::from_secs(1)).await;
 
-            let journal_start_height = listener
-                .lock()
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(ListenerCommand::SnapshotReplayJournalStartHeight { reply })
                 .await
-                .snapshot_replay_journal_start_height()
+                .map_err(|_| "order book listener stopped")?;
+            let journal_start_height = response
+                .await
+                .map_err(|_| "order book listener dropped the journal height request")?
                 .ok_or("Snapshot replay journal has not captured a line from every book stream yet")?;
             // The block at each source's journal start may straddle the start of
             // capture, so every block through the latest start comes from disk.
@@ -466,51 +595,46 @@ fn fetch_snapshot(
                 history.replayed_lines
             );
 
-            let prepared = PreparedSnapshot { state: new_order_book, heights, replay_cutoff_height, history };
-            listener.lock().await.install_snapshot(prepared, kind)
+            Ok(PreparedSnapshot { state: new_order_book, heights, replay_cutoff_height, history })
         }
         .await;
 
-        if res.is_err() {
-            listener.lock().await.clear_snapshot_replay();
-        }
-        let _unused = tx.send(SnapshotTaskResult { kind, result: res });
-        Ok::<(), Error>(())
+        // One job is in flight at a time and the actor drains this channel, so this never waits long.
+        drop(tx.send(SnapshotTaskResult { kind, result: res }).await);
     });
 }
 
-async fn start_snapshot_if_due(
-    listener: &Arc<Mutex<OrderBookListener>>,
+#[allow(clippy::too_many_arguments)]
+fn start_snapshot_if_due(
+    listener: &mut OrderBookListener,
     features: FeatureSet,
     snapshot_fetch_pending: bool,
     next_refresh_at: Option<Instant>,
     repair_retry_at: Option<Instant>,
     now: Instant,
     snapshot_config: &SnapshotConfig,
-    snapshot_fetch_task_tx: &UnboundedSender<SnapshotTaskResult>,
-    ignore_spot: bool,
+    commands: &mpsc::Sender<ListenerCommand>,
+    snapshot_fetch_task_tx: &mpsc::Sender<SnapshotTaskResult>,
 ) -> bool {
-    let (is_ready, repair_pending) = {
-        let listener = listener.lock().await;
-        (listener.is_ready(), listener.repair_pending())
-    };
     let Some(kind) = next_snapshot_trigger(
         features,
-        is_ready,
+        listener.is_ready(),
         snapshot_fetch_pending,
         next_refresh_at,
-        repair_pending,
+        listener.repair_pending(),
         repair_retry_at,
         now,
     ) else {
         return false;
     };
+    let replay_started = listener.begin_snapshot_replay_for(kind);
     fetch_snapshot(
         kind,
         snapshot_config.clone(),
-        Arc::clone(listener),
+        replay_started,
+        commands.clone(),
         snapshot_fetch_task_tx.clone(),
-        ignore_spot,
+        listener.ignore_spot,
         features.book_mode(),
     );
     true
@@ -645,12 +769,19 @@ pub(crate) struct OrderBookListener {
     next_l2_version: u64,
     l2_generation: u64,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
+    active_l2: ActiveL2Subscriptions,
+    // An L2 flush job is being prepared off the listener; it owns `l2_prepared_hashes`
+    // until `finish_l2_flush`, so no other job may be built meanwhile.
+    l2_flush_in_flight: bool,
     last_allbbo_broadcast: Option<Instant>,
     pending_allbbo_changed_coins: HashSet<Coin>,
     allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     last_universe: HashSet<Coin>,
     stats: StatsAccumulator,
     order_sync_recorder: Option<OrderSyncRecorder>,
+    status_tx: watch::Sender<ListenerStatus>,
+    // L4 snapshot requests that arrived mid-block, answered once the block closes.
+    parked_l4_snapshots: Vec<(Coin, oneshot::Sender<Option<L4CoinSnapshot>>)>,
 }
 
 impl OrderBookListener {
@@ -659,6 +790,8 @@ impl OrderBookListener {
         ignore_spot: bool,
         features: FeatureSet,
     ) -> Self {
+        let ready = !features.requires_book_state();
+        let (status_tx, _) = watch::channel(ListenerStatus { ready, universe: Arc::default() });
         Self {
             ignore_spot,
             features,
@@ -679,12 +812,53 @@ impl OrderBookListener {
             next_l2_version: 1,
             l2_generation: 0,
             l2_subscription_registry: Arc::new(L2SubscriptionRegistry::default()),
+            active_l2: ActiveL2Subscriptions::default(),
+            l2_flush_in_flight: false,
             last_allbbo_broadcast: None,
             pending_allbbo_changed_coins: HashSet::new(),
             allbbo_subscription_registry: Arc::new(AllBboSubscriptionRegistry::default()),
             last_universe: HashSet::new(),
             stats: StatsAccumulator::default(),
             order_sync_recorder: None,
+            status_tx,
+            parked_l4_snapshots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn subscribe_status(&self) -> watch::Receiver<ListenerStatus> {
+        self.status_tx.subscribe()
+    }
+
+    /// Publish readiness and the universe. Call before broadcasting a universe change so a
+    /// connection that subscribes in between still reads the new universe.
+    fn publish_status(&self) {
+        let ready = self.is_ready();
+        self.status_tx.send_if_modified(|status| {
+            if status.ready == ready && *status.universe == self.last_universe {
+                return false;
+            }
+            *status = ListenerStatus { ready, universe: Arc::new(self.last_universe.clone()) };
+            true
+        });
+    }
+
+    fn handle_command(&mut self, command: ListenerCommand) {
+        match command {
+            ListenerCommand::SnapshotReplayJournalStartHeight { reply } => {
+                let _unused = reply.send(self.snapshot_replay_journal_start_height());
+            }
+            ListenerCommand::L4Snapshot { coin, reply } => {
+                // A snapshot mid-block would hold part of a block whose remaining updates the
+                // subscriber cannot tell apart from the part already applied.
+                if self.order_book_state.is_some() && !self.block_gate.is_complete() {
+                    self.parked_l4_snapshots.push((coin, reply));
+                } else {
+                    drop(reply.send(self.l4_coin_snapshot(&coin)));
+                }
+            }
+            ListenerCommand::AllBbos { reply } => {
+                drop(reply.send(self.all_bbos()));
+            }
         }
     }
 
@@ -696,12 +870,8 @@ impl OrderBookListener {
         self.order_sync_recorder.clone()
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
+    pub(crate) const fn is_ready(&self) -> bool {
         !self.features.requires_book_state() || self.order_book_state.is_some()
-    }
-
-    pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
     }
 
     pub(crate) fn l2_subscription_registry(&self) -> Arc<L2SubscriptionRegistry> {
@@ -815,6 +985,7 @@ impl OrderBookListener {
         self.stream_ignore_through_height = self.stream_ignore_through_height.max(replay_cutoff_height);
         self.stream_replay_guard_through_height = snapshot_height;
         self.last_universe = self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe);
+        self.publish_status();
         // The incremental L2 cache references the previous book's coins/levels;
         // drop it so the next broadcast does a full rebuild against the new state.
         self.l2_snapshot_cache = HashMap::new();
@@ -932,12 +1103,26 @@ impl OrderBookListener {
         Ok(SnapshotInstallOutcome::Installed { replayed_lines: replay_outcome.replayed_lines })
     }
 
-    // forcibly grab current snapshot
-    pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
-        self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+    fn l4_coin_snapshot(&self, coin: &Coin) -> Option<L4CoinSnapshot> {
+        let state = self.order_book_state.as_ref()?;
+        let snapshot = state.coin_snapshot(coin)?;
+        let diffs_through_height = state.last_diff_block();
+        Some(L4CoinSnapshot {
+            time: state.time(),
+            height: state.height(),
+            diffs_through_height,
+            statuses_through_height: diffs_through_height.min(state.order_status_height()),
+            snapshot,
+        })
     }
 
-    pub(crate) fn all_bbos(&self) -> Option<(u64, Vec<(Coin, RawBbo)>)> {
+    fn answer_parked_l4_snapshots(&mut self) {
+        for (coin, reply) in std::mem::take(&mut self.parked_l4_snapshots) {
+            drop(reply.send(self.l4_coin_snapshot(&coin)));
+        }
+    }
+
+    pub(crate) fn all_bbos(&self) -> Option<AllBbosSnapshot> {
         self.order_book_state.as_ref().map(OrderBookState::get_all_bbos)
     }
 
@@ -975,9 +1160,9 @@ impl OrderBookListener {
         }
 
         if self.features.l2book() {
-            let active_keys = self.l2_subscription_registry.active_keys();
-            if !active_keys.is_empty() {
-                self.pending_l2_changed_coins.extend(active_keys.into_iter().map(|key| key.coin));
+            self.active_l2.refresh(&self.l2_subscription_registry);
+            if !self.active_l2.demand.is_empty() {
+                self.pending_l2_changed_coins.extend(self.active_l2.demand.keys().cloned());
                 self.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
             }
         }
@@ -997,6 +1182,7 @@ impl OrderBookListener {
         }
 
         self.last_universe = universe.clone();
+        self.publish_status();
         if let Some(tx) = &self.internal_message_tx {
             if tx.receiver_count() > 0 {
                 drop(tx.send(Arc::new(InternalMessage::Universe { universe })));
@@ -1023,17 +1209,16 @@ impl OrderBookListener {
             return None;
         }
 
-        let active_keys = self.l2_subscription_registry.active_keys();
-        if active_keys.is_empty() {
+        self.active_l2.refresh(&self.l2_subscription_registry);
+        if self.active_l2.keys.is_empty() {
             self.pending_l2_changed_coins.clear();
             self.l2_snapshot_cache.clear();
             self.l2_prepared_hashes.clear();
             self.next_l2_version = 1;
             return None;
         }
-        let requested_params: HashSet<L2SnapshotParams> = active_keys.iter().map(|key| key.params).collect();
-        let active_coins: HashSet<Coin> = active_keys.iter().map(|key| key.coin.clone()).collect();
-        if !self.pending_l2_changed_coins.iter().any(|coin| active_coins.contains(coin)) {
+        let demand = &self.active_l2.demand;
+        if !self.pending_l2_changed_coins.iter().any(|coin| demand.contains_key(coin)) {
             self.pending_l2_changed_coins.clear();
             return None;
         }
@@ -1060,17 +1245,16 @@ impl OrderBookListener {
         let state = self.order_book_state.as_ref()?;
         let l2_start = Instant::now();
         let mut changed_for_l2 = std::mem::take(&mut self.pending_l2_changed_coins);
-        changed_for_l2.retain(|coin| active_coins.contains(coin));
+        changed_for_l2.retain(|coin| demand.contains_key(coin));
         let snapshot_start = Instant::now();
-        let (time, l2_snapshots) =
-            state.l2_snapshots_incremental(&changed_for_l2, &requested_params, &mut self.l2_snapshot_cache);
-        L2_FLUSH_PHASE_LATENCY.with_label_values(&["snapshot"]).observe(snapshot_start.elapsed().as_secs_f64());
+        let (time, l2_snapshots) = state.l2_snapshots_incremental(&changed_for_l2, demand, &mut self.l2_snapshot_cache);
+        L2_FLUSH_PHASES.snapshot.observe(snapshot_start.elapsed().as_secs_f64());
 
         Some(L2FlushJob {
             generation: self.l2_generation,
             time,
             l2_snapshots,
-            active_keys,
+            active_keys: Arc::clone(&self.active_l2.keys),
             tx: tx.clone(),
             prepared_hashes: std::mem::take(&mut self.l2_prepared_hashes),
             next_version: self.next_l2_version,
@@ -1079,6 +1263,7 @@ impl OrderBookListener {
     }
 
     fn finish_l2_flush(&mut self, prepared: PreparedL2Flush) {
+        self.l2_flush_in_flight = false;
         if prepared.generation != self.l2_generation {
             return;
         }
@@ -1089,7 +1274,7 @@ impl OrderBookListener {
             let msg = Arc::new(InternalMessage::L2Update { l2_books: prepared.l2_books });
             drop(prepared.tx.send(msg));
         }
-        L2_FLUSH_PHASE_LATENCY.with_label_values(&["publish"]).observe(publish_start.elapsed().as_secs_f64());
+        L2_FLUSH_PHASES.publish.observe(publish_start.elapsed().as_secs_f64());
         L2_BROADCAST_LATENCY.observe(prepared.started_at.elapsed().as_secs_f64());
     }
 
@@ -1136,7 +1321,7 @@ impl OrderBookListener {
         let (Some(state), Some(tx)) = (&self.order_book_state, &self.internal_message_tx) else { return };
         let bbo_start = Instant::now();
         let (time, bbos) = state.get_bbos_for_coins(&changed);
-        drop(tx.send(Arc::new(InternalMessage::BboUpdate { bbos, time })));
+        drop(tx.send(Arc::new(InternalMessage::bbo_update(bbos, time))));
         BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
     }
 
@@ -1146,23 +1331,36 @@ impl OrderBookListener {
         if !self.block_gate.is_complete() {
             return;
         }
+        self.answer_parked_l4_snapshots();
         self.publish_pending_bbos();
         if let Some(msg) = self.take_allbbo_update_if_due() {
             if let Some(tx) = &self.internal_message_tx {
                 drop(tx.send(Arc::new(msg)));
             }
         }
-        // A parked job holds `l2_prepared_hashes` until the tick prepares it, so build one at a time.
-        if self.ready_l2_job.is_none() {
+        // A parked or in-flight job holds `l2_prepared_hashes` until it is finished, so build
+        // one at a time.
+        if self.ready_l2_job.is_none() && !self.l2_flush_in_flight {
             self.ready_l2_job = self.take_l2_flush_job_if_due();
         }
     }
 
     /// The flush tick: publish what a complete block allows, then hand back the parked L2 job
-    /// so it is prepared outside the listener lock.
+    /// so it is prepared off the listener. The caller must pass the result to `finish_l2_flush`.
     fn take_due_publications(&mut self) -> Option<L2FlushJob> {
         self.publish_complete_block();
-        self.ready_l2_job.take()
+        let job = self.ready_l2_job.take();
+        self.l2_flush_in_flight |= job.is_some();
+        job
+    }
+
+    /// The prepare task panicked; its changed coins and prepared hashes are lost, so rebuild
+    /// and resend every demanded shape on the next flush.
+    fn abandon_l2_flush(&mut self) {
+        self.l2_flush_in_flight = false;
+        self.l2_prepared_hashes.clear();
+        self.l2_snapshot_cache.clear();
+        self.pending_l2_changed_coins.extend(self.active_l2.demand.keys().cloned());
     }
 
     /// A late timer can fire with lines already queued; applying them decides whether the block ended.
@@ -1197,6 +1395,48 @@ struct ParsedHftEvent {
     height: u64,
     event_batch: EventBatch,
 }
+
+/// Cached children of the per-source metric vectors, so the ingest path skips the label lookup.
+pub(super) struct SourceMetrics {
+    pub(super) file_events: prometheus::IntCounter,
+    pub(super) lines_parsed: prometheus::IntCounter,
+    pub(super) events_processed: prometheus::IntCounter,
+    processing_latency: prometheus::Histogram,
+}
+
+impl SourceMetrics {
+    pub(super) fn get(event_source: EventSource) -> &'static Self {
+        static METRICS: LazyLock<[SourceMetrics; 3]> = LazyLock::new(|| {
+            [EventSource::Fills, EventSource::OrderStatuses, EventSource::OrderDiffs].map(|source| {
+                let label = [source_label(source)];
+                SourceMetrics {
+                    file_events: FILE_EVENTS_TOTAL.with_label_values(&label),
+                    lines_parsed: FILE_LINES_PARSED_TOTAL.with_label_values(&label),
+                    events_processed: EVENTS_PROCESSED_TOTAL.with_label_values(&label),
+                    processing_latency: EVENT_PROCESSING_LATENCY.with_label_values(&label),
+                }
+            })
+        });
+        &METRICS[match event_source {
+            EventSource::Fills => 0,
+            EventSource::OrderStatuses => 1,
+            EventSource::OrderDiffs => 2,
+        }]
+    }
+}
+
+/// Cached children of `L2_FLUSH_PHASE_LATENCY`.
+struct L2FlushPhases {
+    snapshot: prometheus::Histogram,
+    prepare: prometheus::Histogram,
+    publish: prometheus::Histogram,
+}
+
+static L2_FLUSH_PHASES: LazyLock<L2FlushPhases> = LazyLock::new(|| L2FlushPhases {
+    snapshot: L2_FLUSH_PHASE_LATENCY.with_label_values(&["snapshot"]),
+    prepare: L2_FLUSH_PHASE_LATENCY.with_label_values(&["prepare"]),
+    publish: L2_FLUSH_PHASE_LATENCY.with_label_values(&["publish"]),
+});
 
 const fn source_label(event_source: EventSource) -> &'static str {
     match event_source {
@@ -1233,7 +1473,7 @@ fn parse_hft_event(line: String, event_source: EventSource) -> Result<Option<Par
 }
 
 fn record_hft_parse_error(event_source: EventSource, line_len: usize, err: &Error) {
-    static PARSE_ERR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PARSE_ERR_COUNT: AtomicU64 = AtomicU64::new(0);
     PARSE_ERRORS_TOTAL.with_label_values(&[source_label(event_source)]).inc();
     let err_count = PARSE_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if err_count.is_multiple_of(1_000) {
@@ -1287,8 +1527,9 @@ impl OrderBookListener {
             recorder.observe_batch(batch);
         }
 
-        FILE_EVENTS_TOTAL.with_label_values(&[source_label]).inc();
-        FILE_LINES_PARSED_TOTAL.with_label_values(&[source_label]).inc_by(line.len() as u64);
+        let metrics = SourceMetrics::get(event_source);
+        metrics.file_events.inc();
+        metrics.lines_parsed.inc_by(line.len() as u64);
         if apply_to_book {
             if self.block_gate.closes_before(event_source, height) {
                 self.publish_complete_block();
@@ -1303,12 +1544,12 @@ impl OrderBookListener {
                 if should_broadcast {
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
-                            let msg = Arc::new(InternalMessage::L4OrderStatuses { batch: batch.clone() });
+                            let msg = Arc::new(InternalMessage::l4_order_statuses(batch.clone()));
                             drop(tx.send(msg));
                         }
                     }
                 }
-                EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
+                metrics.events_processed.inc();
                 if apply_to_book {
                     self.order_book_state
                         .as_mut()
@@ -1328,13 +1569,13 @@ impl OrderBookListener {
                                 batch.clone()
                             };
                             if to_broadcast.events_len() > 0 {
-                                let msg = Arc::new(InternalMessage::L4OrderDiffs { batch: to_broadcast });
+                                let msg = Arc::new(InternalMessage::l4_order_diffs(to_broadcast));
                                 drop(tx.send(msg));
                             }
                         }
                     }
                 }
-                EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
+                metrics.events_processed.inc();
                 if apply_to_book {
                     self.order_book_state.as_mut().map_or_else(
                         || Ok(HashSet::new()),
@@ -1345,11 +1586,11 @@ impl OrderBookListener {
                 }
             }
             EventBatch::Fills(batch) => {
-                EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
+                metrics.events_processed.inc();
                 if self.features.trades() {
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
+                            let snapshot = Arc::new(InternalMessage::fills(batch));
                             drop(tx.send(snapshot));
                         }
                     }
@@ -1377,7 +1618,7 @@ impl OrderBookListener {
                 HashSet::new()
             }
         };
-        EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
+        metrics.processing_latency.observe(process_start.elapsed().as_secs_f64());
         let pending_repair_reasons =
             self.order_book_state.as_mut().map(OrderBookState::take_repair_reasons).unwrap_or_default();
         self.request_pending_repairs(pending_repair_reasons);
@@ -1448,7 +1689,7 @@ impl L2Snapshots {
                 key.params.mantissa,
                 Some(key.n_levels),
             );
-            prepared.insert(key.clone(), Arc::new(PreparedL2Book { version, payload }));
+            prepared.insert(key.clone(), Arc::new(PreparedL2Book { version, payload, wire: OnceLock::new() }));
         }
         prepared
     }
@@ -1458,7 +1699,7 @@ struct L2FlushJob {
     generation: u64,
     time: u64,
     l2_snapshots: L2Snapshots,
-    active_keys: HashSet<L2SubscriptionKey>,
+    active_keys: Arc<HashSet<L2SubscriptionKey>>,
     tx: Sender<Arc<InternalMessage>>,
     prepared_hashes: HashMap<L2SubscriptionKey, u64>,
     next_version: u64,
@@ -1471,7 +1712,7 @@ impl L2FlushJob {
         let Self { generation, time, l2_snapshots, active_keys, tx, mut prepared_hashes, mut next_version, started_at } =
             self;
         let l2_books = l2_snapshots.into_prepared_books(&active_keys, time, &mut prepared_hashes, &mut next_version);
-        L2_FLUSH_PHASE_LATENCY.with_label_values(&["prepare"]).observe(prepare_start.elapsed().as_secs_f64());
+        L2_FLUSH_PHASES.prepare.observe(prepare_start.elapsed().as_secs_f64());
         PreparedL2Flush { generation, tx, l2_books, prepared_hashes, next_version, started_at }
     }
 }
@@ -1485,9 +1726,8 @@ struct PreparedL2Flush {
     started_at: Instant,
 }
 
+#[cfg(test)]
 pub(crate) struct TimedSnapshots {
-    pub(crate) time: u64,
-    pub(crate) height: u64,
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
 
@@ -1525,6 +1765,23 @@ impl StatsAccumulator {
     }
 }
 
+/// Wire payloads for one broadcast message, keyed by topic (coin or user). The first
+/// connection that needs them groups and serializes the message once; every other
+/// connection reuses the same bytes.
+pub(crate) struct PayloadCache<K>(OnceLock<HashMap<K, bytes::Bytes>>);
+
+impl<K> Default for PayloadCache<K> {
+    fn default() -> Self {
+        Self(OnceLock::new())
+    }
+}
+
+impl<K> PayloadCache<K> {
+    pub(crate) fn get_or_build(&self, build: impl FnOnce() -> HashMap<K, bytes::Bytes>) -> &HashMap<K, bytes::Bytes> {
+        self.0.get_or_init(build)
+    }
+}
+
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     L2Update {
@@ -1535,11 +1792,15 @@ pub(crate) enum InternalMessage {
     },
     Fills {
         batch: Batch<NodeDataFill>,
+        /// Trades per coin.
+        trades: PayloadCache<String>,
     },
     /// Fast BBO broadcast path - bypasses expensive L2 snapshot computation
     BboUpdate {
         bbos: HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)>,
         time: u64,
+        /// BBO per coin.
+        payloads: PayloadCache<String>,
     },
     AllBboUpdate {
         bbos: Vec<(Coin, RawBbo)>,
@@ -1548,14 +1809,40 @@ pub(crate) enum InternalMessage {
     /// HFT L4 streaming - order diffs without waiting for status pairing
     L4OrderDiffs {
         batch: Batch<NodeDataOrderDiff>,
+        /// L4 book updates per coin.
+        l4_updates: PayloadCache<String>,
+        /// Raw book diffs per coin.
+        raw_diffs: PayloadCache<String>,
     },
     /// HFT L4 streaming - order statuses without waiting for diff pairing
     L4OrderStatuses {
         batch: Batch<NodeDataOrderStatus>,
+        /// L4 book updates per coin.
+        l4_updates: PayloadCache<String>,
+        /// Order updates per user.
+        order_updates: PayloadCache<Address>,
     },
     Stats {
         stats: Stats,
     },
+}
+
+impl InternalMessage {
+    fn fills(batch: Batch<NodeDataFill>) -> Self {
+        Self::Fills { batch, trades: PayloadCache::default() }
+    }
+
+    fn bbo_update(bbos: HashMap<Coin, RawBbo>, time: u64) -> Self {
+        Self::BboUpdate { bbos, time, payloads: PayloadCache::default() }
+    }
+
+    fn l4_order_diffs(batch: Batch<NodeDataOrderDiff>) -> Self {
+        Self::L4OrderDiffs { batch, l4_updates: PayloadCache::default(), raw_diffs: PayloadCache::default() }
+    }
+
+    fn l4_order_statuses(batch: Batch<NodeDataOrderStatus>) -> Self {
+        Self::L4OrderStatuses { batch, l4_updates: PayloadCache::default(), order_updates: PayloadCache::default() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -1580,9 +1867,18 @@ impl L2SubscriptionKey {
 pub(crate) struct PreparedL2Book {
     version: u64,
     payload: L2Book,
+    /// The serialized update, shared by every subscriber of this key.
+    wire: OnceLock<Option<bytes::Bytes>>,
 }
 
 impl PreparedL2Book {
+    pub(crate) fn wire_payload(
+        &self,
+        serialize: impl FnOnce(&L2Book) -> Option<bytes::Bytes>,
+    ) -> Option<&bytes::Bytes> {
+        self.wire.get_or_init(|| serialize(&self.payload)).as_ref()
+    }
+
     pub(crate) const fn version(&self) -> u64 {
         self.version
     }
@@ -1592,7 +1888,14 @@ impl PreparedL2Book {
     }
 }
 
-pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crate::ServerConfig) -> Result<()> {
+/// The listener actor: the sole owner of `listener`. Websocket connections and the snapshot
+/// task reach it through `commands`; `command_tx` lets the snapshot task it spawns do the same.
+pub(crate) async fn hl_listen_hft(
+    mut listener: OrderBookListener,
+    mut commands: mpsc::Receiver<ListenerCommand>,
+    command_tx: mpsc::Sender<ListenerCommand>,
+    config: crate::ServerConfig,
+) -> Result<()> {
     let dir = match config.data_dir.clone() {
         Some(d) => d,
         None => dirs::home_dir().ok_or(
@@ -1616,18 +1919,14 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         data_dir: dir.clone(),
     };
 
-    let ignore_spot = {
-        let listener = listener.lock().await;
-        listener.ignore_spot
-    };
-
-    let order_sync_recorder = listener.lock().await.order_sync_recorder();
+    let order_sync_recorder = listener.order_sync_recorder();
 
     // Start only the file watchers needed by the enabled features.
     let (mut file_events, _handles) =
         parallel::start_parallel_file_watchers(dir, config.features, order_sync_recorder, config.stream_watch).await?;
 
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<SnapshotTaskResult>();
+    // Only one snapshot job is in flight at a time.
+    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = mpsc::channel::<SnapshotTaskResult>(1);
     let refresh_interval = snapshot_refresh_interval(config.snapshot_refresh_hours);
     if let Some(interval) = refresh_interval {
         info!("Snapshot refresh enabled every {} seconds", interval.as_secs());
@@ -1655,6 +1954,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     let mut repair_backoff = RepairRetryBackoff::default();
     let mut ready_events = Vec::with_capacity(64);
     let mut quiet_deadline: Option<Instant> = None;
+    // At most one L2 flush job is prepared off the listener at a time.
+    let mut l2_prepare: Option<tokio::task::JoinHandle<PreparedL2Flush>> = None;
 
     info!("Main event loop starting");
 
@@ -1664,47 +1965,53 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
             _ = sleep_until(quiet_deadline.unwrap_or_else(Instant::now)), if quiet_deadline.is_some() => {
                 quiet_deadline = None;
-                listener.lock().await.close_quiet_block(Instant::now(), &file_events);
+                listener.close_quiet_block(Instant::now(), &file_events);
+            }
+
+            prepared = join_l2_prepare(&mut l2_prepare) => {
+                l2_prepare = None;
+                match prepared {
+                    Ok(prepared) => listener.finish_l2_flush(prepared),
+                    Err(err) => {
+                        error!("L2 flush prepare task failed: {err}");
+                        listener.abandon_l2_flush();
+                    }
+                }
             }
 
             // Flush throttled book-derived batches on the scheduler, ahead of file
             // events in this biased select, so a full file-event queue cannot starve them.
             _ = l2_flush_ticker.tick(), if config.features.requires_book_state() => {
-                let job = listener.lock().await.take_due_publications();
-                if let Some(job) = job {
-                    let prepared = job.prepare();
-                    listener.lock().await.finish_l2_flush(prepared);
+                if let Some(job) = listener.take_due_publications() {
+                    l2_prepare = Some(tokio::task::spawn_blocking(move || job.prepare()));
                 }
             }
 
             _ = stats_ticker.tick(), if config.features.stats() => {
-                listener.lock().await.flush_stats_if_due();
+                listener.flush_stats_if_due();
             }
 
             _ = maintenance_ticker.tick(), if config.features.requires_book_state() => {
                 ORDER_STREAM_QUEUE_DEPTH.set(i64::try_from(file_events.len()).unwrap_or(i64::MAX));
-                let repair_due = {
-                    let mut listener = listener.lock().await;
-                    listener.maintain_state();
-                    listener.is_ready() && listener.repair_pending()
-                };
+                listener.maintain_state();
+                let repair_due = listener.is_ready() && listener.repair_pending();
                 if repair_due && start_snapshot_if_due(
-                    &listener,
+                    &mut listener,
                     config.features,
                     snapshot_fetch_pending,
                     next_refresh_at,
                     repair_backoff.retry_at(),
                     Instant::now(),
                     &snapshot_config,
+                    &command_tx,
                     &snapshot_fetch_task_tx,
-                    ignore_spot,
-                ).await {
+                ) {
                     snapshot_fetch_pending = true;
                 }
             }
 
             _ = compaction_ticker.tick(), if config.features.requires_book_state() => {
-                listener.lock().await.compact_order_book();
+                listener.compact_order_book();
             }
 
             // Handle completed snapshots ahead of a continuously ready file-event
@@ -1712,24 +2019,32 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // result until a large upstream backlog has been fully drained.
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
                 snapshot_fetch_pending = false;
+                // Install inline, between batches, so no reader sees a half-swapped book.
+                let snapshot_fetch_res = snapshot_fetch_res.map(|SnapshotTaskResult { kind, result }| {
+                    let result = result.and_then(|prepared| listener.install_snapshot(prepared, kind));
+                    if result.is_err() {
+                        listener.clear_snapshot_replay();
+                    }
+                    (kind, result)
+                });
                 match snapshot_fetch_res {
                     None => {
                         return Err("Snapshot fetch task sender dropped".into());
                     }
-                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Initial, result: Err(err), .. }) => {
+                    Some((SnapshotTaskKind::Initial, Err(err))) => {
                         warn!("Initial snapshot failed; retrying on the next scheduler tick: {err}");
                     }
-                    Some(SnapshotTaskResult { kind: SnapshotTaskKind::Refresh, result: Err(err), .. }) => {
+                    Some((SnapshotTaskKind::Refresh, Err(err))) => {
                         warn!("Background snapshot refresh failed; keeping current order book: {err}");
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
                         let now = Instant::now();
-                        if listener.lock().await.repair_pending() {
+                        if listener.repair_pending() {
                             repair_backoff.record_failure(now);
                         } else {
                             repair_backoff.reset();
                         }
                     }
-                    Some(SnapshotTaskResult { kind, result: Ok(outcome) }) => {
+                    Some((kind, Ok(outcome))) => {
                         match outcome {
                             SnapshotInstallOutcome::Installed { replayed_lines } => {
                                 info!("{kind:?} snapshot installed after replaying {replayed_lines} stream lines");
@@ -1754,12 +2069,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                         next_refresh_at = refresh_interval.map(|interval| Instant::now() + interval);
                         let now = Instant::now();
-                        let repair_pending = {
-                            let listener = listener.lock().await;
-                            quiet_deadline = listener.block_gate.quiet_deadline();
-                            listener.repair_pending()
-                        };
-                        if repair_pending {
+                        quiet_deadline = listener.block_gate.quiet_deadline();
+                        if listener.repair_pending() {
                             repair_backoff.record_failure(now);
                         } else {
                             repair_backoff.reset();
@@ -1771,23 +2082,28 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // Start snapshots ahead of file events so a continuous backlog cannot starve the timer.
             _ = ticker.tick() => {
                 let now = Instant::now();
-                let is_ready = listener.lock().await.is_ready();
-                if config.features.requires_book_state() && is_ready && next_refresh_at.is_none() {
+                if config.features.requires_book_state() && listener.is_ready() && next_refresh_at.is_none() {
                     next_refresh_at = refresh_interval.map(|interval| now + interval);
                 }
                 if start_snapshot_if_due(
-                    &listener,
+                    &mut listener,
                     config.features,
                     snapshot_fetch_pending,
                     next_refresh_at,
                     repair_backoff.retry_at(),
                     now,
                     &snapshot_config,
+                    &command_tx,
                     &snapshot_fetch_task_tx,
-                    ignore_spot,
-                ).await {
+                ) {
                     snapshot_fetch_pending = true;
                 }
+            }
+
+            // Serve websocket and snapshot-task requests ahead of file events so a continuous
+            // backlog cannot starve them; each request is one coin or one BBO pass.
+            Some(command) = commands.recv() => {
+                listener.handle_command(command);
             }
 
             received = file_events.recv_many(&mut ready_events, 64) => {
@@ -1819,7 +2135,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                     }
                 }
-                let mut listener = listener.lock().await;
                 for source in stream_gaps {
                     listener.report_stream_gap(source);
                 }
@@ -1835,6 +2150,16 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 quiet_deadline = listener.block_gate.quiet_deadline();
             }
         }
+    }
+}
+
+/// Wait for the in-flight L2 prepare task, or forever when there is none.
+async fn join_l2_prepare(
+    task: &mut Option<tokio::task::JoinHandle<PreparedL2Flush>>,
+) -> std::result::Result<PreparedL2Flush, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2014,9 +2339,9 @@ mod tests {
         // that a throttled change invalidates this cached entry before the next L2 send.
         let state = listener.order_book_state.as_ref().expect("state initialized");
         let empty = HashSet::new();
-        let requested_params = HashSet::from([L2SnapshotParams::new(None, None)]);
-        let (_time, seeded) =
-            state.l2_snapshots_incremental(&empty, &requested_params, &mut listener.l2_snapshot_cache);
+        let default_params = HashSet::from([L2SnapshotParams::new(None, None)]);
+        let demand = state.compute_universe().into_iter().map(|coin| (coin, default_params.clone())).collect();
+        let (_time, seeded) = state.l2_snapshots_incremental(&empty, &demand, &mut listener.l2_snapshot_cache);
         assert_eq!(l2_best_bid_sz(&seeded, "BTC"), "1");
         listener
     }
@@ -2133,8 +2458,9 @@ mod tests {
         Snapshots::new(HashMap::from([(Coin::new("BTC"), book.to_snapshot())]))
     }
 
-    fn btc_orders(listener: &mut OrderBookListener) -> Vec<(u64, Side, String, String)> {
-        let snapshot = listener.compute_snapshot().expect("state initialized").snapshot.value();
+    fn btc_orders(listener: &OrderBookListener) -> Vec<(u64, Side, String, String)> {
+        let snapshot =
+            listener.order_book_state.as_ref().expect("state initialized").compute_snapshot().snapshot.value();
         let mut orders: Vec<_> = snapshot[&Coin::new("BTC")]
             .as_ref()
             .iter()
@@ -2753,7 +3079,7 @@ mod tests {
 
         assert_eq!(outcome, SnapshotInstallOutcome::Installed { replayed_lines: 4 });
         assert_eq!(
-            btc_orders(&mut listener),
+            btc_orders(&listener),
             vec![
                 (1, Side::Bid, "100".to_string(), "1".to_string()),
                 (3, Side::Ask, "102".to_string(), "0.5".to_string()),
@@ -3740,6 +4066,77 @@ mod tests {
         listener.finish_l2_flush(prepared);
 
         assert!(drain_latest_l2(&mut rx).is_none(), "stale prepared L2 should not publish after a snapshot reset");
+    }
+
+    #[test]
+    fn an_in_flight_l2_flush_holds_back_the_next_job_until_it_finishes() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+        close_block_after_quiet(&mut listener);
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        let job = listener.take_due_publications().expect("first job");
+
+        listener.process_data_hft(update_diff_line("BTC", 1, "2", "3"), EventSource::OrderDiffs).expect("diff applies");
+        close_block_after_quiet(&mut listener);
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        assert!(listener.take_due_publications().is_none(), "the first job still owns the prepared hashes");
+        assert!(listener.pending_l2_changed_coins.contains(&Coin::new("BTC")), "the change waits for the next job");
+
+        listener.finish_l2_flush(job.prepare());
+        let next = listener.take_due_publications().expect("next job once the first finished");
+        listener.finish_l2_flush(next.prepare());
+
+        let sizes: Vec<_> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|msg| match msg.as_ref() {
+                InternalMessage::L2Update { l2_books } => Some(prepared_l2_bid_sz_at_level(l2_books, "BTC", 0)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, vec!["2".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn abandoning_an_l2_flush_rebuilds_every_shape_on_the_next_job() {
+        let (tx, mut rx) = channel::<Arc<InternalMessage>>(16);
+        let mut listener = listener_with_btc_bid(tx);
+        listener.process_data_hft(update_diff_line("BTC", 1, "1", "2"), EventSource::OrderDiffs).expect("diff applies");
+        close_block_after_quiet(&mut listener);
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        drop(listener.take_due_publications().expect("job"));
+
+        listener.abandon_l2_flush();
+        listener.last_l2_broadcast = Some(Instant::now() - Duration::from_millis(L2_BROADCAST_THROTTLE_MS + 1));
+        listener.flush_due_publications();
+
+        let msg = drain_latest_l2(&mut rx).expect("the lost update is published again");
+        let InternalMessage::L2Update { l2_books } = msg.as_ref() else { unreachable!() };
+        assert_eq!(prepared_l2_bid_sz_at_level(l2_books, "BTC", 0), "2");
+    }
+
+    #[test]
+    fn l2_registry_generation_moves_only_when_the_key_set_changes() {
+        let registry = L2SubscriptionRegistry::default();
+        let mut active = ActiveL2Subscriptions::default();
+        active.refresh(&registry);
+        assert!(active.demand.is_empty());
+
+        registry.register_l2(default_l2_key("BTC"));
+        let after_first = registry.generation();
+        registry.register_l2(default_l2_key("BTC"));
+        assert_eq!(registry.generation(), after_first, "a second subscriber does not change the key set");
+        active.refresh(&registry);
+        assert_eq!(active.demand.keys().collect::<Vec<_>>(), vec![&Coin::new("BTC")]);
+
+        registry.unregister_l2(&default_l2_key("BTC"));
+        assert_eq!(registry.generation(), after_first, "one subscriber remains");
+        registry.unregister_l2(&default_l2_key("BTC"));
+        assert_ne!(registry.generation(), after_first);
+        active.refresh(&registry);
+        assert!(active.keys.is_empty());
+        assert!(active.demand.is_empty());
     }
 
     #[test]

@@ -84,7 +84,14 @@ impl LevelTotal {
     }
 }
 
+impl<O> Snapshot<O> {
+    pub(crate) fn into_inner(self) -> [Vec<O>; 2] {
+        self.0
+    }
+}
+
 impl<O: Clone> Snapshot<O> {
+    #[cfg(test)]
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0
     }

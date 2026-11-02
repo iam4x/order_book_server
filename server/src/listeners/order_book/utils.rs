@@ -13,7 +13,7 @@ use tokio::process::Command;
 
 use crate::{
     SnapshotMode,
-    listeners::order_book::{L2SnapshotParams, L2Snapshots},
+    listeners::order_book::{L2Demand, L2SnapshotParams, L2Snapshots},
     order_book::{Coin, Snapshot, multi_book::OrderBooks, types::InnerOrder},
     prelude::*,
     types::{
@@ -228,45 +228,44 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
     params.into_iter().zip(order_book.to_l2_snapshots(max_levels, &raw_params)).collect()
 }
 
-/// Recompute changed coins and missing variants, retaining unchanged cache entries.
-/// Return only recomputed entries and evict coins absent from `order_books`.
+/// Recompute changed coins and missing variants for the demanded `(coin, params)` pairs only,
+/// retaining unchanged cache entries. Return only recomputed entries and evict coins that are
+/// no longer demanded or absent from `order_books`.
 pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     order_books: &OrderBooks<O>,
     changed_coins: &HashSet<Coin>,
-    requested_params: &HashSet<L2SnapshotParams>,
+    demand: &L2Demand,
     cache: &mut HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
 ) -> L2Snapshots {
-    if requested_params.is_empty() {
+    if demand.is_empty() {
         cache.clear();
         return L2Snapshots(HashMap::new());
     }
 
     // Evict stale entries.
-    cache.retain(|coin, _| order_books.as_ref().contains_key(coin));
+    cache.retain(|coin, _| demand.contains_key(coin) && order_books.as_ref().contains_key(coin));
 
-    // Determine which coins we actually need to (re)compute: anything in
-    // `changed_coins` that the book still contains, plus any present-but-uncached
-    // coins (first-time broadcast after a snapshot reset).
-    let mut to_compute: HashSet<Coin> =
-        changed_coins.iter().filter(|c| order_books.as_ref().contains_key(c)).cloned().collect();
-    for coin in order_books.as_ref().keys() {
-        let has_all_requested_params = cache.get(coin).is_some_and(|variants| {
-            variants.len() == requested_params.len()
-                && requested_params.iter().all(|params| variants.contains_key(params))
-        });
-        if !has_all_requested_params {
-            to_compute.insert(coin.clone());
-        }
-    }
+    // Recompute demanded coins that changed, plus demanded coins whose cached variants do
+    // not match their demanded params (first broadcast after a reset or a new subscription).
+    let to_compute: Vec<(&Coin, &HashSet<L2SnapshotParams>)> = demand
+        .iter()
+        .filter(|(coin, params)| {
+            order_books.as_ref().contains_key(*coin)
+                && (changed_coins.contains(*coin)
+                    || !cache.get(*coin).is_some_and(|variants| {
+                        variants.len() == params.len() && params.iter().all(|params| variants.contains_key(params))
+                    }))
+        })
+        .collect();
 
     // Parallel recompute for the coins we need.
     let updates: Vec<(Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>)> = to_compute
         .into_par_iter()
-        .filter_map(|coin| {
+        .filter_map(|(coin, params)| {
             order_books
                 .as_ref()
-                .get(&coin)
-                .map(|book| (coin, Arc::new(compute_l2_variants_for_coin(book, requested_params))))
+                .get(coin)
+                .map(|book| (coin.clone(), Arc::new(compute_l2_variants_for_coin(book, params))))
         })
         .collect();
     let mut snapshot = HashMap::with_capacity(updates.len());
@@ -370,6 +369,10 @@ mod tests {
         }
     }
 
+    fn demand_all(books: &OrderBooks<InnerL4Order>, params: &HashSet<L2SnapshotParams>) -> L2Demand {
+        books.as_ref().keys().map(|coin| (coin.clone(), params.clone())).collect()
+    }
+
     #[test]
     fn test_incremental_reuses_arc_for_unchanged_coins() {
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
@@ -378,7 +381,12 @@ mod tests {
 
         let mut cache = HashMap::new();
         // First call seeds the cache for both coins.
-        let seeded = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_l2_snapshot_params(), &mut cache);
+        let seeded = compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &demand_all(&books, &all_l2_snapshot_params()),
+            &mut cache,
+        );
         assert_eq!(seeded.as_ref().len(), 2);
         assert_eq!(cache.len(), 2);
         let btc_first = Arc::clone(cache.get(&Coin::new("BTC")).unwrap());
@@ -387,8 +395,12 @@ mod tests {
         // Mark BTC changed; ETH unchanged. ETH's Arc must be the same object.
         let changed: HashSet<Coin> = std::iter::once(Coin::new("BTC")).collect();
         books.add_order(order(3, "BTC", Side::Bid, "2", "50001"));
-        let changed_snapshot =
-            compute_l2_snapshots_incremental(&books, &changed, &all_l2_snapshot_params(), &mut cache);
+        let changed_snapshot = compute_l2_snapshots_incremental(
+            &books,
+            &changed,
+            &demand_all(&books, &all_l2_snapshot_params()),
+            &mut cache,
+        );
         assert_eq!(changed_snapshot.as_ref().len(), 1);
         assert!(changed_snapshot.as_ref().contains_key(&Coin::new("BTC")));
 
@@ -405,13 +417,23 @@ mod tests {
         books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
 
         let mut cache = HashMap::new();
-        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_l2_snapshot_params(), &mut cache));
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &demand_all(&books, &all_l2_snapshot_params()),
+            &mut cache,
+        ));
         assert!(cache.contains_key(&Coin::new("BTC")));
 
         // Cancel BTC's only order — the multi-book evicts the empty book, which
         // means our cache must also drop the entry on the next incremental call.
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC"));
-        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_l2_snapshot_params(), &mut cache));
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &demand_all(&books, &all_l2_snapshot_params()),
+            &mut cache,
+        ));
         assert!(!cache.contains_key(&Coin::new("BTC")), "BTC entry should have been evicted from the cache");
         assert!(cache.contains_key(&Coin::new("ETH")));
     }
@@ -424,7 +446,12 @@ mod tests {
         }
 
         let mut cache = HashMap::new();
-        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_l2_snapshot_params(), &mut cache));
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &demand_all(&books, &all_l2_snapshot_params()),
+            &mut cache,
+        ));
         let btc = cache.get(&Coin::new("BTC")).expect("BTC cache");
 
         for snapshot in btc.values() {
@@ -444,11 +471,46 @@ mod tests {
 
         let requested_params = HashSet::from([L2SnapshotParams::new(None, None)]);
         let mut cache = HashMap::new();
-        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &requested_params, &mut cache));
+        drop(compute_l2_snapshots_incremental(
+            &books,
+            &HashSet::new(),
+            &demand_all(&books, &requested_params),
+            &mut cache,
+        ));
 
         let btc = cache.get(&Coin::new("BTC")).expect("BTC cache");
         assert_eq!(btc.len(), 1);
         assert!(btc.contains_key(&L2SnapshotParams::new(None, None)));
+    }
+
+    #[test]
+    fn test_l2_variants_are_computed_only_for_demanded_coins_and_params() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        books.add_order(order(1, "BTC", Side::Bid, "1", "50000"));
+        books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
+        let default = L2SnapshotParams::new(None, None);
+        let coarse = L2SnapshotParams::new(Some(2), None);
+        let changed = HashSet::from([Coin::new("BTC"), Coin::new("ETH")]);
+        let mut cache = HashMap::new();
+
+        let demand = HashMap::from([(Coin::new("BTC"), HashSet::from([default]))]);
+        let computed = compute_l2_snapshots_incremental(&books, &changed, &demand, &mut cache);
+        assert_eq!(computed.as_ref().keys().collect::<Vec<_>>(), vec![&Coin::new("BTC")]);
+        assert!(!cache.contains_key(&Coin::new("ETH")), "ETH changed but nobody subscribes to it");
+
+        // A new variant for an unchanged coin is computed without recomputing the others.
+        let demand =
+            HashMap::from([(Coin::new("BTC"), HashSet::from([default])), (Coin::new("ETH"), HashSet::from([coarse]))]);
+        let btc_before = Arc::clone(&cache[&Coin::new("BTC")]);
+        let computed = compute_l2_snapshots_incremental(&books, &HashSet::new(), &demand, &mut cache);
+        assert_eq!(computed.as_ref().keys().collect::<Vec<_>>(), vec![&Coin::new("ETH")]);
+        assert!(Arc::ptr_eq(&btc_before, &cache[&Coin::new("BTC")]));
+        assert_eq!(cache[&Coin::new("ETH")].keys().collect::<Vec<_>>(), vec![&coarse]);
+
+        // Dropping demand evicts the coin from the cache.
+        let demand = HashMap::from([(Coin::new("ETH"), HashSet::from([coarse]))]);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &demand, &mut cache));
+        assert!(!cache.contains_key(&Coin::new("BTC")));
     }
 
     #[test]

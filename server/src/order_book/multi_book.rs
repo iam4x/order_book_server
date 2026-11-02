@@ -3,7 +3,6 @@ use std::{
     path::Path,
 };
 
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 
@@ -161,8 +160,17 @@ impl<O: InnerOrder> OrderBooks<O> {
 }
 
 impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
+    /// One coin's book, without touching the others.
+    #[must_use]
+    pub(crate) fn coin_snapshot(&self, coin: &Coin) -> Option<Snapshot<O>> {
+        self.order_books.get(coin).map(OrderBook::to_snapshot)
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn to_snapshots_par(&self) -> Snapshots<O> {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
         let snapshots = self.order_books.par_iter().map(|(c, book)| (c.clone(), book.to_snapshot())).collect();
         Snapshots(snapshots)
     }
