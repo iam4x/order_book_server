@@ -355,13 +355,7 @@ async fn byte_budget_stalls_reader_while_appends_continue_and_releases_after_dra
     reader.start_tracking(&path);
     append_to_file(&path, "{\"block_number\":1}\n");
 
-    let budget = Arc::new(QueueBudget {
-        state: Mutex::new(BudgetState::default()),
-        space: Condvar::new(),
-        limit: 200,
-        lines: AtomicUsize::new(0),
-        source: "diffs",
-    });
+    let budget = Arc::new(QueueBudget::new(200, "diffs"));
     let (tx, rx) = channel(8);
     let sender = SourceSender { tx, budget: Arc::clone(&budget) };
     let mut receiver = FileEventReceiver {

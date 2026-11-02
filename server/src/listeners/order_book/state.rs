@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     BookMode,
-    listeners::order_book::{L2Snapshots, TimedSnapshots},
+    listeners::order_book::L2Snapshots,
     order_book::{
         Coin, InnerOrder, Oid, Px, QueuePlacement, RawBbo, Sz,
         multi_book::{OrderBooks, Snapshots},
@@ -202,8 +202,13 @@ impl OrderBookState {
     }
 
     // forcibly take snapshot - (time, height, snapshot)
-    pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
-        TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
+    #[cfg(test)]
+    pub(super) fn compute_snapshot(&self) -> super::TimedSnapshots {
+        super::TimedSnapshots { snapshot: self.order_book.to_snapshots_par() }
+    }
+
+    pub(super) fn coin_snapshot(&self, coin: &Coin) -> Option<crate::order_book::Snapshot<InnerL4Order>> {
+        self.order_book.coin_snapshot(coin)
     }
 
     /// Incremental variant: rebuilds variants only for `changed_coins` and reuses
@@ -212,7 +217,7 @@ impl OrderBookState {
     pub(super) fn l2_snapshots_incremental(
         &self,
         changed_coins: &HashSet<Coin>,
-        requested_params: &HashSet<crate::listeners::order_book::L2SnapshotParams>,
+        demand: &crate::listeners::order_book::L2Demand,
         cache: &mut HashMap<
             Coin,
             std::sync::Arc<
@@ -226,7 +231,7 @@ impl OrderBookState {
         let snapshots = crate::listeners::order_book::utils::compute_l2_snapshots_incremental(
             &self.order_book,
             changed_coins,
-            requested_params,
+            demand,
             cache,
         );
         (self.time, snapshots)
@@ -662,7 +667,7 @@ mod tests {
         let params = L2SnapshotParams::new(None, None);
         let (_time, snapshots) = state.l2_snapshots_incremental(
             &HashSet::from([coin.clone()]),
-            &HashSet::from([params]),
+            &HashMap::from([(coin.clone(), HashSet::from([params]))]),
             &mut HashMap::new(),
         );
         let snapshot = snapshots.as_ref().get(&coin).expect("coin L2").get(&params).expect("default L2 params").clone();

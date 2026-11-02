@@ -65,7 +65,7 @@ fn published_btc_bids(rx: &mut Receiver<Arc<InternalMessage>>) -> Vec<(&'static 
                     u32::try_from(level["n"].as_u64().unwrap()).unwrap(),
                 ))
             }
-            InternalMessage::BboUpdate { bbos, time } => {
+            InternalMessage::BboUpdate { bbos, time, .. } => {
                 let (px, sz, n) = bid_summary(bbos.get(&Coin::new("BTC"))?.0.as_ref());
                 Some(("bbo", *time, px, sz, n))
             }
@@ -263,4 +263,66 @@ fn a_book_line_after_a_snapshot_install_keeps_its_block_open() {
 
     close_block_after_quiet(&mut listener);
     assert_eq!(published_btc_bids(&mut rx), vec![("bbo", BLOCK_11_TIME_MS, "100".to_string(), "3".to_string(), 3)]);
+}
+
+fn request_l4_snapshot(listener: &mut OrderBookListener, coin: &str) -> oneshot::Receiver<Option<L4CoinSnapshot>> {
+    let (reply, response) = oneshot::channel();
+    listener.handle_command(ListenerCommand::L4Snapshot { coin: Coin::new(coin), reply });
+    response
+}
+
+fn snapshot_bid_oids(snapshot: L4CoinSnapshot) -> Vec<u64> {
+    let [bids, _asks] = snapshot.snapshot.into_inner();
+    let mut oids: Vec<_> = bids.iter().map(|order| order.oid).collect();
+    oids.sort_unstable();
+    oids
+}
+
+#[test]
+fn an_l4_snapshot_at_a_block_boundary_is_answered_at_once() {
+    let (tx, _rx) = channel(64);
+    let mut listener = listener_at_block_10(tx, features("l2book"));
+
+    let snapshot = request_l4_snapshot(&mut listener, "BTC").try_recv().expect("answered").expect("BTC book");
+    assert_eq!((snapshot.diffs_through_height, snapshot.height), (10, 10));
+    assert_eq!(snapshot_bid_oids(snapshot), vec![1]);
+    assert!(request_l4_snapshot(&mut listener, "ETH").try_recv().expect("answered").is_none(), "no ETH book");
+}
+
+#[test]
+fn an_l4_snapshot_requested_mid_block_waits_for_the_block_to_close() {
+    let (tx, _rx) = channel(64);
+    let mut listener = listener_at_block_10(tx, features("l2book"));
+
+    apply_btc_bid(&mut listener, 2, 11);
+    let mut response = request_l4_snapshot(&mut listener, "BTC");
+    assert!(response.try_recv().is_err(), "block 11 is still open");
+
+    apply_btc_bid(&mut listener, 3, 12);
+    let snapshot = response.try_recv().expect("answered when block 12 began").expect("BTC book");
+    assert_eq!(snapshot.diffs_through_height, 11);
+    assert_eq!(snapshot_bid_oids(snapshot), vec![1, 2], "holds block 11 whole and nothing of block 12");
+
+    let mut response = request_l4_snapshot(&mut listener, "BTC");
+    close_block_after_quiet(&mut listener);
+    let snapshot = response.try_recv().expect("answered after the quiet window").expect("BTC book");
+    assert_eq!(snapshot.diffs_through_height, 12);
+    assert_eq!(snapshot_bid_oids(snapshot), vec![1, 2, 3]);
+}
+
+#[test]
+fn the_status_watch_tracks_readiness_and_the_universe() {
+    let (tx, _rx) = channel(64);
+    let mut listener = listener_without_snapshot(tx, features("l2book"));
+    let status = listener.subscribe_status();
+    assert!(!status.borrow().ready);
+
+    let state =
+        order_book_state_with_bids_and_time(&[("BTC", &[(1, "100", "1")])], 10, BLOCK_10_TIME_MS, BookMode::DiffsOnly);
+    listener.replace_order_book_state(state, 10, 10, true);
+    assert!(status.borrow().ready);
+    assert_eq!(*status.borrow().universe, HashSet::from([Coin::new("BTC")]));
+
+    listener.process_data_hft(new_diff_line_at_block("ETH", 7, "1", 11), EventSource::OrderDiffs).unwrap();
+    assert_eq!(*status.borrow().universe, HashSet::from([Coin::new("BTC"), Coin::new("ETH")]));
 }

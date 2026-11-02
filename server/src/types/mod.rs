@@ -34,10 +34,12 @@ impl Level {
         Self { px, sz, n }
     }
 
+    #[cfg(test)]
     pub(crate) fn px(&self) -> &str {
         &self.px
     }
 
+    #[cfg(test)]
     pub(crate) fn sz(&self) -> &str {
         &self.sz
     }

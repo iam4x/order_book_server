@@ -25,9 +25,8 @@ use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
 use crate::{
     FeatureSet, StreamWatch,
     metrics::{
-        EVENTS_PROCESSED_TOTAL, FILE_BACKPRESSURE_SECONDS_TOTAL, FILE_EVENTS_TOTAL, FILE_LINES_PARSED_TOTAL,
-        FILE_QUEUE_BYTES, FILE_READ_BYTES_TOTAL, FILE_READ_CALLS_TOTAL, FILE_READ_DURATION, FILE_UNREAD_BYTES,
-        FILE_WATCHER_WAKEUPS_TOTAL, PARSE_ERRORS_TOTAL,
+        FILE_BACKPRESSURE_SECONDS_TOTAL, FILE_QUEUE_BYTES, FILE_READ_BYTES_TOTAL, FILE_READ_CALLS_TOTAL,
+        FILE_READ_DURATION, FILE_UNREAD_BYTES, FILE_WATCHER_WAKEUPS_TOTAL, PARSE_ERRORS_TOTAL,
     },
     order_sync::OrderSyncRecorder,
     types::node_data::EventSource,
@@ -81,10 +80,23 @@ struct QueueBudget {
     space: Condvar,
     limit: usize,
     lines: AtomicUsize,
-    source: &'static str,
+    // Cached children of the per-source metric vectors.
+    queue_bytes: prometheus::IntGauge,
+    backpressure_seconds: prometheus::Counter,
 }
 
 impl QueueBudget {
+    fn new(limit: usize, source: &'static str) -> Self {
+        Self {
+            state: Mutex::new(BudgetState::default()),
+            space: Condvar::new(),
+            limit,
+            lines: AtomicUsize::new(0),
+            queue_bytes: FILE_QUEUE_BYTES.with_label_values(&[source]),
+            backpressure_seconds: FILE_BACKPRESSURE_SECONDS_TOTAL.with_label_values(&[source]),
+        }
+    }
+
     fn acquire(self: &Arc<Self>, bytes: usize, wait: bool) -> Option<ByteLease> {
         if bytes > self.limit {
             return None;
@@ -99,13 +111,13 @@ impl QueueBudget {
             state = self.space.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         if let Some(started) = started {
-            FILE_BACKPRESSURE_SECONDS_TOTAL.with_label_values(&[self.source]).inc_by(started.elapsed().as_secs_f64());
+            self.backpressure_seconds.inc_by(started.elapsed().as_secs_f64());
         }
         if state.closed {
             return None;
         }
         state.used += bytes;
-        FILE_QUEUE_BYTES.with_label_values(&[self.source]).set(i64::try_from(state.used).unwrap_or(i64::MAX));
+        self.queue_bytes.set(i64::try_from(state.used).unwrap_or(i64::MAX));
         drop(state);
         Some(ByteLease { budget: Arc::clone(self), bytes })
     }
@@ -120,7 +132,7 @@ impl Drop for ByteLease {
     fn drop(&mut self) {
         let mut state = self.budget.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.used -= self.bytes;
-        FILE_QUEUE_BYTES.with_label_values(&[self.budget.source]).set(i64::try_from(state.used).unwrap_or(i64::MAX));
+        self.budget.queue_bytes.set(i64::try_from(state.used).unwrap_or(i64::MAX));
         drop(state);
         self.budget.space.notify_one();
     }
@@ -172,9 +184,7 @@ impl SourceSender {
             Err(TrySendError::Full(message)) => {
                 let started = Instant::now();
                 let sent = self.tx.blocking_send(message).is_ok();
-                FILE_BACKPRESSURE_SECONDS_TOTAL
-                    .with_label_values(&[self.budget.source])
-                    .inc_by(started.elapsed().as_secs_f64());
+                self.budget.backpressure_seconds.inc_by(started.elapsed().as_secs_f64());
                 sent
             }
         }
@@ -375,9 +385,10 @@ impl FileLineSink {
                 for line in lines {
                     match recorder.observe_fill_line(&line) {
                         Ok(_) => {
-                            FILE_EVENTS_TOTAL.with_label_values(&["fills"]).inc();
-                            FILE_LINES_PARSED_TOTAL.with_label_values(&["fills"]).inc_by(line.len() as u64);
-                            EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
+                            let metrics = super::SourceMetrics::get(EventSource::Fills);
+                            metrics.file_events.inc();
+                            metrics.lines_parsed.inc_by(line.len() as u64);
+                            metrics.events_processed.inc();
                         }
                         Err(err) => {
                             PARSE_ERRORS_TOTAL.with_label_values(&["fills"]).inc();
@@ -650,13 +661,7 @@ pub(super) fn file_event_channels(sources: &[EventSource], capacity: usize) -> (
         .iter()
         .map(|&source| {
             let (tx, rx) = channel(per_source_capacity);
-            let budget = Arc::new(QueueBudget {
-                state: Mutex::new(BudgetState::default()),
-                space: Condvar::new(),
-                limit: QUEUE_BYTES_PER_SOURCE,
-                lines: AtomicUsize::new(0),
-                source: super::source_label(source),
-            });
+            let budget = Arc::new(QueueBudget::new(QUEUE_BYTES_PER_SOURCE, super::source_label(source)));
             (
                 SourceSender { tx, budget: Arc::clone(&budget) },
                 SourceQueue { source, rx, budget, batch: None, head: None, caught_up: false, closed: false },

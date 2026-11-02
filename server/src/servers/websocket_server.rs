@@ -1,18 +1,19 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use axum::{Router, extract::Query, response::IntoResponse, routing::get, serve::ListenerExt};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
+use prometheus::IntCounter;
 use serde::Deserialize;
 use tokio::{
     net::TcpListener,
     select,
     sync::{
-        Mutex, OwnedSemaphorePermit, Semaphore,
+        OwnedSemaphorePermit, Semaphore,
         broadcast::{Sender, channel},
         mpsc, watch,
     },
@@ -22,18 +23,19 @@ use yawc::{FrameView, OpCode, WebSocket};
 use crate::{
     FeatureSet, ServerConfig,
     listeners::order_book::{
-        AllBboSubscriptionRegistry, InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, OrderBookListener,
-        PreparedL2Book, TimedSnapshots, hl_listen_hft,
+        AllBboSubscriptionRegistry, InternalMessage, L2SubscriptionKey, L2SubscriptionRegistry, L4CoinSnapshot,
+        LISTENER_MAILBOX_CAPACITY, ListenerClient, ListenerCommand, OrderBookListener, PayloadCache, PreparedL2Book,
+        hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
-    order_book::{Coin, RawBbo},
+    order_book::{Coin, Px, RawBbo, Sz},
     order_sync::{OrderSyncHub, OrderSyncStatus},
     prelude::*,
     types::{
-        AllBbo, AllBboEntry, Bbo, L2Book, L4Book, L4BookUpdates, L4Order, Level, Stats, Trade,
+        AllBbo, AllBboEntry, Bbo, L4Book, L4BookUpdates, L4Order, Level, Stats, Trade,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -44,28 +46,87 @@ struct WsAuthQuery {
     token: Option<String>,
 }
 
-/// Per-subscription cached L2 broadcast. `version` is used for change-based dedup;
-/// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
+/// Cached children of `BROADCASTS_TOTAL`, so the per-message path skips the label lookup.
+struct BroadcastCounters {
+    l2: IntCounter,
+    l2_heartbeat: IntCounter,
+    bbo: IntCounter,
+    bbo_heartbeat: IntCounter,
+    allbbo: IntCounter,
+    allbbo_heartbeat: IntCounter,
+    trades: IntCounter,
+    l4: IntCounter,
+    book_diffs: IntCounter,
+    stats: IntCounter,
+    order_sync: IntCounter,
+}
+
+static BROADCASTS: LazyLock<BroadcastCounters> = LazyLock::new(|| {
+    let counter = |channel: &str| BROADCASTS_TOTAL.with_label_values(&[channel]);
+    BroadcastCounters {
+        l2: counter("l2"),
+        l2_heartbeat: counter("l2_heartbeat"),
+        bbo: counter("bbo"),
+        bbo_heartbeat: counter("bbo_heartbeat"),
+        allbbo: counter("allbbo"),
+        allbbo_heartbeat: counter("allbbo_heartbeat"),
+        trades: counter("trades"),
+        l4: counter("l4"),
+        book_diffs: counter("bookDiffs"),
+        stats: counter("stats"),
+        order_sync: counter("orderSync"),
+    }
+});
+
+/// Per-subscription cached L2 broadcast. The prepared book's version is used for
+/// change-based dedup; its payload is resent (with refreshed `time`) when the heartbeat fires.
 struct L2Entry {
-    version: u64,
     last_sent: Instant,
-    payload: L2Book,
+    prepared: Arc<PreparedL2Book>,
 }
 
-/// Per-coin cached BBO broadcast. `tuple` is used for change-based dedup;
-/// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires.
+/// Per-coin cached BBO broadcast. `raw` is used for change-based dedup and is resent
+/// (with refreshed `time`) when the heartbeat fires.
 struct BboEntry {
-    tuple: BboDedupTuple,
+    raw: RawBbo,
     last_sent: Instant,
-    payload: Bbo,
 }
 
-#[derive(Clone, Eq, PartialEq)]
-struct BboDedupTuple {
-    bid_px: String,
-    bid_sz: String,
-    ask_px: String,
-    ask_sz: String,
+/// Heights an L4 snapshot already covers for its coin. Buffered broadcast updates at or
+/// below them predate the snapshot and are dropped instead of applied twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct L4UpdateCutoff {
+    diffs_through: u64,
+    statuses_through: u64,
+}
+
+impl L4UpdateCutoff {
+    const fn from_snapshot(snapshot: &L4CoinSnapshot) -> Self {
+        Self { diffs_through: snapshot.diffs_through_height, statuses_through: snapshot.statuses_through_height }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum L4UpdateKind {
+    Diffs,
+    Statuses,
+}
+
+/// True when `subscription` is an L4 subscription whose snapshot already holds this update.
+fn l4_update_in_snapshot(
+    cutoffs: &HashMap<String, L4UpdateCutoff>,
+    subscription: &Subscription,
+    kind: L4UpdateKind,
+    height: u64,
+) -> bool {
+    let Subscription::L4Book { coin } = subscription else { return false };
+    cutoffs.get(coin).is_some_and(|cutoff| {
+        height
+            <= match kind {
+                L4UpdateKind::Diffs => cutoff.diffs_through,
+                L4UpdateKind::Statuses => cutoff.statuses_through,
+            }
+    })
 }
 
 #[derive(Default)]
@@ -244,13 +305,15 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         }
         listener
     };
-    let listener = Arc::new(Mutex::new(listener));
+    let l2_subscription_registry = listener.l2_subscription_registry();
+    let allbbo_subscription_registry = listener.allbbo_subscription_registry();
+    let (command_tx, command_rx) = mpsc::channel::<ListenerCommand>(LISTENER_MAILBOX_CAPACITY);
+    let listener_client = ListenerClient::new(command_tx.clone(), listener.subscribe_status());
     {
-        let listener = listener.clone();
         let config = config.clone();
         tokio::spawn(async move {
             info!("Starting HFT-optimized listener");
-            let result = hl_listen_hft(listener, config).await;
+            let result = hl_listen_hft(listener, command_rx, command_tx, config).await;
             if let Err(err) = result {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
@@ -266,9 +329,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let websocket_secret = config.secret.as_deref().map(Arc::<str>::from);
 
     let start_time = Instant::now();
-    let listener_for_health = listener.clone();
-    let l2_subscription_registry = listener.lock().await.l2_subscription_registry();
-    let allbbo_subscription_registry = listener.lock().await.allbbo_subscription_registry();
+    let listener_for_health = listener_client.clone();
 
     let app: Router = Router::new()
         .route(
@@ -279,7 +340,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
                 let allbbo_heartbeat_ms = config.allbbo_heartbeat_ms;
                 let features = config.features;
-                let listener = listener.clone();
+                let listener = listener_client.clone();
                 let l2_subscription_registry = Arc::clone(&l2_subscription_registry);
                 let allbbo_subscription_registry = Arc::clone(&allbbo_subscription_registry);
                 let websocket_secret = websocket_secret.clone();
@@ -316,7 +377,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             get(move || {
                 let listener = listener_for_health.clone();
                 async move {
-                    let is_ready = listener.lock().await.is_ready();
+                    let is_ready = listener.status().ready;
                     let uptime_secs = start_time.elapsed().as_secs();
                     let height = ORDERBOOK_HEIGHT.get();
                     let connections = WS_CONNECTIONS_ACTIVE.get();
@@ -351,7 +412,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: ListenerClient,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
@@ -433,7 +494,7 @@ mod auth_tests {
 async fn handle_socket(
     socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: ListenerClient,
     l2_subscription_registry: Arc<L2SubscriptionRegistry>,
     allbbo_subscription_registry: Arc<AllBboSubscriptionRegistry>,
     market_filter: (bool, bool, bool), // (include_perps, include_spot, include_hip3)
@@ -459,15 +520,17 @@ async fn handle_socket(
 
     let mut internal_message_rx = internal_message_tx.subscribe();
     BROADCAST_RECEIVERS.set(internal_message_tx.receiver_count() as i64);
-    let is_ready = listener.lock().await.is_ready();
+    // Read after subscribing: the actor publishes the status before it broadcasts a universe change.
+    let status = listener.status();
+    let is_ready = status.ready;
     let mut manager = SubscriptionManager::default();
-    let mut universe =
-        filter_universe(&listener.lock().await.universe(), market_filter.0, market_filter.1, market_filter.2);
+    let mut universe = filter_universe(&status.universe, market_filter.0, market_filter.1, market_filter.2);
     // Per-subscription cache for L2 dedup + heartbeat resend.
     let mut last_l2: HashMap<L2SubscriptionKey, L2Entry> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
     let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
     let mut last_allbbo = AllBboCache::default();
+    let mut l4_cutoffs: HashMap<String, L4UpdateCutoff> = HashMap::new();
     let mut l2_registrations = ConnectionL2Registrations::new(l2_subscription_registry);
     let mut allbbo_registration = ConnectionAllBboRegistration::new(allbbo_subscription_registry);
     let mut order_sync_rx: Option<watch::Receiver<OrderSyncStatus>> = None;
@@ -524,7 +587,7 @@ async fn handle_socket(
                             InternalMessage::Universe{ universe: next_universe } => {
                                 universe = filter_universe(next_universe, market_filter.0, market_filter.1, market_filter.2);
                             },
-                            InternalMessage::BboUpdate{ bbos, time } => {
+                            InternalMessage::BboUpdate{ bbos, time, payloads } => {
                                 if !features.bbo() {
                                     continue;
                                 }
@@ -532,7 +595,7 @@ async fn handle_socket(
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     if let Subscription::Bbo { coin } = sub {
-                                        alive &= send_ws_data_from_bbo(&outbound, coin, bbos, *time, &mut last_bbo);
+                                        alive &= send_ws_data_from_bbo(&outbound, coin, bbos, *time, payloads, &mut last_bbo);
                                     }
                                 }
                             },
@@ -548,57 +611,68 @@ async fn handle_socket(
                                     &mut last_allbbo,
                                 );
                             },
-                            InternalMessage::Fills{ batch } => {
+                            InternalMessage::Fills{ batch, trades } => {
                                 if !features.trades() {
                                     continue;
                                 }
                                 let has_trades = manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. }));
                                 if has_trades {
-                                    let mut trades = coin_to_trades(batch);
+                                    let trades = trades.get_or_build(|| trade_payloads(batch));
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_data_from_trades(&outbound, sub, &mut trades);
+                                        if let Subscription::Trades { coin } = sub {
+                                            alive &= send_coin_payload(&outbound, trades, coin, &BROADCASTS.trades);
+                                        }
                                     }
                                 }
                             },
-                            InternalMessage::L4OrderDiffs{ batch } => {
+                            InternalMessage::L4OrderDiffs{ batch, l4_updates, raw_diffs } => {
                                 if !features.l4book() && !features.bookdiffs() {
                                     continue;
                                 }
                                 let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
                                 let has_book_diffs = manager.subscriptions().iter().any(|s| matches!(s, Subscription::BookDiffs { .. }));
                                 if has_l4 || has_book_diffs {
-                                    let mut book_updates = if has_l4 { Some(coin_to_book_diffs_only(batch)) } else { None };
-                                    let mut raw_diffs = if has_book_diffs { Some(coin_to_book_diffs_raw(batch)) } else { None };
+                                    let book_updates = has_l4.then(|| l4_updates.get_or_build(|| l4_diff_payloads(batch)));
+                                    let raw_diffs = has_book_diffs.then(|| raw_diffs.get_or_build(|| raw_diff_payloads(batch)));
+                                    let height = batch.block_number();
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        if let Some(ref mut updates) = book_updates {
-                                            alive &= send_ws_data_from_book_updates(&outbound, sub, updates);
+                                        if let (Some(updates), Subscription::L4Book { coin }) = (book_updates, sub)
+                                            && !l4_update_in_snapshot(&l4_cutoffs, sub, L4UpdateKind::Diffs, height)
+                                        {
+                                            alive &= send_coin_payload(&outbound, updates, coin, &BROADCASTS.l4);
                                         }
                                         if !alive { break; }
-                                        if let Some(ref mut diffs) = raw_diffs {
-                                            alive &= send_ws_data_from_book_diffs_raw(&outbound, sub, diffs);
+                                        if let (Some(diffs), Subscription::BookDiffs { coin }) = (raw_diffs, sub) {
+                                            alive &= send_coin_payload(&outbound, diffs, coin, &BROADCASTS.book_diffs);
                                         }
                                     }
                                 }
                             },
-                            InternalMessage::L4OrderStatuses{ batch } => {
+                            InternalMessage::L4OrderStatuses{ batch, l4_updates, order_updates } => {
                                 if !features.l4book() && !features.orderupdates() {
                                     continue;
                                 }
                                 let has_l4 = manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. }));
                                 let has_order_updates = manager.subscriptions().iter().any(|s| matches!(s, Subscription::OrderUpdates { .. }));
                                 if has_l4 {
-                                    let mut book_updates = coin_to_book_statuses_only(batch);
+                                    let book_updates = l4_updates.get_or_build(|| l4_status_payloads(batch));
+                                    let height = batch.block_number();
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_data_from_book_updates(&outbound, sub, &mut book_updates);
+                                        if let Subscription::L4Book { coin } = sub
+                                            && !l4_update_in_snapshot(&l4_cutoffs, sub, L4UpdateKind::Statuses, height)
+                                        {
+                                            alive &= send_coin_payload(&outbound, book_updates, coin, &BROADCASTS.l4);
+                                        }
                                     }
                                 }
                                 if has_order_updates {
+                                    let order_updates = order_updates.get_or_build(|| order_update_payloads(batch));
                                     for sub in manager.subscriptions() {
                                         if !alive { break; }
-                                        alive &= send_ws_order_updates(&outbound, sub, batch);
+                                        alive &= send_ws_order_updates(&outbound, sub, order_updates);
                                     }
                                 }
                             },
@@ -612,9 +686,8 @@ async fn handle_socket(
 
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        CHANNEL_LAG.set(n as i64);
-                        CHANNEL_DROPS_TOTAL.inc();
-                        log::debug!("Receiver lagged: {n} messages");
+                        report_broadcast_lag(&outbound, n);
+                        break;
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
@@ -632,32 +705,30 @@ async fn handle_socket(
                         Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
                             let Some(hb) = l2_hb else { continue };
                             let key = L2SubscriptionKey::new(Coin::new(coin), *n_sig_figs, *mantissa, *n_levels);
-                            if let Some(entry) = last_l2.get_mut(&key) {
-                                if now.duration_since(entry.last_sent) >= hb {
-                                    entry.payload.set_time(now_ms);
-                                    entry.last_sent = now;
-                                    BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
-                                    let payload = entry.payload.clone();
-                                    alive &= outbound.send_message(ServerResponse::L2Book(payload));
-                                }
+                            if let Some(entry) = last_l2.get_mut(&key)
+                                && now.duration_since(entry.last_sent) >= hb
+                            {
+                                entry.last_sent = now;
+                                BROADCASTS.l2_heartbeat.inc();
+                                let mut payload = entry.prepared.payload().clone();
+                                payload.set_time(now_ms);
+                                alive &= outbound.send_message(ServerResponse::L2Book(payload));
                             }
                         }
                         Subscription::Bbo { coin } => {
                             let Some(hb) = bbo_hb else { continue };
-                            if let Some(entry) = last_bbo.get_mut(coin) {
-                                if now.duration_since(entry.last_sent) >= hb {
-                                    entry.payload.time = now_ms;
-                                    entry.last_sent = now;
-                                    BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
-                                    let payload = entry.payload.clone();
-                                    alive &= outbound.send_message(ServerResponse::Bbo(payload));
-                                }
+                            if let Some(entry) = last_bbo.get_mut(coin)
+                                && now.duration_since(entry.last_sent) >= hb
+                            {
+                                entry.last_sent = now;
+                                BROADCASTS.bbo_heartbeat.inc();
+                                alive &= outbound.send_message(ServerResponse::Bbo(bbo_from_raw(coin, now_ms, entry.raw)));
                             }
                         }
                         Subscription::AllBbo => {
                             let Some(hb) = allbbo_hb else { continue };
                             let Some(payload) = last_allbbo.heartbeat(now, now_ms, hb) else { continue };
-                            BROADCASTS_TOTAL.with_label_values(&["allbbo_heartbeat"]).inc();
+                            BROADCASTS.allbbo_heartbeat.inc();
                             alive &= outbound.send_message(ServerResponse::AllBbo(payload));
                         }
                         _ => {}
@@ -666,7 +737,7 @@ async fn handle_socket(
             }
 
             status = receive_order_sync(&mut order_sync_rx) => {
-                BROADCASTS_TOTAL.with_label_values(&["orderSync"]).inc();
+                BROADCASTS.order_sync.inc();
                 alive &= outbound.send_message(ServerResponse::OrderSync(status));
             }
 
@@ -696,12 +767,13 @@ async fn handle_socket(
                                             &mut manager,
                                             value,
                                             &universe,
-                                            listener.clone(),
+                                            &listener,
                                             features,
                                             market_filter,
                                             &mut last_l2,
                                             &mut last_bbo,
                                             &mut last_allbbo,
+                                            &mut l4_cutoffs,
                                             &mut l2_registrations,
                                             &mut allbbo_registration,
                                             order_sync.as_deref(),
@@ -742,12 +814,13 @@ async fn receive_client_message(
     manager: &mut SubscriptionManager,
     client_message: ClientMessage,
     universe: &HashSet<String>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: &ListenerClient,
     features: FeatureSet,
     market_filter: (bool, bool, bool),
     last_l2: &mut HashMap<L2SubscriptionKey, L2Entry>,
     last_bbo: &mut HashMap<String, BboEntry>,
     last_allbbo: &mut AllBboCache,
+    l4_cutoffs: &mut HashMap<String, L4UpdateCutoff>,
     l2_registrations: &mut ConnectionL2Registrations,
     allbbo_registration: &mut ConnectionAllBboRegistration,
     order_sync: Option<&OrderSyncHub>,
@@ -795,6 +868,9 @@ async fn receive_client_message(
                         *last_allbbo = AllBboCache::default();
                         allbbo_registration.unregister(&subscription);
                     }
+                    Subscription::L4Book { coin } => {
+                        l4_cutoffs.remove(coin);
+                    }
                     _ => {}
                 }
             }
@@ -817,7 +893,7 @@ async fn receive_client_message(
             allbbo_registration.register(subscription);
         }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener, market_filter).await;
+            let msg = subscription.handle_immediate_snapshot(listener, market_filter, l4_cutoffs).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
@@ -846,6 +922,18 @@ async fn receive_client_message(
     }
 }
 
+/// The connection missed `skipped` broadcasts. Every stream is incremental or deduplicated
+/// against what this connection last sent, so it cannot recover in place: tell the client to
+/// reconnect, and the caller closes the connection.
+fn report_broadcast_lag(outbound: &Outbound, skipped: u64) {
+    CHANNEL_LAG.set(i64::try_from(skipped).unwrap_or(i64::MAX));
+    CHANNEL_DROPS_TOTAL.inc();
+    log::warn!("Receiver lagged by {skipped} messages; closing the connection");
+    let _unused = outbound.send_message(ServerResponse::Error(format!(
+        "Stream lagged: {skipped} messages were dropped; reconnect to resubscribe"
+    )));
+}
+
 /// Fast BBO broadcast - directly from BBO HashMap without L2 snapshot computation.
 /// Returns false if outbound admission fails (caller must drop the connection).
 fn send_ws_data_from_bbo(
@@ -853,23 +941,47 @@ fn send_ws_data_from_bbo(
     coin: &str,
     bbos: &HashMap<Coin, RawBbo>,
     time: u64,
+    payloads: &PayloadCache<String>,
     last_bbo: &mut HashMap<String, BboEntry>,
 ) -> bool {
     let coin_key = Coin::new(coin);
-    if let Some(raw_bbo) = bbos.get(&coin_key).copied() {
-        let (bid, ask) = levels_from_raw_bbo(raw_bbo);
-        let current = dedup_tuple_from_levels(bid.as_ref(), ask.as_ref());
+    let Some(raw) = bbos.get(&coin_key).copied() else { return true };
+    // The level count is not part of the dedup key: only price and size changes are sent.
+    if last_bbo.get(coin).is_some_and(|entry| bbo_dedup_key(entry.raw) == bbo_dedup_key(raw)) {
+        return true;
+    }
+    BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
+    BROADCASTS.bbo.inc();
+    last_bbo.insert(coin.to_string(), BboEntry { raw, last_sent: Instant::now() });
+    let payloads = payloads.get_or_build(|| bbo_payloads(bbos, time));
+    payloads.get(coin).is_none_or(|payload| outbound.send_payload(payload.clone()))
+}
 
-        if last_bbo.get(coin).map(|e| &e.tuple) != Some(&current) {
-            BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
-            BROADCASTS_TOTAL.with_label_values(&["bbo"]).inc();
-            let bbo = Bbo { coin: coin.to_string(), time, bid, ask };
-            last_bbo
-                .insert(coin.to_string(), BboEntry { tuple: current, last_sent: Instant::now(), payload: bbo.clone() });
-            return outbound.send_message(ServerResponse::Bbo(bbo));
+type BboDedupKey = (Option<(Px, Sz)>, Option<(Px, Sz)>);
+
+const fn bbo_dedup_key(raw: RawBbo) -> BboDedupKey {
+    const fn side(level: Option<(Px, Sz, u32)>) -> Option<(Px, Sz)> {
+        match level {
+            Some((px, sz, _n)) => Some((px, sz)),
+            None => None,
         }
     }
-    true
+    (side(raw.0), side(raw.1))
+}
+
+fn bbo_from_raw(coin: &str, time: u64, raw: RawBbo) -> Bbo {
+    let (bid, ask) = levels_from_raw_bbo(raw);
+    Bbo { coin: coin.to_string(), time, bid, ask }
+}
+
+fn bbo_payloads(bbos: &HashMap<Coin, RawBbo>, time: u64) -> HashMap<String, bytes::Bytes> {
+    bbos.iter()
+        .filter_map(|(coin, raw)| {
+            let coin = coin.value();
+            let payload = serialize_response(&ServerResponse::Bbo(bbo_from_raw(&coin, time, *raw)))?;
+            Some((coin, payload))
+        })
+        .collect()
 }
 
 fn send_ws_data_from_allbbo(
@@ -885,11 +997,11 @@ fn send_ws_data_from_allbbo(
         .map(|(coin, raw_bbo)| allbbo_entry_from_raw(coin, *raw_bbo));
     let Some(payload) = last_allbbo.delta(time, entries, Instant::now()) else { return true };
 
-    BROADCASTS_TOTAL.with_label_values(&["allbbo"]).inc();
+    BROADCASTS.allbbo.inc();
     outbound.send_message(ServerResponse::AllBbo(payload))
 }
 
-fn level_from_raw(raw: Option<(crate::order_book::Px, crate::order_book::Sz, u32)>) -> Option<Level> {
+fn level_from_raw(raw: Option<(Px, Sz, u32)>) -> Option<Level> {
     raw.map(|(px, sz, n)| Level::new(px.to_str(), sz.to_str(), n as usize))
 }
 
@@ -905,20 +1017,22 @@ fn allbbo_entry_from_raw(coin: &Coin, raw_bbo: RawBbo) -> AllBboEntry {
     }
 }
 
-fn dedup_tuple_from_levels(bid: Option<&Level>, ask: Option<&Level>) -> BboDedupTuple {
-    BboDedupTuple {
-        bid_px: bid.map(Level::px).unwrap_or_default().to_string(),
-        bid_sz: bid.map(Level::sz).unwrap_or_default().to_string(),
-        ask_px: ask.map(Level::px).unwrap_or_default().to_string(),
-        ask_sz: ask.map(Level::sz).unwrap_or_default().to_string(),
-    }
-}
-
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTBOUND_QUEUE_DEPTH: usize = 128;
 const OUTBOUND_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 const PONG_QUEUE_DEPTH: usize = 8;
 const PONG_FRAME: &[u8] = br#"{"channel":"pong"}"#;
+
+/// Serialize a response to its wire bytes; a failure is logged and the response is skipped.
+fn serialize_response(msg: &ServerResponse) -> Option<bytes::Bytes> {
+    match serde_json::to_string(msg) {
+        Ok(payload) => Some(bytes::Bytes::from(payload)),
+        Err(err) => {
+            error!("Server response serialization error: {err}");
+            None
+        }
+    }
+}
 
 type WsRead = futures_util::stream::SplitStream<WebSocket>;
 type WsWriter = tokio::task::JoinHandle<()>;
@@ -940,14 +1054,7 @@ impl Outbound {
     }
 
     fn send_message(&self, msg: ServerResponse) -> bool {
-        let payload = match serde_json::to_string(&msg) {
-            Ok(payload) => payload,
-            Err(err) => {
-                error!("Server response serialization error: {err}");
-                return true;
-            }
-        };
-        self.send_payload(bytes::Bytes::from(payload))
+        serialize_response(&msg).is_none_or(|payload| self.send_payload(payload))
     }
 
     fn send_payload(&self, payload: bytes::Bytes) -> bool {
@@ -1132,14 +1239,15 @@ fn send_ws_data_from_l2_update(
         return true;
     };
 
-    if last_l2.get(&key).map(|entry| entry.version) == Some(prepared.version()) {
+    if last_l2.get(&key).map(|entry| entry.prepared.version()) == Some(prepared.version()) {
         return true;
     }
 
-    BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
-    let payload = prepared.payload().clone();
-    last_l2.insert(key, L2Entry { version: prepared.version(), last_sent: Instant::now(), payload: payload.clone() });
-    outbound.send_message(ServerResponse::L2Book(payload))
+    BROADCASTS.l2.inc();
+    last_l2.insert(key, L2Entry { last_sent: Instant::now(), prepared: Arc::clone(prepared) });
+    prepared
+        .wire_payload(|payload| serialize_response(&ServerResponse::L2Book(payload.clone())))
+        .is_none_or(|payload| outbound.send_payload(payload.clone()))
 }
 
 #[cfg(test)]
@@ -1198,11 +1306,7 @@ mod tests {
 
     fn raw_bbo(bid: Option<(&str, &str, u32)>, ask: Option<(&str, &str, u32)>) -> RawBbo {
         let parse = |(px, sz, n): (&str, &str, u32)| {
-            (
-                crate::order_book::Px::parse_from_str(px).expect("valid px"),
-                crate::order_book::Sz::parse_from_str(sz).expect("valid sz"),
-                n,
-            )
+            (Px::parse_from_str(px).expect("valid px"), Sz::parse_from_str(sz).expect("valid sz"), n)
         };
         (bid.map(parse), ask.map(parse))
     }
@@ -1430,16 +1534,202 @@ mod tests {
         let mut bbos = HashMap::from([(Coin::new("BTC"), raw_bbo(Some(("100", "1", 1)), None))]);
         let (outbound, mut data_rx) = outbound_for_test();
 
-        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 1, &mut cache));
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 1, &PayloadCache::default(), &mut cache));
         let _first = data_rx.try_recv().expect("initial bbo queued");
 
         bbos.insert(Coin::new("BTC"), raw_bbo(Some(("100", "2", 1)), None));
-        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 2, &mut cache));
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 2, &PayloadCache::default(), &mut cache));
         let _size_delta = data_rx.try_recv().expect("size delta queued");
 
         bbos.insert(Coin::new("BTC"), raw_bbo(Some(("100", "2", 9)), None));
-        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 3, &mut cache));
+        assert!(send_ws_data_from_bbo(&outbound, "BTC", &bbos, 3, &PayloadCache::default(), &mut cache));
         assert!(matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn broadcast_lag_queues_a_reconnect_error() {
+        let (outbound, mut data_rx) = outbound_for_test();
+
+        report_broadcast_lag(&outbound, 7);
+
+        let payload = data_rx.try_recv().expect("lag error queued").payload;
+        assert_eq!(
+            payload,
+            bytes::Bytes::from_static(
+                br#"{"channel":"error","data":"Stream lagged: 7 messages were dropped; reconnect to resubscribe"}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn l4_updates_at_or_below_the_snapshot_cutoff_are_dropped() {
+        let cutoffs = HashMap::from([("BTC".to_string(), L4UpdateCutoff { diffs_through: 11, statuses_through: 9 })]);
+        let btc = Subscription::L4Book { coin: "BTC".to_string() };
+        let eth = Subscription::L4Book { coin: "ETH".to_string() };
+
+        assert!(l4_update_in_snapshot(&cutoffs, &btc, L4UpdateKind::Diffs, 11));
+        assert!(!l4_update_in_snapshot(&cutoffs, &btc, L4UpdateKind::Diffs, 12));
+        assert!(l4_update_in_snapshot(&cutoffs, &btc, L4UpdateKind::Statuses, 9));
+        assert!(!l4_update_in_snapshot(&cutoffs, &btc, L4UpdateKind::Statuses, 10));
+        assert!(!l4_update_in_snapshot(&cutoffs, &eth, L4UpdateKind::Diffs, 1));
+        assert!(!l4_update_in_snapshot(
+            &cutoffs,
+            &Subscription::Trades { coin: "BTC".to_string() },
+            L4UpdateKind::Diffs,
+            1
+        ));
+    }
+
+    fn diff_json(coin: &str, oid: u64) -> serde_json::Value {
+        serde_json::json!({
+            "user": "0x0000000000000000000000000000000000000000",
+            "oid": oid,
+            "side": "B",
+            "px": "100",
+            "coin": coin,
+            "raw_book_diff": { "new": { "sz": "1" } }
+        })
+    }
+
+    fn status_json(coin: &str, oid: u64, user: &str) -> serde_json::Value {
+        serde_json::json!({
+            "time": "2024-01-15T10:30:00",
+            "user": user,
+            "hash": "0xabc",
+            "builder": null,
+            "status": "open",
+            "order": {
+                "user": user,
+                "coin": coin,
+                "side": "B",
+                "limitPx": "100.0",
+                "sz": "1.0",
+                "oid": oid,
+                "timestamp": 1000,
+                "triggerCondition": "N/A",
+                "isTrigger": false,
+                "triggerPx": "0.0",
+                "children": [],
+                "isPositionTpsl": false,
+                "reduceOnly": false,
+                "orderType": "Limit",
+                "origSz": "1.0",
+                "tif": "Gtc",
+                "cloid": null
+            }
+        })
+    }
+
+    fn fill_json(coin: &str, tid: u64) -> serde_json::Value {
+        serde_json::json!([
+            "0x0000000000000000000000000000000000000001",
+            {
+                "coin": coin,
+                "px": "50000.0",
+                "sz": "0.1",
+                "side": "A",
+                "time": 1_700_000_000_000_u64,
+                "startPosition": "0",
+                "dir": "Open Long",
+                "closedPnl": "0",
+                "hash": "0xabc",
+                "oid": 123,
+                "crossed": true,
+                "fee": "0.5",
+                "tid": tid,
+                "feeToken": "USDC",
+                "liquidation": null
+            }
+        ])
+    }
+
+    fn batch_of<E: serde::de::DeserializeOwned>(events: Vec<serde_json::Value>) -> Batch<E> {
+        serde_json::from_value(serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 42,
+            "events": events,
+        }))
+        .expect("valid batch")
+    }
+
+    fn wire(msg: &ServerResponse) -> bytes::Bytes {
+        bytes::Bytes::from(serde_json::to_string(msg).unwrap())
+    }
+
+    #[test]
+    fn shared_book_payloads_match_per_message_serialization() {
+        let diffs: Batch<NodeDataOrderDiff> =
+            batch_of(vec![diff_json("BTC", 1), diff_json("ETH", 2), diff_json("BTC", 3)]);
+        let btc_diffs: Vec<NodeDataOrderDiff> =
+            diffs.events_ref().iter().filter(|diff| diff.coin().value() == "BTC").cloned().collect();
+        let (time, height) = (diffs.block_time(), diffs.block_number());
+
+        let mut expected_updates = L4BookUpdates::new(time, height);
+        expected_updates.book_diffs.clone_from(&btc_diffs);
+        assert_eq!(l4_diff_payloads(&diffs)["BTC"], wire(&ServerResponse::L4Book(L4Book::Updates(expected_updates))),);
+        let raw = raw_diff_payloads(&diffs);
+        assert_eq!(raw["BTC"], wire(&ServerResponse::BookDiffs(btc_diffs)));
+        assert_eq!(raw.len(), 2);
+
+        let alice = "0x00000000000000000000000000000000000000a1";
+        let bob = "0x00000000000000000000000000000000000000b2";
+        let statuses: Batch<NodeDataOrderStatus> =
+            batch_of(vec![status_json("BTC", 1, alice), status_json("ETH", 2, bob), status_json("BTC", 3, alice)]);
+        let alice: alloy::primitives::Address = alice.parse().unwrap();
+        let alice_statuses: Vec<NodeDataOrderStatus> =
+            statuses.events_ref().iter().filter(|status| status.user == alice).cloned().collect();
+        let mut expected_updates = L4BookUpdates::new(time, height);
+        expected_updates.order_statuses.clone_from(&alice_statuses);
+        assert_eq!(
+            l4_status_payloads(&statuses)["BTC"],
+            wire(&ServerResponse::L4Book(L4Book::Updates(expected_updates))),
+        );
+
+        let expected_orders = alice_statuses
+            .into_iter()
+            .map(|order_status| OrderUpdate { user: alice, time, height, order_status })
+            .collect();
+        let order_updates = order_update_payloads(&statuses);
+        assert_eq!(order_updates[&alice], wire(&ServerResponse::OrderUpdates(expected_orders)));
+        assert_eq!(order_updates.len(), 2);
+
+        let fills: Batch<NodeDataFill> = batch_of(vec![fill_json("BTC", 1), fill_json("ETH", 2), fill_json("BTC", 3)]);
+        let btc_trades = fills
+            .events_ref()
+            .iter()
+            .cloned()
+            .map(Trade::from_single_fill)
+            .filter(|trade| trade.coin == "BTC")
+            .collect();
+        assert_eq!(trade_payloads(&fills)["BTC"], wire(&ServerResponse::Trades(btc_trades)));
+    }
+
+    #[test]
+    fn shared_bbo_payload_matches_per_message_serialization() {
+        let raw = raw_bbo(Some(("100", "1", 2)), Some(("101", "3", 1)));
+        let bbos = HashMap::from([(Coin::new("BTC"), raw)]);
+        let (bid, ask) = levels_from_raw_bbo(raw);
+
+        assert_eq!(
+            bbo_payloads(&bbos, 7)["BTC"],
+            wire(&ServerResponse::Bbo(Bbo { coin: "BTC".to_string(), time: 7, bid, ask })),
+        );
+    }
+
+    #[test]
+    fn subscribers_of_one_message_share_its_payload_bytes() {
+        let bbos = HashMap::from([(Coin::new("BTC"), raw_bbo(Some(("100", "1", 1)), None))]);
+        let payloads = PayloadCache::default();
+        let (first, mut first_rx) = outbound_for_test();
+        let (second, mut second_rx) = outbound_for_test();
+
+        assert!(send_ws_data_from_bbo(&first, "BTC", &bbos, 1, &payloads, &mut HashMap::new()));
+        assert!(send_ws_data_from_bbo(&second, "BTC", &bbos, 1, &payloads, &mut HashMap::new()));
+
+        let first = first_rx.try_recv().expect("first queued").payload;
+        let second = second_rx.try_recv().expect("second queued").payload;
+        assert_eq!(first.as_ptr(), second.as_ptr(), "one serialization, shared");
     }
 
     #[test]
@@ -1530,100 +1820,90 @@ mod tests {
     }
 }
 
-fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let fills = batch.clone().events();
-    let mut trades = HashMap::new();
+fn serialize_grouped<K: Eq + std::hash::Hash, V>(
+    groups: HashMap<K, V>,
+    wrap: impl Fn(V) -> ServerResponse,
+) -> HashMap<K, bytes::Bytes> {
+    groups.into_iter().filter_map(|(key, value)| Some((key, serialize_response(&wrap(value))?))).collect()
+}
 
+/// Trades per coin, serialized.
+fn trade_payloads(batch: &Batch<NodeDataFill>) -> HashMap<String, bytes::Bytes> {
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
     // Convert each fill directly to a trade (no pairing)
-    for fill in fills {
-        let trade = Trade::from_single_fill(fill);
-        let coin = trade.coin.clone();
-        trades.entry(coin).or_insert_with(Vec::new).push(trade);
+    for fill in batch.events_ref() {
+        let trade = Trade::from_single_fill(fill.clone());
+        trades.entry(trade.coin.clone()).or_default().push(trade);
     }
-
-    trades
+    serialize_grouped(trades, ServerResponse::Trades)
 }
 
-/// HFT helper: convert order diffs batch to book updates (without statuses)
-fn coin_to_book_diffs_only(diff_batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, L4BookUpdates> {
-    let diffs = diff_batch.clone().events();
-    let time = diff_batch.block_time();
-    let height = diff_batch.block_number();
-    let mut updates = HashMap::new();
-    for diff in diffs {
-        let coin = diff.coin().value();
-        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).book_diffs.push(diff);
+/// L4 book updates per coin from an order diffs batch (without statuses), serialized.
+fn l4_diff_payloads(batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, bytes::Bytes> {
+    let (time, height) = (batch.block_time(), batch.block_number());
+    let mut updates: HashMap<String, L4BookUpdates> = HashMap::new();
+    for diff in batch.events_ref() {
+        updates
+            .entry(diff.coin().value())
+            .or_insert_with(|| L4BookUpdates::new(time, height))
+            .book_diffs
+            .push(diff.clone());
     }
-    updates
+    serialize_grouped(updates, |updates| ServerResponse::L4Book(L4Book::Updates(updates)))
 }
 
-/// HFT helper: convert order statuses batch to book updates (without diffs)
-fn coin_to_book_statuses_only(status_batch: &Batch<NodeDataOrderStatus>) -> HashMap<String, L4BookUpdates> {
-    let statuses = status_batch.clone().events();
-    let time = status_batch.block_time();
-    let height = status_batch.block_number();
-    let mut updates = HashMap::new();
-    for status in statuses {
-        let coin = status.order.coin.clone();
-        updates.entry(coin).or_insert_with(|| L4BookUpdates::new(time, height)).order_statuses.push(status);
+/// L4 book updates per coin from an order statuses batch (without diffs), serialized.
+fn l4_status_payloads(batch: &Batch<NodeDataOrderStatus>) -> HashMap<String, bytes::Bytes> {
+    let (time, height) = (batch.block_time(), batch.block_number());
+    let mut updates: HashMap<String, L4BookUpdates> = HashMap::new();
+    for status in batch.events_ref() {
+        updates
+            .entry(status.order.coin.clone())
+            .or_insert_with(|| L4BookUpdates::new(time, height))
+            .order_statuses
+            .push(status.clone());
     }
-    updates
+    serialize_grouped(updates, |updates| ServerResponse::L4Book(L4Book::Updates(updates)))
 }
 
-fn coin_to_book_diffs_raw(batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, Vec<NodeDataOrderDiff>> {
-    let diffs = batch.clone().events();
-    let mut grouped = HashMap::new();
-    for diff in diffs {
-        let coin = diff.coin().value();
-        grouped.entry(coin).or_insert_with(Vec::new).push(diff);
+/// Raw book diffs per coin, serialized.
+fn raw_diff_payloads(batch: &Batch<NodeDataOrderDiff>) -> HashMap<String, bytes::Bytes> {
+    let mut grouped: HashMap<String, Vec<NodeDataOrderDiff>> = HashMap::new();
+    for diff in batch.events_ref() {
+        grouped.entry(diff.coin().value()).or_default().push(diff.clone());
     }
-    grouped
+    serialize_grouped(grouped, ServerResponse::BookDiffs)
 }
 
-fn send_ws_data_from_book_diffs_raw(
+/// Order updates per user, serialized.
+fn order_update_payloads(batch: &Batch<NodeDataOrderStatus>) -> HashMap<alloy::primitives::Address, bytes::Bytes> {
+    let (time, height) = (batch.block_time(), batch.block_number());
+    let mut by_user: HashMap<alloy::primitives::Address, Vec<OrderUpdate>> = HashMap::new();
+    for status in batch.events_ref() {
+        by_user.entry(status.user).or_default().push(OrderUpdate {
+            user: status.user,
+            time,
+            height,
+            order_status: status.clone(),
+        });
+    }
+    serialize_grouped(by_user, ServerResponse::OrderUpdates)
+}
+
+/// Send `coin`'s payload from a per-coin map, if the message has one.
+fn send_coin_payload(
     outbound: &Outbound,
-    subscription: &Subscription,
-    book_diffs: &mut HashMap<String, Vec<NodeDataOrderDiff>>,
+    payloads: &HashMap<String, bytes::Bytes>,
+    coin: &str,
+    broadcasts: &IntCounter,
 ) -> bool {
-    if let Subscription::BookDiffs { coin } = subscription {
-        if let Some(diffs) = book_diffs.remove(coin) {
-            BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
-            return outbound.send_message(ServerResponse::BookDiffs(diffs));
-        }
-    }
-    true
-}
-
-fn send_ws_data_from_book_updates(
-    outbound: &Outbound,
-    subscription: &Subscription,
-    book_updates: &mut HashMap<String, L4BookUpdates>,
-) -> bool {
-    if let Subscription::L4Book { coin } = subscription {
-        if let Some(updates) = book_updates.remove(coin) {
-            BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
-            return outbound.send_message(ServerResponse::L4Book(L4Book::Updates(updates)));
-        }
-    }
-    true
-}
-
-fn send_ws_data_from_trades(
-    outbound: &Outbound,
-    subscription: &Subscription,
-    trades: &mut HashMap<String, Vec<Trade>>,
-) -> bool {
-    if let Subscription::Trades { coin } = subscription {
-        if let Some(trades) = trades.remove(coin) {
-            BROADCASTS_TOTAL.with_label_values(&["trades"]).inc();
-            return outbound.send_message(ServerResponse::Trades(trades));
-        }
-    }
-    true
+    let Some(payload) = payloads.get(coin) else { return true };
+    broadcasts.inc();
+    outbound.send_payload(payload.clone())
 }
 
 fn send_ws_stats(outbound: &Outbound, stats: Stats) -> bool {
-    BROADCASTS_TOTAL.with_label_values(&["stats"]).inc();
+    BROADCASTS.stats.inc();
     outbound.send_message(ServerResponse::Stats(stats))
 }
 
@@ -1631,30 +1911,27 @@ impl Subscription {
     // snapshots that begin a stream
     async fn handle_immediate_snapshot(
         &self,
-        listener: Arc<Mutex<OrderBookListener>>,
+        listener: &ListenerClient,
         market_filter: (bool, bool, bool),
+        l4_cutoffs: &mut HashMap<String, L4UpdateCutoff>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
-            let snapshot = listener.lock().await.compute_snapshot();
-            if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
-                let requested_coin = Coin::new(coin);
-                let filtered =
-                    snapshot.value().into_iter().filter(|(c, _)| *c == requested_coin).collect::<Vec<_>>().pop();
-                if let Some((found_coin, coin_snapshot)) = filtered {
-                    let levels =
-                        coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                    return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
-                        coin: found_coin.value(),
-                        time,
-                        height,
-                        levels,
-                    })));
-                }
+            let requested_coin = Coin::new(coin);
+            if let Some(coin_snapshot) = listener.l4_snapshot(requested_coin.clone()).await? {
+                l4_cutoffs.insert(coin.clone(), L4UpdateCutoff::from_snapshot(&coin_snapshot));
+                let L4CoinSnapshot { time, height, snapshot, .. } = coin_snapshot;
+                let levels = snapshot.into_inner().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
+                    coin: requested_coin.value(),
+                    time,
+                    height,
+                    levels,
+                })));
             }
             return Err("Snapshot Failed".into());
         }
         if matches!(self, Self::AllBbo) {
-            if let Some((time, bbos)) = listener.lock().await.all_bbos() {
+            if let Some((time, bbos)) = listener.all_bbos().await? {
                 let bbos = bbos
                     .into_iter()
                     .filter(|(coin, _)| market_filter_allows_coin_ref(coin, market_filter))
@@ -1669,28 +1946,13 @@ impl Subscription {
 }
 
 /// Send order updates to OrderUpdates subscribers filtered by user address
-fn send_ws_order_updates(outbound: &Outbound, subscription: &Subscription, batch: &Batch<NodeDataOrderStatus>) -> bool {
-    if let Subscription::OrderUpdates { user } = subscription {
-        // Parse the user address from the subscription
-        let user_addr = match user.parse::<alloy::primitives::Address>() {
-            Ok(addr) => addr,
-            Err(_) => return true, // Invalid address, skip (validation should already prevent this)
-        };
-
-        let time = batch.block_time();
-        let height = batch.block_number();
-        let statuses = batch.clone().events();
-
-        // Filter statuses for this specific user
-        let user_updates: Vec<OrderUpdate> = statuses
-            .into_iter()
-            .filter(|status| status.user == user_addr)
-            .map(|status| OrderUpdate { user: status.user, time, height, order_status: status })
-            .collect();
-
-        if !user_updates.is_empty() {
-            return outbound.send_message(ServerResponse::OrderUpdates(user_updates));
-        }
-    }
-    true
+fn send_ws_order_updates(
+    outbound: &Outbound,
+    subscription: &Subscription,
+    payloads: &HashMap<alloy::primitives::Address, bytes::Bytes>,
+) -> bool {
+    let Subscription::OrderUpdates { user } = subscription else { return true };
+    // Invalid address, skip (validation should already prevent this)
+    let Ok(user) = user.parse::<alloy::primitives::Address>() else { return true };
+    payloads.get(&user).is_none_or(|payload| outbound.send_payload(payload.clone()))
 }
